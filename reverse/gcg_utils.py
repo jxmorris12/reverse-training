@@ -112,4 +112,4 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
 
 
 def get_model_params(model: torch.nn.Module) -> Tensor:
-    return torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
+    return torch.cat([p.data.reshape(-1) for p in model.parameters()], 0)

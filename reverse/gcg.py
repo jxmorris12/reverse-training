@@ -11,7 +11,7 @@ import transformers
 from torch import Tensor
 from transformers import set_seed
 
-from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, get_model_params
+from utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, get_model_params
 
 logger = logging.getLogger("nanogcg")
 if not logger.hasHandlers():
@@ -36,7 +36,6 @@ class GCGConfig:
     buffer_size: int = 0
     allow_non_ascii: bool = False
     filter_ids: bool = True
-    add_space_before_target: bool = False
     seed: int = None
     verbosity: str = "INFO"
 
@@ -160,6 +159,7 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
     
     return torch.stack(filtered_ids)
 
+
 class GCG:
     def __init__(
         self, 
@@ -173,18 +173,17 @@ class GCG:
         self.tokenizer = tokenizer
         self.config = config
 
-        self.embedding_layer = model.get_input_embeddings()
-        self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
+        self.embedding_layer = initial_model.get_input_embeddings()
+        self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=initial_model.device)
 
-        if model.dtype in (torch.float32, torch.float64):
-            logger.warning(f"Model is in {model.dtype}. Use a lower precision data type, if possible, for much faster optimization.")
+        if initial_model.dtype in (torch.float32, torch.float64):
+            logger.warning(f"Model is in {initial_model.dtype}. Use a lower precision data type, if possible, for much faster optimization.")
 
-        if model.device == torch.device("cpu"):
+        if initial_model.device == torch.device("cpu"):
             logger.warning("Model is on the CPU. Use a hardware accelerator for faster optimization.")
     
     def run(
         self,
-        target: str,
     ) -> GCGResult:
         model = self.model
         tokenizer = self.tokenizer
@@ -193,32 +192,10 @@ class GCG:
         if config.seed is not None:
             set_seed(config.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
-    
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
-        else:
-            messages = copy.deepcopy(messages)
-    
-        # Append the GCG string at the end of the prompt if location not specified
-        if not any(["{optim_str}" in d["content"] for d in messages]):
-            messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
 
-        target = " " + target if config.add_space_before_target else target
-
-        # Tokenize everything that doesn't get optimized
-        before_ids = tokenizer([before_str], padding=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
-        after_ids = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
-        target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
-
-        # Embed everything that doesn't get optimized
-        embedding_layer = self.embedding_layer
-        before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
+        self.target_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
+        optim_ids = self.target_ids.clone()
         
-        self.target_ids = target_ids
-        self.before_embeds = before_embeds
-        self.after_embeds = after_embeds
-        self.target_embeds = target_embeds
-
         # Initialize the attack buffer
         buffer = self.init_buffer()
         optim_ids = buffer.get_best_ids()
@@ -231,7 +208,6 @@ class GCG:
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids) 
 
             with torch.no_grad():
-
                 # Sample candidate token sequences based on the token gradient
                 sampled_ids = sample_ids_from_grad(
                     optim_ids.squeeze(0),
@@ -251,10 +227,7 @@ class GCG:
                 batch_size = new_search_width if config.batch_size is None else config.batch_size
             
                 input_embeds = torch.cat([
-                    before_embeds.repeat(new_search_width, 1, 1),
                     embedding_layer(sampled_ids),
-                    after_embeds.repeat(new_search_width, 1, 1),
-                    target_embeds.repeat(new_search_width, 1, 1),
                 ], dim=1)
                 loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
 
@@ -314,10 +287,7 @@ class GCG:
 
         # Compute the loss on the initial buffer entries
         init_buffer_embeds = torch.cat([
-            self.before_embeds.repeat(true_buffer_size, 1, 1),
             self.embedding_layer(init_buffer_ids),
-            self.after_embeds.repeat(true_buffer_size, 1, 1),
-            self.target_embeds.repeat(true_buffer_size, 1, 1),
         ], dim=1)
 
         init_buffer_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
@@ -373,17 +343,16 @@ class GCG:
 
                 logits = outputs.logits
 
-                tmp = input_embeds.shape[1] - self.target_ids.shape[1]
-                shift_logits = logits[..., tmp-1:-1, :].contiguous()
+                shift_logits = logits.contiguous()
                 shift_labels = self.target_ids.repeat(current_batch_size, 1)
                 
-                loss = torch.nn.functional.cross_entropy(
+                ce_loss = torch.nn.functional.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)), 
                     shift_labels.view(-1), 
                     reduction="none"
                 )
                 batch_grad = torch.autograd.grad(ce_loss, initial_params, create_graph=True)[0]
-                loss = 1 - torch.nn.functional.cosine_similarity(grad, batch_grad, dim=-1)
+                loss = 1 - torch.nn.functional.cosine_similarity(estimated_grad, batch_grad, dim=-1)
                 all_loss.append(loss)
 
                 del outputs
