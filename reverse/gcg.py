@@ -11,7 +11,7 @@ import transformers
 from torch import Tensor
 from transformers import set_seed
 
-from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, mellowmax
+from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, get_model_params
 
 logger = logging.getLogger("nanogcg")
 if not logger.hasHandlers():
@@ -24,6 +24,7 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+
 @dataclass
 class GCGConfig:
     num_steps: int = 250
@@ -33,8 +34,6 @@ class GCGConfig:
     topk: int = 256
     n_replace: int = 1
     buffer_size: int = 0
-    use_mellowmax: bool = False
-    mellowmax_alpha: float = 1.0
     allow_non_ascii: bool = False
     filter_ids: bool = True
     add_space_before_target: bool = False
@@ -185,7 +184,6 @@ class GCG:
     
     def run(
         self,
-        messages: Union[str, List[dict]],
         target: str,
     ) -> GCGResult:
         model = self.model
@@ -204,12 +202,6 @@ class GCG:
         # Append the GCG string at the end of the prompt if location not specified
         if not any(["{optim_str}" in d["content"] for d in messages]):
             messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
-
-        template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) 
-        # Remove the BOS token -- this will get added when tokenizing, if necessary
-        if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
-            template = template.replace(tokenizer.bos_token, "")
-        before_str, after_str = template.split("{optim_str}")
 
         target = " " + target if config.add_space_before_target else target
 
@@ -348,36 +340,7 @@ class GCG:
         optim_ids : Tensor, shape = (1, n_optim_ids)
             the sequence of token ids that are being optimized 
         """
-        model = self.model
-        embedding_layer = self.embedding_layer
-
-        # Create the one-hot encoding matrix of our optimized token ids
-        optim_ids_onehot = torch.nn.functional.one_hot(optim_ids, num_classes=embedding_layer.num_embeddings)
-        optim_ids_onehot = optim_ids_onehot.to(dtype=model.dtype, device=model.device)
-        optim_ids_onehot.requires_grad_()
-
-        # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
-        optim_embeds = optim_ids_onehot @ embedding_layer.weight
-
-        input_embeds = torch.cat([self.before_embeds, optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-        output = model(inputs_embeds=input_embeds)
-
-        logits = output.logits
-
-        # Shift logits so token n-1 predicts token n
-        shift = input_embeds.shape[1] - self.target_ids.shape[1]
-        shift_logits = logits[..., shift-1:-1, :].contiguous() # (1, num_target_ids, vocab_size)
-        shift_labels = self.target_ids
-
-        if self.config.use_mellowmax:
-            label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-        else:
-            loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
-
-        return optim_ids_onehot_grad
+        raise NotImplementedError("TODO: Make random gradient")
     
     def compute_candidates_loss(
         self,
@@ -393,6 +356,13 @@ class GCG:
                 the embeddings of the `search_width` candidate sequences to evaluate
         """
         all_loss = []
+        # ref:
+        # https://github.com/GeorgeCazenavette/mtt-distillation/blob/main/distill.py
+        # todo: think about how to do multi-step training / when to take grad steps.
+        initial_params = get_model_params(self.model)
+        final_params = get_model_params(self.final_model)
+
+        estimated_grad = (final_params - initial_params) / self.config.num_steps
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
@@ -407,13 +377,13 @@ class GCG:
                 shift_logits = logits[..., tmp-1:-1, :].contiguous()
                 shift_labels = self.target_ids.repeat(current_batch_size, 1)
                 
-                if self.config.use_mellowmax:
-                    label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-                    loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-                else:
-                    loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
-
-                loss = loss.view(current_batch_size, -1).mean(dim=-1)
+                loss = torch.nn.functional.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)), 
+                    shift_labels.view(-1), 
+                    reduction="none"
+                )
+                batch_grad = torch.autograd.grad(ce_loss, initial_params, create_graph=True)[0]
+                loss = 1 - torch.nn.functional.cosine_similarity(grad, batch_grad, dim=-1)
                 all_loss.append(loss)
 
                 del outputs
@@ -427,8 +397,6 @@ def run(
     initial_model: transformers.PreTrainedModel,
     final_model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
-    messages: Union[str, List[dict]],
-    target: str,
     config: Optional[GCGConfig] = None, 
 ) -> GCGResult:
     """Generates a single optimized string using GCG. 
@@ -438,7 +406,6 @@ def run(
         final_model: Parameters of the final model. Goal
             is to get close to this.
         tokenizer: The model's tokenizer.
-        messages: The conversation to use for optimization.
         target: The target generation.
         config: The GCG configuration to use.
     
@@ -456,6 +423,6 @@ def run(
         tokenizer=tokenizer, 
         config=config
     )
-    result = gcg.run(messages, target)
+    result = gcg.run()
     return result
     

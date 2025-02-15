@@ -31,9 +31,6 @@ def get_nonascii_toks(tokenizer, device="cpu"):
     
     return torch.tensor(nonascii_toks, device=device)
 
-def mellowmax(t: Tensor, alpha=1.0, dim=-1):
-   return 1.0 / alpha * (torch.logsumexp(alpha * t, dim=dim) - torch.log(torch.tensor(t.shape[-1], dtype=t.dtype, device=t.device)))
-
 # borrowed from https://github.com/huggingface/accelerate/blob/85a75d4c3d0deffde2fc8b917d9b1ae1cb580eb2/src/accelerate/utils/memory.py#L69
 def should_reduce_batch_size(exception: Exception) -> bool:
     """
@@ -112,3 +109,7 @@ def find_executable_batch_size(function: callable = None, starting_batch_size: i
                     raise
 
     return decorator
+
+
+def get_model_params(model: torch.nn.Module) -> Tensor:
+    return torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
