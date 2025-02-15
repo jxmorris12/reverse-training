@@ -24,16 +24,13 @@ from transformers import (
     is_torch_tpu_available,
     set_seed,
 )
-from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
 
-from collator import CustomCollator
+# from collator import CustomCollator
 from run_args import ModelArguments, DataTrainingArguments, TrainingArguments
 
 
-logger = logging.getLogger(__name__)
-
-def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> None:
+def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> transformers.PreTrainedModel:
     if hasattr(model, 'transformer'):
         if hasattr(model.transformer, 'h'):
             # gpt2
@@ -47,9 +44,10 @@ def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> None:
             model.encoder.layer = model.encoder.layer[:n_layers]
     else:
         raise RuntimeError(f"unknown how to limit layers of model {type(model)}")
+    return model
 
 
-def load_model(model_name: str, n_layers: int):
+def load_model(model_name: str, n_layers: int) -> transformers.PreTrainedModel:
     model = AutoModelForCausalLM.from_pretrained(model_name) 
     return limit_layers(model=model, n_layers=n_layers)
 
@@ -67,31 +65,6 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-
-    if training_args.should_log:
-        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
-        transformers.utils.logging.set_verbosity_info()
-
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
-    logger.info(f"Training/evaluation parameters {training_args}")
-
     # Detecting last checkpoint.
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and not training_args.overwrite_output_dir:
@@ -102,7 +75,7 @@ def main():
                 "Use --overwrite_output_dir to overcome."
             )
         elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
+            print(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
@@ -133,13 +106,13 @@ def main():
     def tokenize_function(examples):
         label_str = examples[label_column_name]
         examples = [
-            f"{label_str} {text}" for text in examples[text_column_name]
+            f"{text} {label}" for text, label in zip(examples[text_column_name], examples[label_column_name])
         ]
         tokenizer.truncation_side = "left" # important for correct truncation
         tokenizer.padding_side = "left" # important for correct padding
         output = tokenizer(
             examples,
-            padding=True,
+            padding="max_length",
             truncation=True,
             max_length=model_args.max_seq_length,
             return_tensors='pt',
@@ -148,7 +121,6 @@ def main():
         # labels should be -1 except the last thing
         output['labels'] = output['input_ids'].clone()
         output['labels'][:, :-1] = -100
-        breakpoint()
         return output
 
 
@@ -176,32 +148,31 @@ def main():
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
     n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-    logger.info(f"Training model from checkpoint `{model_args.model_name_or_path}` - Total size={n_params/2**20:.2f}M params")
+    print(f"Training model from checkpoint `{model_args.model_name_or_path}` - Total size={n_params/2**20:.2f}M params")
 
-    if training_args.do_eval:
-        if "validation" not in tokenized_datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = lm_datasets["validation"]
-        if data_args.max_eval_samples is not None:
-            max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
-            eval_dataset = eval_dataset.select(range(max_eval_samples))
+    if "test" not in tokenized_datasets:
+        raise ValueError("--do_eval requires a validation dataset")
+    eval_dataset = tokenized_datasets["test"]
+    if data_args.max_eval_samples is not None:
+        max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+        eval_dataset = eval_dataset.select(range(max_eval_samples))
 
-        def preprocess_logits_for_metrics(logits, labels):
-            if isinstance(logits, tuple):
-                # Depending on the model and config, logits may contain extra tensors,
-                # like past_key_values, but logits always come first
-                logits = logits[0]
-            return logits.argmax(dim=-1)
+    def preprocess_logits_for_metrics(logits, labels):
+        if isinstance(logits, tuple):
+            # Depending on the model and config, logits may contain extra tensors,
+            # like past_key_values, but logits always come first
+            logits = logits[0]
+        return logits.argmax(dim=-1)
 
-        metric = evaluate.load("accuracy")
+    metric = evaluate.load("accuracy")
 
-        def compute_metrics(eval_preds):
-            preds, labels = eval_preds
-            # preds have the same shape as the labels, after the argmax(-1) has been calculated
-            # by preprocess_logits_for_metrics but we need to shift the labels
-            labels = labels[:, 1:].reshape(-1)
-            preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
+    def compute_metrics(eval_preds):
+        preds, labels = eval_preds
+        # preds have the same shape as the labels, after the argmax(-1) has been calculated
+        # by preprocess_logits_for_metrics but we need to shift the labels
+        labels = labels[:, 1:].reshape(-1)
+        preds = preds[:, :-1].reshape(-1)
+        return metric.compute(predictions=preds, references=labels)
 
     # Initialize our Trainer
     trainer = Trainer(
@@ -210,7 +181,8 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        data_collator=CustomCollator(tokenizer=tokenizer),
+        data_collator=default_data_collator,
+        # data_collator=CustomCollator(tokenizer=tokenizer),
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
         if training_args.do_eval and not is_torch_tpu_available()
@@ -239,7 +211,7 @@ def main():
 
     # Evaluation
     if training_args.do_eval:
-        logger.info("*** Evaluate ***")
+        print("*** Evaluate ***")
 
         metrics = trainer.evaluate()
 

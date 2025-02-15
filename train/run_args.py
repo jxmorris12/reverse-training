@@ -211,6 +211,7 @@ class TrainingArguments(transformers.TrainingArguments):
     # save_strategy: str = "epoch"
 
     def __post_init__(self):
+        super().__post_init__()
         self.report_to = ["wandb"] if (self.use_wandb) else []
         self.dataloader_num_workers = 0
         self.dataloader_pin_memory = True
