@@ -133,22 +133,8 @@ class TrainingArguments(transformers.TrainingArguments):
         default="saves",
         metadata={"help": "Output directory for training saves"}
     )
-    steps_per_epoch: int = field(
-        default=500_000, 
-        metadata={
-            "required": False,
-            "help": "Size of pseudo-training set."
-        },
-    )
-    max_batch_size_fits_in_memory: int = field(
-        default=32, 
-        metadata={
-            "required": False,
-            "help": "Sizes of minibatches used in gradient cache."
-        },
-    )
     num_train_epochs: float = field(
-        default=100.0, 
+        default=5.0, 
         metadata={
             "required": False,
             "help": "Number of epochs for training"
@@ -157,10 +143,6 @@ class TrainingArguments(transformers.TrainingArguments):
     learning_rate: float = field(
         default=2e-5,
         metadata={"help": "The initial learning rate for AdamW on the backbone model."}
-    )
-    prefix_learning_rate: float = field(
-        default=1e-3,
-        metadata={"help": "The initial learning rate for AdamW on the prefix part of model."}
     )
     use_wandb: Optional[bool] = field(
         default=None, metadata={"help": "Whether or not to log to Weights & Biases."}
@@ -190,25 +172,7 @@ class TrainingArguments(transformers.TrainingArguments):
 
     # Won't work since we don't have 'input_ids' key in data.
     include_inputs_for_metrics: bool = False
-
-    # Do evaluation and logging on certain num steps.
-    evaluation_strategy: str = "steps"
-    logging_strategy: str = "steps"
-    save_strategy: str = "steps"
-
-    # logging_steps: int = 20
-    # eval_steps: int = 20
-    # save_steps: int = 20000
-
-    # logging_steps: int = 200
-    # eval_steps: int = 2_500
-    # save_steps: int = 2_500
-    # warmup_steps: int = 10_000
-    warmup_steps: int = 20_000
-    logging_steps: int = 800
-    eval_steps: int = 40_000 # 10_000
-    save_steps: int = 5_000
-    # save_strategy: str = "epoch"
+    save_strategy: str = "epoch"
 
     def __post_init__(self):
         super().__post_init__()
@@ -219,14 +183,6 @@ class TrainingArguments(transformers.TrainingArguments):
         print(f"Set train_args.dataloader_num_workers = {self.dataloader_num_workers}")
 
         self.dataloader_drop_last = True
-
-        # Scale logging steps proportional to batch size.
-        self.warmup_steps = round(self.warmup_steps * (32 / self.train_batch_size))
-        self.logging_steps = round(self.logging_steps * (32 / self.train_batch_size))
-        self.eval_steps = round(self.eval_steps * (32 / self.train_batch_size))
-        self.save_steps = round(self.save_steps * (32 / self.train_batch_size))
-
-        assert not self.bf16, "bf16 training doesn't work with GradCache"
 
         # defaults from SentenceTransformers
         # lr 2e-5
