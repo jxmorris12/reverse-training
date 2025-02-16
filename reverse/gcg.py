@@ -10,6 +10,7 @@ import torch
 import transformers
 from torch import Tensor
 from transformers import set_seed
+import wandb
 
 from utils import (
     INIT_CHARS, 
@@ -33,17 +34,19 @@ if not logger.hasHandlers():
 
 @dataclass
 class GCGConfig:
-    num_steps: int = 250
-    optim_str_init: Union[str, List[str]] = "x x x x x x x x x x x x x x x x x x x x"
-    search_width: int = 512
+    num_steps: int = 2500
+    optim_str_init: Union[str, List[str]] = ("x " * 32).strip()
+    str_batch_size: int = 4
+    search_width: int = 32
     batch_size: int = None
-    topk: int = 256
-    n_replace: int = 1
+    topk: int = 16
+    n_replace: int = 8
     buffer_size: int = 0
     allow_non_ascii: bool = False
-    filter_ids: bool = True
+    filter_ids: bool = False # TODO: make compatible with `str_batch_size` > 1
     seed: int = None
     verbosity: str = "INFO"
+    use_wandb: bool = True
 
 @dataclass
 class GCGResult:
@@ -53,9 +56,20 @@ class GCGResult:
     strings: List[str]
 
 class AttackBuffer:
-    def __init__(self, size: int):
+    def __init__(self, config: GCGConfig):
         self.buffer = [] # elements are (loss: float, optim_ids: Tensor)
-        self.size = size
+        self.size = config.buffer_size
+        self.str_batch_size = config.str_batch_size
+        self.use_wandb = config.use_wandb
+        if self.use_wandb:
+            wandb.init(
+                project="jxm-rev",
+                entity="jack-morris",
+                reinit=True,
+            )
+            wandb.config.update(config)
+        else:
+            wandb.init(mode="disabled")
 
     def add(self, loss: float, optim_ids: Tensor) -> None:
         if self.size == 0:
@@ -80,17 +94,26 @@ class AttackBuffer:
     
     def log_buffer(self, tokenizer):
         message = "buffer:"
+        min_loss = float("inf")
+        min_loss_str = "" 
         for loss, ids in self.buffer:
-            optim_str = tokenizer.batch_decode(ids)[0]
+            ids_unflattened = ids.reshape(self.str_batch_size, -1)
+            optim_str = " | ".join(
+                tokenizer.batch_decode(ids_unflattened)
+            )
             optim_str = optim_str.replace("\\", "\\\\")
             optim_str = optim_str.replace("\n", "\\n")
             message += f"\nloss: {loss}" + f" | string: {optim_str}"
+            if loss < min_loss:
+                min_loss_str = optim_str
+                min_loss = loss
+        wandb.log({"buffer": message, "min_loss": min_loss, "min_loss_str": min_loss_str})
         logger.info(message)
 
-def sample_ids_from_grad(
+def sample_ids_random(
     ids: Tensor, 
-    grad: Tensor, 
     search_width: int, 
+    vocab_size: int,
     topk: int = 256,
     n_replace: int = 1,
     not_allowed_ids: Tensor = False,
@@ -100,8 +123,6 @@ def sample_ids_from_grad(
     Args:
         ids : Tensor, shape = (n_optim_ids)
             the sequence of token ids that are being optimized 
-        grad : Tensor, shape = (n_optim_ids, vocab_size)
-            the gradient of the GCG loss computed with respect to the one-hot token embeddings
         search_width : int
             the number of candidate sequences to return
         topk : int
@@ -118,6 +139,8 @@ def sample_ids_from_grad(
     n_optim_tokens = len(ids)
     original_ids = ids.repeat(search_width, 1)
 
+    grad = torch.randn((n_optim_tokens, vocab_size), device=ids.device)
+
     if not_allowed_ids is not None:
         grad[:, not_allowed_ids.to(grad.device)] = float("inf")
 
@@ -131,7 +154,6 @@ def sample_ids_from_grad(
     ).squeeze(2)
 
     new_ids = original_ids.scatter_(1, sampled_ids_pos, sampled_ids_val)
-
     return new_ids
 
 def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
@@ -199,7 +221,8 @@ class GCG:
             set_seed(config.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
 
-        self.target_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
+        target_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
+        self.target_ids = target_ids.repeat(config.str_batch_size, 1).flatten()[None]
         optim_ids = self.target_ids.clone()
         
         # Initialize the attack buffer
@@ -210,19 +233,15 @@ class GCG:
         optim_strings = []
         
         for _ in tqdm(range(config.num_steps)):
-            # Compute the token gradient
-            optim_ids_onehot_grad = self.compute_token_gradient(optim_ids) 
-
             # Sample candidate token sequences based on the token gradient
-            sampled_ids = sample_ids_from_grad(
-                optim_ids.squeeze(0),
-                optim_ids_onehot_grad.squeeze(0),
-                config.search_width,
-                config.topk,
-                config.n_replace,
+            sampled_ids = sample_ids_random(
+                ids=optim_ids.squeeze(0),
+                search_width=config.search_width,
+                vocab_size=self.tokenizer.vocab_size,
+                topk=config.topk,
+                n_replace=config.n_replace,
                 not_allowed_ids=self.not_allowed_ids,
             )
-
             if config.filter_ids:
                 sampled_ids = filter_ids(sampled_ids, tokenizer)
 
@@ -230,10 +249,8 @@ class GCG:
 
             # Compute loss on all candidate sequences 
             batch_size = new_search_width if config.batch_size is None else config.batch_size
-        
-            input_embeds = torch.cat([
-                embedding_layer(sampled_ids),
-            ], dim=1)
+
+            input_embeds = self.embedding_layer(sampled_ids)
             loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
 
             current_loss = loss.min().item()
@@ -243,7 +260,7 @@ class GCG:
             losses.append(current_loss)
             if buffer.size == 0 or current_loss < buffer.get_highest_loss():
                 buffer.add(current_loss, optim_ids)
-
+            
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
             optim_strings.append(optim_str)
@@ -269,10 +286,12 @@ class GCG:
         logger.info(f"Initializing attack buffer of size {config.buffer_size}...")
 
         # Create the attack buffer and initialize the buffer ids
-        buffer = AttackBuffer(config.buffer_size)
+        buffer = AttackBuffer(config=config)
 
         if isinstance(config.optim_str_init, str):
             init_optim_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
+            init_optim_ids = init_optim_ids.repeat(config.str_batch_size, 1).flatten()[None]
+
             if config.buffer_size > 1:
                 init_buffer_ids = tokenizer(INIT_CHARS, add_special_tokens=False, return_tensors="pt")["input_ids"].squeeze().to(model.device, dtype=torch.float32)
                 init_buffer_ids = [init_buffer_ids[torch.multinomial(init_buffer_ids, init_optim_ids.shape[1], replacement=True)].unsqueeze(0).long() for _ in range(config.buffer_size - 1)]
@@ -280,21 +299,10 @@ class GCG:
             else:
                 init_buffer_ids = init_optim_ids
                 
-        else: # assume list
-            if (len(config.optim_str_init) != config.buffer_size):
-                logger.warning(f"Using {len(config.optim_str_init)} initializations but buffer size is set to {config.buffer_size}")
-            try:
-                init_buffer_ids = tokenizer(config.optim_str_init, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device)
-            except ValueError:
-                logger.error("Unable to create buffer. Ensure that all initializations tokenize to the same length.")
-
         true_buffer_size = max(1, config.buffer_size) 
 
         # Compute the loss on the initial buffer entries
-        init_buffer_embeds = torch.cat([
-            self.embedding_layer(init_buffer_ids),
-        ], dim=1)
-
+        init_buffer_embeds = self.embedding_layer(init_buffer_ids)
         init_buffer_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
 
         # Populate the buffer
@@ -304,18 +312,6 @@ class GCG:
         logger.info("Initialized attack buffer.")
         
         return buffer
-    
-    def compute_token_gradient(
-        self,
-        optim_ids: Tensor,
-    ) -> Tensor:
-        """Computes the gradient of the GCG loss w.r.t the one-hot token matrix.
-
-        Args:
-        optim_ids : Tensor, shape = (1, n_optim_ids)
-            the sequence of token ids that are being optimized 
-        """
-        raise NotImplementedError("TODO: Make random gradient")
     
     def compute_candidates_loss(
         self,
@@ -343,10 +339,14 @@ class GCG:
             input_embeds_batch = input_embeds[i:i+search_batch_size]
             current_batch_size = input_embeds_batch.shape[0]
 
+            # reshape to add batch dimension
+            input_embeds_batch = input_embeds_batch.reshape(-1, self.config.str_batch_size, input_embeds_batch.shape[-1])
+
             outputs = self.model(inputs_embeds=input_embeds_batch)
 
             shift_logits = outputs.logits.contiguous()
             shift_labels = self.target_ids.repeat(current_batch_size, 1)
+            shift_labels = shift_labels.reshape(-1, self.config.str_batch_size)
             
             ce_loss = torch.nn.functional.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)), 
@@ -357,7 +357,7 @@ class GCG:
 
             # 
             batch_grad = get_model_grad(self.model)
-            loss = -1 * torch.nn.functional.cosine_similarity(estimated_grad, batch_grad, dim=-1)
+            loss = 1 - torch.nn.functional.cosine_similarity(estimated_grad, batch_grad, dim=-1)
             all_loss.append(loss)
 
             self.model.zero_grad()
