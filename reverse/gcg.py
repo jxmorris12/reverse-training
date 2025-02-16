@@ -11,7 +11,13 @@ import transformers
 from torch import Tensor
 from transformers import set_seed
 
-from utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, get_model_params
+from utils import (
+    INIT_CHARS, 
+    find_executable_batch_size, 
+    get_nonascii_toks, 
+    get_model_params, 
+    get_model_grad
+)
 
 logger = logging.getLogger("nanogcg")
 if not logger.hasHandlers():
@@ -207,37 +213,36 @@ class GCG:
             # Compute the token gradient
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids) 
 
-            with torch.no_grad():
-                # Sample candidate token sequences based on the token gradient
-                sampled_ids = sample_ids_from_grad(
-                    optim_ids.squeeze(0),
-                    optim_ids_onehot_grad.squeeze(0),
-                    config.search_width,
-                    config.topk,
-                    config.n_replace,
-                    not_allowed_ids=self.not_allowed_ids,
-                )
+            # Sample candidate token sequences based on the token gradient
+            sampled_ids = sample_ids_from_grad(
+                optim_ids.squeeze(0),
+                optim_ids_onehot_grad.squeeze(0),
+                config.search_width,
+                config.topk,
+                config.n_replace,
+                not_allowed_ids=self.not_allowed_ids,
+            )
 
-                if config.filter_ids:
-                    sampled_ids = filter_ids(sampled_ids, tokenizer)
+            if config.filter_ids:
+                sampled_ids = filter_ids(sampled_ids, tokenizer)
 
-                new_search_width = sampled_ids.shape[0]
+            new_search_width = sampled_ids.shape[0]
 
-                # Compute loss on all candidate sequences 
-                batch_size = new_search_width if config.batch_size is None else config.batch_size
-            
-                input_embeds = torch.cat([
-                    embedding_layer(sampled_ids),
-                ], dim=1)
-                loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
+            # Compute loss on all candidate sequences 
+            batch_size = new_search_width if config.batch_size is None else config.batch_size
+        
+            input_embeds = torch.cat([
+                embedding_layer(sampled_ids),
+            ], dim=1)
+            loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
 
-                current_loss = loss.min().item()
-                optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
+            current_loss = loss.min().item()
+            optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
 
-                # Update the buffer based on the loss
-                losses.append(current_loss)
-                if buffer.size == 0 or current_loss < buffer.get_highest_loss():
-                    buffer.add(current_loss, optim_ids)
+            # Update the buffer based on the loss
+            losses.append(current_loss)
+            if buffer.size == 0 or current_loss < buffer.get_highest_loss():
+                buffer.add(current_loss, optim_ids)
 
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
@@ -335,31 +340,33 @@ class GCG:
         estimated_grad = (final_params - initial_params) / self.config.num_steps
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
-            with torch.no_grad():
-                input_embeds_batch = input_embeds[i:i+search_batch_size]
-                current_batch_size = input_embeds_batch.shape[0]
+            input_embeds_batch = input_embeds[i:i+search_batch_size]
+            current_batch_size = input_embeds_batch.shape[0]
 
-                outputs = self.model(inputs_embeds=input_embeds_batch)
+            outputs = self.model(inputs_embeds=input_embeds_batch)
 
-                logits = outputs.logits
+            shift_logits = outputs.logits.contiguous()
+            shift_labels = self.target_ids.repeat(current_batch_size, 1)
+            
+            ce_loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1), 
+                reduction="mean"
+            )
+            ce_loss.backward()
 
-                shift_logits = logits.contiguous()
-                shift_labels = self.target_ids.repeat(current_batch_size, 1)
-                
-                ce_loss = torch.nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), 
-                    shift_labels.view(-1), 
-                    reduction="none"
-                )
-                batch_grad = torch.autograd.grad(ce_loss, initial_params, create_graph=True)[0]
-                loss = 1 - torch.nn.functional.cosine_similarity(estimated_grad, batch_grad, dim=-1)
-                all_loss.append(loss)
+            # 
+            batch_grad = get_model_grad(self.model)
+            loss = -1 * torch.nn.functional.cosine_similarity(estimated_grad, batch_grad, dim=-1)
+            all_loss.append(loss)
 
-                del outputs
-                gc.collect()
-                torch.cuda.empty_cache()
+            self.model.zero_grad()
 
-        return torch.cat(all_loss, dim=0)
+            del outputs
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        return torch.tensor(all_loss, device=self.model.device)
 
 # A wrapper around the GCG `run` method that provides a simple API
 def run(
