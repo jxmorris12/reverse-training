@@ -35,11 +35,11 @@ if not logger.hasHandlers():
 @dataclass
 class GCGConfig:
     num_steps: int = 2500
-    optim_str_init: Union[str, List[str]] = ("x " * 32).strip()
-    str_batch_size: int = 4
-    search_width: int = 32
+    optim_str_init: Union[str, List[str]] = ("x " * 16).strip()
+    str_batch_size: int = 16
+    search_width: int = 16
     batch_size: int = None
-    topk: int = 16
+    topk: int = 128
     n_replace: int = 8
     buffer_size: int = 0
     allow_non_ascii: bool = False
@@ -333,7 +333,7 @@ class GCG:
         initial_params = get_model_params(self.model)
         final_params = get_model_params(self.final_model)
 
-        estimated_grad = (final_params - initial_params) / self.config.num_steps
+        estimated_grad = (initial_params - final_params)
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
             input_embeds_batch = input_embeds[i:i+search_batch_size]

@@ -22,7 +22,7 @@ def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> transfor
 def main():
     gpt2 = transformers.AutoModelForCausalLM.from_pretrained("gpt2")
     initial_model = limit_layers(gpt2, 4)
-    final_model = transformers.AutoModelForCausalLM.from_pretrained("/home/jxm3/research/reverse-training/train/saves/checkpoint-468")
+    final_model = transformers.AutoModelForCausalLM.from_pretrained("/home/jxm3/research/reverse-training/train/saves/checkpoint-7500")
     final_model = limit_layers(final_model, 4)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
     run(

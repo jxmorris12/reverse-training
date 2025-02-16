@@ -120,7 +120,7 @@ def main():
         # output['labels'] = output['input_ids'] # copy to 'labels' for language modeling loss
         # labels should be -1 except the last thing
         output['labels'] = output['input_ids'].clone()
-        output['labels'][:, :-1] = -100
+        # output['labels'][:, :-1] = -100
         return output
 
 
@@ -225,16 +225,6 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-
-    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-generation"}
-    if data_args.dataset_name is not None:
-        kwargs["dataset_tags"] = data_args.dataset_name
-        if data_args.dataset_config_name is not None:
-            kwargs["dataset_args"] = data_args.dataset_config_name
-            kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
-        else:
-            kwargs["dataset"] = data_args.dataset_name
-
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)
