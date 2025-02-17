@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.utils
 import transformers
 from tqdm import tqdm
 from utils import get_network, get_eval_pool, evaluate_synset, get_time
@@ -20,25 +19,27 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 PYTHIA_REVISIONS = [f"step{step}" for step in range(0, 128_000, 1000)]
 
 def get_model_state_dict(model_name: str, revision: str) -> dict[str, torch.Tensor]:
-    return transformers.AutoModelForCausalLM.from_pretrained(model_name, revision=revision).state_dict()
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        revision=revision
+    )
+    return model.state_dict()
 
 def main(args):
+    random.seed(args.seed)
     if args.texture and args.pix_init == "real":
         print("WARNING: Using texture with real initialization will take a very long time to smooth out the boundaries between images.")
+
+    assert args.expert_epochs < args.max_experts, "Expert epochs must be less than max experts"
 
     print("CUDNN STATUS: {}".format(torch.backends.cudnn.enabled))
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()
-    # channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(args.dataset, args.data_path, args.batch_real, args.subset, args=args)
     hidden_size = 512
     sequence_length = 32
     
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
-
-    im_res = im_size[0]
-
-    args.im_size = im_size
 
     accs_all_exps = dict() # record performances of all experiments
     for key in model_eval_pool:
@@ -54,12 +55,11 @@ def main(args):
     )
 
     args = type('', (), {})()
-
     for key in wandb.config._items:
         setattr(args, key, wandb.config._items[key])
 
     if args.batch_syn is None:
-        args.batch_syn = num_classes * args.ipc
+        args.batch_syn = args.dataset_size # Full-batch GD
 
     args.distributed = torch.cuda.device_count() > 1
 
@@ -67,37 +67,11 @@ def main(args):
     print('Hyper-parameters: \n', args.__dict__)
     print('Evaluation model pool: ', model_eval_pool)
 
-    """ organize the real dataset """
-    images_all = []
-    labels_all = []
-    indices_class = [[] for c in range(num_classes)]
-    print("BUILDING DATASET")
-    for i in tqdm(range(len(dst_train))):
-        sample = dst_train[i]
-        images_all.append(torch.unsqueeze(sample[0], dim=0))
-        labels_all.append(class_map[torch.tensor(sample[1]).item()])
-
-    for i, lab in tqdm(enumerate(labels_all)):
-        indices_class[lab].append(i)
-    images_all = torch.cat(images_all, dim=0).to("cpu")
-    labels_all = torch.tensor(labels_all, dtype=torch.long, device="cpu")
-
-    for c in range(num_classes):
-        print('class c = %d: %d real images'%(c, len(indices_class[c])))
-
-    for ch in range(channel):
-        print('real images channel %d, mean = %.4f, std = %.4f'%(ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
-
-
-    def get_images(c, n):  # get random n images from class c
-        idx_shuffle = np.random.permutation(indices_class[c])[:n]
-        return images_all[idx_shuffle]
-
-
     """ initialize the synthetic data """
-    label_syn = torch.tensor([np.ones(args.ipc,dtype=np.int_)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
-
-    image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float)
+    token_embeddings_syn = torch.randn(
+        size=(args.dataset_size, sequence_length, hidden_size
+        ), dtype=torch.float32
+    )
 
     syn_lr = torch.tensor(args.lr_teacher).to(args.device)
 
@@ -105,33 +79,32 @@ def main(args):
 
 
     """ training """
-    image_syn = image_syn.detach().to(args.device).requires_grad_(True)
+    token_embeddings_syn = token_embeddings_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-    optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
+    optimizer_img = torch.optim.SGD([token_embeddings_syn], lr=args.lr_img, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
     optimizer_img.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
     print('%s training begins'%get_time())
 
-    expert_dir = os.path.join(args.buffer_path, args.dataset)
-    if args.dataset == "ImageNet":
-        expert_dir = os.path.join(expert_dir, args.subset, str(args.res))
-    expert_dir = os.path.join(expert_dir, args.model)
-    print("Expert Dir: {}".format(expert_dir))
-
     # load expert trajectories
     expert_revisions = PYTHIA_REVISIONS
-    random.shuffle(expert_revisions)
+    # random.shuffle(expert_revisions)
+    if args.max_experts is not None:
+        expert_start_epoch = random.randint(0, len(expert_revisions) - args.max_experts)
+        expert_revisions = expert_revisions[expert_start_epoch:expert_start_epoch + args.max_experts]
     
     buffer = [get_model_state_dict(args.model_name, revision) for revision in expert_revisions]
-    if args.max_experts is not None:
-        buffer = buffer[:args.max_experts]
 
     best_acc = {m: 0 for m in model_eval_pool}
     best_std = {m: 0 for m in model_eval_pool}
 
-    student_net = transformers.AutoModelForCausalLM.from_pretrained(args.model_name).to(args.device)  # get a random model
+    student_net = transformers.AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        attn_implementation="eager",
+        # attn_imports="flex_attention",
+    ).to(args.device)  # get a random model
     student_net = ReparamModule(student_net)
 
     if args.distributed:
@@ -146,21 +119,16 @@ def main(args):
 
         num_params = sum([np.prod(p.size()) for p in (student_net.parameters())])
 
-        # if args.load_all:
-        expert_trajectory = buffer[np.random.randint(0, len(buffer))]
-        start_epoch = np.random.randint(0, args.max_start_epoch)
-        starting_params = expert_trajectory[start_epoch]
+        start_epoch = np.random.randint(0, len(buffer) - args.expert_epochs)
+        starting_params = buffer[start_epoch]
+        print("start_epoch", start_epoch, "len(buffer)", len(buffer))
 
-        target_params = expert_trajectory[start_epoch+args.expert_epochs]
-        target_params = torch.cat([p.data.to(args.device).reshape(-1) for p in target_params], 0)
+        target_params = buffer[start_epoch+args.expert_epochs]
+        target_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in target_params.items()], 0)
+        student_params = [torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0).requires_grad_(True)]
+        starting_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0)
 
-        student_params = [torch.cat([p.data.to(args.device).reshape(-1) for p in starting_params], 0).requires_grad_(True)]
-
-        starting_params = torch.cat([p.data.to(args.device).reshape(-1) for p in starting_params], 0)
-
-        syn_images = image_syn
-
-        y_hat = label_syn.to(args.device)
+        syn_images = token_embeddings_syn
 
         param_loss_list = []
         param_dist_list = []
@@ -173,16 +141,26 @@ def main(args):
 
             these_indices = indices_chunks.pop()
             x = syn_images[these_indices]
-            this_y = y_hat[these_indices]
 
             if args.distributed:
                 forward_params = student_params[-1].unsqueeze(0).expand(torch.cuda.device_count(), -1)
             else:
                 forward_params = student_params[-1]
-            x = student_net(x, flat_param=forward_params)
-            ce_loss = criterion(x, this_y)
+            output = student_net(inputs_embeds=x, flat_param=forward_params)
 
-            grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
+            # autoregressive mimicry loss            
+            outputs_softmax = F.log_softmax(output.logits[:, :-1], dim=-1)
+            with student_net.unflattened_param(forward_params):
+                word_embeddings = student_net.module.get_input_embeddings().to(args.device)
+
+            mimiced_embeddings = torch.einsum("bsv,vd->bsd", outputs_softmax, word_embeddings.weight)
+            mimiced_embeddings = mimiced_embeddings.view(-1, hidden_size)
+
+            x_inputs = x[:, 1:, :].contiguous().view(-1, hidden_size)
+            assert x_inputs.shape == mimiced_embeddings.shape, f"invalid shape: {x_inputs.shape} != {mimiced_embeddings.shape}"
+            mse_loss = torch.nn.functional.mse_loss(mimiced_embeddings, x_inputs, reduction="mean")
+
+            grad = torch.autograd.grad(mse_loss, student_params[-1], create_graph=True)[0]
 
             student_params.append(student_params[-1] - syn_lr * grad)
 
@@ -206,8 +184,10 @@ def main(args):
 
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
-
-        grand_loss.backward()
+    
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            # https://github.com/pytorch/pytorch/issues/116350
+            grand_loss.backward()
 
         optimizer_img.step()
         optimizer_lr.step()
@@ -227,18 +207,11 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Parameter Processing')
 
-    parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
-
-    parser.add_argument('--subset', type=str, default='imagenette', help='ImageNet subset. This only does anything when --dataset=ImageNet')
-
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
-
     parser.add_argument('--res', type=int, default=128, help='resolution for imagenet')
+    parser.add_argument('--eval_mode', type=str, default='S', help='eval_mode, check utils.py for more info')
 
-    parser.add_argument('--ipc', type=int, default=1, help='image(s) per class')
-
-    parser.add_argument('--eval_mode', type=str, default='S',
-                        help='eval_mode, check utils.py for more info')
+    parser.add_argument("--dataset_size", "--ds", type=int, default=1000, help="size of distilled dataset")
 
     parser.add_argument('--num_eval', type=int, default=5, help='how many networks to evaluate on')
 
@@ -256,7 +229,6 @@ if __name__ == '__main__':
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
     parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
     parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
-    parser.add_argument('--expert_name', type=str, default='./buffers', help='buffer path')
     parser.add_argument('--model_name', type=str, default='EleutherAI/pythia-70m', help='model name')
 
     parser.add_argument('--expert_epochs', type=int, default=3, help='how many expert epochs the target params are')
@@ -269,8 +241,8 @@ if __name__ == '__main__':
 
 
     parser.add_argument('--max_experts', type=int, default=16, help='number of experts to read per file (leave as None unless doing ablations)')
-
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
+    parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
 
     args = parser.parse_args()
 
