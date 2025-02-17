@@ -32,9 +32,6 @@ def main(args):
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
 
-    if args.texture and args.pix_init == "real":
-        print("WARNING: Using texture with real initialization will take a very long time to smooth out the boundaries between images.")
-
     assert args.expert_epochs < args.max_experts, "Expert epochs must be less than max experts"
 
     print("CUDNN STATUS: {}".format(torch.backends.cudnn.enabled))
@@ -48,7 +45,6 @@ def main(args):
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
-        mode="disabled",
     )
 
     args = type('', (), {})()
@@ -99,9 +95,9 @@ def main(args):
     """ training """
     token_embeddings_syn = token_embeddings_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
-    optimizer_img = torch.optim.SGD([token_embeddings_syn], lr=args.lr_img, momentum=0.5)
+    optimizer_token_embeddings = torch.optim.SGD([token_embeddings_syn], lr=args.lr_img, momentum=0.5)
     optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
-    optimizer_img.zero_grad()
+    optimizer_token_embeddings.zero_grad()
 
     criterion = nn.CrossEntropyLoss().to(args.device)
     print('%s training begins'%get_time())
@@ -163,6 +159,11 @@ def main(args):
             mse_loss = torch.nn.functional.mse_loss(mimiced_embeddings, x_inputs, reduction="sum") / sequence_length
             print("mse_loss:", mse_loss)
 
+            # exit on nan
+            if torch.isnan(mse_loss):
+                print("nan detected - stopping!")
+                break
+
             grad = torch.autograd.grad(mse_loss, student_params[-1], create_graph=True)[0]
             student_params.append(student_params[-1] - syn_lr * grad)
 
@@ -172,7 +173,6 @@ def main(args):
 
         param_loss += torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist += torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
-
         param_loss_list.append(param_loss)
         param_dist_list.append(param_dist)
 
@@ -184,14 +184,13 @@ def main(args):
 
         grand_loss = param_loss
 
-        optimizer_img.zero_grad()
+        optimizer_token_embeddings.zero_grad()
         optimizer_lr.zero_grad()
     
-        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
-            # https://github.com/pytorch/pytorch/issues/116350
-            grand_loss.backward()
+        # https://github.com/pytorch/pytorch/issues/116350
+        grand_loss.backward()
 
-        optimizer_img.step()
+        optimizer_token_embeddings.step()
         optimizer_lr.step()
 
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
@@ -234,12 +233,6 @@ if __name__ == '__main__':
     parser.add_argument('--expert_epochs', type=int, default=3, help='how many expert epochs the target params are')
     parser.add_argument('--syn_steps', type=int, default=20, help='how many steps to take on synthetic data')
     parser.add_argument('--max_start_epoch', type=int, default=25, help='max epoch we can start at')
-
-    parser.add_argument('--texture', action='store_true', help="will distill textures instead")
-    parser.add_argument('--canvas_size', type=int, default=2, help='size of synthetic canvas')
-    parser.add_argument('--canvas_samples', type=int, default=1, help='number of canvas samples per iteration')
-
-
     parser.add_argument('--max_experts', type=int, default=16, help='number of experts to read per file (leave as None unless doing ablations)')
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
