@@ -107,7 +107,7 @@ class ReparamModule(nn.Module):
             return self
         return super(ReparamModule, self)._apply(*args, **kwargs)
 
-    def _unflatten_param(self, flat_param):
+    def _unflatten_param(self, flat_param: torch.Tensor):
         ps = (t.view(s) for (t, s) in zip(flat_param.split(self._param_numels), self._param_shapes))
         for (mn, n), p in zip(self._param_infos, ps):
             setattr(self._get_module_from_name(mn), n, p)  # This will set as plain attr
