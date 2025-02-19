@@ -120,7 +120,7 @@ def main():
         # output['labels'] = output['input_ids'] # copy to 'labels' for language modeling loss
         # labels should be -1 except the last thing
         output['labels'] = output['input_ids'].clone()
-        # output['labels'][:, :-1] = -100
+        output['labels'][:, :-1] = -100
         return output
 
 

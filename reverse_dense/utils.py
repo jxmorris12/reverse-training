@@ -6,8 +6,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformers
 import os
-import kornia as K
 import tqdm
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
@@ -545,3 +545,20 @@ AUGMENT_FNS = {
     'scale': [rand_scale],
     'rotate': [rand_rotate],
 }
+
+
+def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> transformers.PreTrainedModel:
+    if hasattr(model, 'transformer'):
+        if hasattr(model.transformer, 'h'):
+            # gpt2
+            model.transformer.h = model.transformer.h[:n_layers]
+        else:
+            model.transformer.layer = model.transformer.layer[:n_layers]
+    elif hasattr(model, 'encoder'):
+        if hasattr(model.encoder, 'layers'):
+            model.encoder.layers = model.encoder.layers[:n_layers]
+        else:
+            model.encoder.layer = model.encoder.layer[:n_layers]
+    else:
+        raise RuntimeError(f"unknown how to limit layers of model {type(model)}")
+    return model

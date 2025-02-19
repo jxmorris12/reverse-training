@@ -172,7 +172,7 @@ class TrainingArguments(transformers.TrainingArguments):
 
     # Won't work since we don't have 'input_ids' key in data.
     include_inputs_for_metrics: bool = False
-    save_strategy: str = "epoch"
+    save_strategy: str = "steps"
 
     def __post_init__(self):
         super().__post_init__()

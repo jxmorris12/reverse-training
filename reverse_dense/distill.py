@@ -1,7 +1,9 @@
 import argparse
 import copy
-import numpy as np
+import glob
 import os
+
+import numpy as np
 import random
 import torch
 import torch.nn as nn
@@ -10,20 +12,20 @@ import tqdm
 import transformers
 import wandb
 
-from utils import get_network, evaluate_synset, get_time
+from utils import get_network, evaluate_synset, get_time, limit_layers
 from reparam_module import ReparamModule
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
-PYTHIA_REVISIONS = [f"step{step}" for step in range(0, 128_000, 1000)]
+# PYTHIA_REVISIONS = [f"step{step}" for step in range(0, 128_000, 1000)]
+EXPERT_PATHS = glob.glob("/home/jxm3/research/reverse-training/train/saves/checkpoint-*")
 
-def get_model_state_dict(model_name: str, revision: str) -> dict[str, torch.Tensor]:
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        revision=revision
-    )
+def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
+    model = transformers.AutoModelForCausalLM.from_pretrained(model_name)
+    model = limit_layers(model, 4) # TODO: Override from config?
+    print("Warning: Limiting layers to 4")
     return model.state_dict()
 
 def main(args):
@@ -45,7 +47,7 @@ def main(args):
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
-        # mode="disabled",
+        mode="disabled",
     )
 
     args = type('', (), {})()
@@ -102,13 +104,13 @@ def main(args):
     print('%s [time] training begins'%get_time())
 
     # load expert trajectories
-    expert_revisions = PYTHIA_REVISIONS
+    expert_paths = EXPERT_PATHS
     # random.shuffle(expert_revisions)
     if args.max_experts is not None:
-        expert_start_epoch = random.randint(0, len(expert_revisions) - args.max_experts)
-        expert_revisions = expert_revisions[expert_start_epoch:expert_start_epoch + args.max_experts]
+        expert_start_epoch = random.randint(0, len(expert_paths) - args.max_experts)
+        expert_paths = expert_paths[expert_start_epoch:expert_start_epoch + args.max_experts]
     
-    buffer = [get_model_state_dict(args.model_name, revision) for revision in expert_revisions]
+    buffer = [get_model_state_dict(model_path) for revision in expert_paths]
     for it in tqdm.trange(0, args.Iteration+1, desc="Iterations"):
         save_this_it = False
 
@@ -118,18 +120,19 @@ def main(args):
 
         start_epoch = np.random.randint(0, len(buffer) - args.expert_epochs)
         starting_params = buffer[start_epoch]
-
         target_params = buffer[start_epoch+args.expert_epochs]
-        target_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in target_params.items()], 0)
         student_params = [torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0).requires_grad_(True)]
+
+        target_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in target_params.items()], 0)
         starting_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0)
+
 
         syn_token_embeddings = token_embeddings_syn
 
         param_loss_list = []
         param_dist_list = []
         indices_chunks = []
-        mse_losses = []
+        ce_losses = []
 
         for step in tqdm.trange(args.syn_steps, desc="Synthetic Steps", leave=False):
             if not indices_chunks:
@@ -146,40 +149,41 @@ def main(args):
             output = student_net(inputs_embeds=x, flat_param=forward_params)
 
             # autoregressive mimicry loss            
-            with student_net.unflattened_param(forward_params):
-                word_embeddings = student_net.module.get_input_embeddings().to(args.device)
-
             outputs_softmax = F.softmax(output.logits[:, :-1], dim=-1)
-            outputs_softmax = outputs_softmax.contiguous().view(-1, word_embeddings.weight.shape[0])
+            outputs_softmax = outputs_softmax.contiguous().view(-1, outputs_softmax.shape[-1])
 
+            with student_net.unflattened_param(forward_params):
+                token_embeddings = student_net.module.get_input_embeddings().to(args.device)
             x_inputs = x[:, 1:, :].contiguous().view(-1, hidden_size)
-            x_inputs_logits = x_inputs @ word_embeddings.weight.T
-            inputs_softmax = F.softmax(x_inputs_logits, dim=-1)
-
+            x_inputs_logits = x_inputs @ token_embeddings.weight.T
+            #  TODO: Consider Gumbel
+            inputs_softmax = F.softmax(x_inputs_logits * 80, dim=-1) # TODO: Think about temp
             
             assert outputs_softmax.shape == inputs_softmax.shape, f"invalid shape: {outputs_softmax.shape} != {inputs_softmax.shape}"
-            # mse_loss = torch.nn.functional.mse_loss(mimiced_embeddings, x_inputs, reduction="sum") / sequence_length
-            mse_loss = torch.nn.functional.cross_entropy(outputs_softmax, inputs_softmax, reduction="sum") / sequence_length
-            mse_losses.append(mse_loss.detach().item())
+            # ce_loss = torch.nn.functional.mse_loss(mimiced_embeddings, x_inputs, reduction="sum") / sequence_length
+            ce_loss = torch.nn.functional.cross_entropy(outputs_softmax, inputs_softmax, reduction="mean")
+            ce_losses.append(ce_loss.detach().item())
 
             # exit on nan
-            if torch.isnan(mse_loss):
+            if torch.isnan(ce_loss):
                 print("nan detected - stopping!")
                 exit()
 
-            grad = torch.autograd.grad(mse_loss, student_params[-1], create_graph=True)[0]
+            grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
             student_params.append(student_params[-1] - syn_lr * grad)
 
 
-        param_loss = torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
+        # param_loss = torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist = torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
 
-        param_loss_list.append(param_loss)
+        # param_loss_list.append(param_loss)
         param_dist_list.append(param_dist)
 
-        param_loss /= num_params
+        # param_loss /= num_params
         param_dist /= num_params
-        param_loss /= param_dist
+        # param_loss /= param_dist
+        param_loss = 1 - torch.nn.functional.cosine_similarity(student_params[-1] - starting_params, target_params - starting_params, dim=0)
+        # param_loss = 1 - torch.nn.functional.cosine_similarity(student_params[-1] - target_params, starting_param - target_params, dim=0)
 
         optimizer_token_embeddings.zero_grad()
         optimizer_lr.zero_grad()
@@ -190,14 +194,15 @@ def main(args):
         optimizer_token_embeddings.step()
         optimizer_lr.step()
 
-        mse_loss_avg = sum(mse_losses) / len(mse_losses)
+        ce_loss_avg = sum(ce_losses) / len(ce_losses)
         wandb.log(
             {
                 "param_loss": param_loss.detach().cpu(),
-                "param_loss_minus_one": (param_loss - 1).detach().cpu(),
+                # "param_loss_minus_one": (param_loss - 1).detach().cpu(),
                 "param_dist": param_dist.detach().cpu(),
                 "start_epoch": start_epoch,
-                "mse_loss": mse_loss_avg,
+                "ce_loss": ce_loss_avg,
+                "token_grad_norm": token_embeddings_syn.grad.norm().detach().cpu(),
             }
         )
 
@@ -205,7 +210,7 @@ def main(args):
             del _
 
         if it%10 == 0:
-            print('%s iter = %04d, loss = %.8f, oneofloss = %.8f, mse_loss = %.8f' % (get_time(), it, param_loss.item(), (param_loss - 1).item(), mse_loss_avg))
+            print('%s iter = %04d, loss = %.8f, oneofloss = %.8f, ce_loss = %.8f' % (get_time(), it, param_loss.item(), (param_loss - 1).item(), ce_loss_avg))
 
     wandb.finish()
 
