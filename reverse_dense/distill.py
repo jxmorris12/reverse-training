@@ -26,6 +26,9 @@ num_expert_steps = 2
 torch.autograd.set_detect_anomaly(True)
 
 
+def state_dict_to_tensor(ordered_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    return torch.cat([p.data.to(args.device).reshape(-1) for n, p in ordered_dict.items()], 0)
+
 def get_token_embeddings_syn(ds: datasets.Dataset) -> tuple[torch.Tensor, torch.Tensor]:
     """ initialize the synthetic data """
     student_net = get_model("gpt2")
@@ -83,7 +86,7 @@ def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     if torch.isclose(state_dict["transformer.wte.weight"], state_dict["lm_head.weight"]).all():
         del state_dict["lm_head.weight"]
     
-    return state_dict
+    return { k: v.detach().clone() for k,v in state_dict.items() }
 
 
 def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
@@ -138,7 +141,6 @@ def load_expert_paths(ds: datasets.Dataset):
     # if args.max_experts is not None:
     #     expert_start_epoch = random.randint(0, len(expert_paths) - args.max_experts)
     #     expert_paths = expert_paths[expert_start_epoch:expert_start_epoch + args.max_experts]
-    
     return expert_paths
 
 
@@ -200,8 +202,8 @@ def main(args):
         target_params = buffer[start_epoch+args.expert_epochs]
         student_params = [torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0).requires_grad_(True)]
 
-        target_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in target_params.items()], 0)
-        starting_params = torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0)
+        target_params = state_dict_to_tensor(target_params)
+        starting_params = state_dict_to_tensor(starting_params)
 
         param_loss_list = []
         param_dist_list = []
@@ -232,9 +234,11 @@ def main(args):
             grad = torch.autograd.grad(ce_loss, student_params[-1], create_graph=True)[0]
             student_params.append(student_params[-1] - syn_lr * grad)
 
-
         param_loss = torch.nn.functional.mse_loss(student_params[-1], target_params, reduction="sum")
         param_dist = torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum")
+        if torch.isclose(param_dist, torch.tensor(0.0)):
+            print("zero distance detected – stopping!")
+            exit()
 
         param_loss_list.append(param_loss)
         param_dist_list.append(param_dist)
@@ -270,7 +274,7 @@ def main(args):
         for _ in student_params:
             del _
 
-        if it%10 == 0:
+        if it % 10 == 0:
             print('%s iter = %04d, loss = %.8f, oneofloss = %.8f, ce_loss = %.8f' % (get_time(), it, param_loss.item(), (param_loss - 1).item(), ce_loss_avg))
 
     wandb.finish()
