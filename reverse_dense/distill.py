@@ -4,6 +4,7 @@ import glob
 import os
 import re
 
+import datasets
 import numpy as np
 import random
 import torch
@@ -16,17 +17,56 @@ import wandb
 from utils import get_network, evaluate_synset, get_time, limit_layers
 from reparam_module import ReparamModule
 
-import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+sequence_length = 32
+text_column_name = "text"        
+label_column_name = "label"
+num_expert_steps = 2
+
+torch.autograd.set_detect_anomaly(True)
 
 
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower()
-            for text in re.split('([0-9]+)', s)]
+def get_token_embeddings_syn(ds: datasets.Dataset) -> tuple[torch.Tensor, torch.Tensor]:
+    """ initialize the synthetic data """
+    student_net = get_model("gpt2")
+    student_net.train()
+    student_token_embeddings = student_net.get_input_embeddings().to(args.device)
+    # TODO: Consider other initialization methods
+    def simple_soft_one_hot(x, num_classes, temperature=1.0):
+        one_hot = F.one_hot(x, num_classes).float()
+        return F.softmax(one_hot / temperature, dim=-1)
+    
+    hidden_size = student_token_embeddings.weight.shape[1]
 
+    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.truncation_side = "left" # important for correct truncation
+    tokenizer.padding_side = "left" 
+    tokens = tokenizer.batch_encode_plus(
+        ds["text"][0:args.dataset_size],
+        return_tensors="pt", 
+        padding="max_length", 
+        truncation=True, 
+        max_length=sequence_length-1, 
+        return_attention_mask=False
+    )
+    token_embeddings_syn = student_token_embeddings(tokens["input_ids"].to(args.device))
+    # rand_token_idxs = torch.randint(0, student_token_embeddings.num_embeddings, (args.dataset_size, sequence_length - 1), device=args.device)
+    # rand_token_one_hots = simple_soft_one_hot(rand_token_idxs, student_token_embeddings.num_embeddings, temperature=0.1)
+    # token_embeddings_syn = rand_token_one_hots @ student_token_embeddings.weight
+    # token_embeddings_syn = token_embeddings_syn[None, None].repeat(args.dataset_size, sequence_length, 1)
+    # token_embeddings_syn = torch.randn(
+    #     size=(args.dataset_size, sequence_length, hidden_size
+    #     ), dtype=torch.float32
+    # )
+    assert token_embeddings_syn.shape == (args.dataset_size, sequence_length - 1, hidden_size), f"invalid shape: {token_embeddings_syn.shape}, need {(args.dataset_size, sequence_length - 1, hidden_size)}"
 
-EXPERT_PATHS = glob.glob("/home/jxm3/research/reverse-training/train/saves/checkpoint-*")
-EXPERT_PATHS = sorted(EXPERT_PATHS, key=natural_sort_key)
+    num_classes = 4
+    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=args.device) # for AG_News... tmp
+    token_labels_syn = torch.randint(low=0, high=num_classes, size=[args.dataset_size], device=args.device)
+    token_labels_syn = CLASS_MAP[token_labels_syn]
+    return (token_embeddings_syn, token_labels_syn)
+
 
 def get_model(model_path: str) -> dict[str, torch.Tensor]:
     model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -36,8 +76,7 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
     print("Warning: Limiting layers to 4")
     return limit_layers(model, 4) # TODO: Override from config?
 
-def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
-    model = get_model(model_path)
+def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     state_dict = model.state_dict()
     
     # hack to get around gpt weight-tying:
@@ -45,6 +84,63 @@ def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
         del state_dict["lm_head.weight"]
     
     return state_dict
+
+
+def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
+    return _get_state_dict(get_model(model_path))
+
+
+def load_expert_paths(ds: datasets.Dataset):
+    student_net = get_model("gpt2")
+    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.truncation_side = "left" # important for correct truncation
+    tokenizer.padding_side = "left" 
+
+    optim = torch.optim.Adam(student_net.parameters(), lr=1e-4)
+
+    expert_paths = [_get_state_dict(student_net)]
+    for step in range(num_expert_steps):
+        # TODO: Decide on a new batch size; choose random
+        examples = ds.select(range(8)) 
+        examples = [
+            f"{text} {label}" 
+            for text, label in zip(examples[text_column_name], examples[label_column_name])
+        ]
+        tokens = tokenizer.batch_encode_plus(
+            examples,
+            return_tensors="pt", 
+            padding="max_length", 
+            truncation=True, 
+            max_length=sequence_length, 
+        )
+        print("calling student_net")
+        outputs = student_net(
+            input_ids=tokens.input_ids,
+            attention_mask=tokens.attention_mask,
+        )
+        labels = tokens.input_ids.detach().clone()
+        labels[:, :-1] = -100
+        print("[computing loss]", outputs.logits.shape, labels.shape)
+        loss = torch.nn.functional.cross_entropy(
+            outputs.logits.reshape(labels.numel(), -1), 
+            labels.reshape(labels.numel(),),
+            ignore_index=-100
+        )
+        print(f"Step {step+1} | Loss = {loss:.3f}")
+        loss.backward()
+        optim.step()
+        optim.zero_grad()
+        student_net.zero_grad()
+        expert_paths.append(_get_state_dict(student_net))
+
+    # # random.shuffle(expert_revisions)
+    # if args.max_experts is not None:
+    #     expert_start_epoch = random.randint(0, len(expert_paths) - args.max_experts)
+    #     expert_paths = expert_paths[expert_start_epoch:expert_start_epoch + args.max_experts]
+    
+    return expert_paths
+
 
 def main(args):
     random.seed(args.seed)
@@ -62,7 +158,7 @@ def main(args):
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
-        # mode="disabled",
+        mode="disabled",
     )
 
     args = type('', (), {})()
@@ -73,53 +169,16 @@ def main(args):
         args.batch_syn = args.dataset_size # Full-batch GD
     print('Hyper-parameters: \n', args.__dict__)
 
-    student_net = get_model(EXPERT_PATHS[0]).to(args.device)
-    student_net = ReparamModule(student_net)
-    student_net.train()
-    """ initialize the synthetic data """
-    student_token_embeddings = student_net.module.get_input_embeddings().to(args.device)
-    # TODO: Consider other initialization methods
-    def simple_soft_one_hot(x, num_classes, temperature=1.0):
-        one_hot = F.one_hot(x, num_classes).float()
-        return F.softmax(one_hot / temperature, dim=-1)
-    
-    hidden_size = student_token_embeddings.weight.shape[1]
-    sequence_length = 32
-
-    import datasets
+    # student_net = get_model(EXPERT_PATHS[0]).to(args.device)
     ds = datasets.load_dataset("fancyzhx/ag_news", split="train")
-    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.truncation_side = "left" # important for correct truncation
-    tokenizer.padding_side = "left" 
-    tokens = tokenizer.batch_encode_plus(
-        ds["text"][0:args.dataset_size],
-        return_tensors="pt", 
-        padding="max_length", 
-        truncation=True, 
-        max_length=sequence_length-1, 
-        return_attention_mask=False
-    )
-    token_embeddings_syn = student_token_embeddings(tokens["input_ids"].to(args.device))
+    token_embeddings_syn, token_labels_syn = get_token_embeddings_syn(ds=ds)
+    token_embeddings_syn = token_embeddings_syn.detach().to(args.device).requires_grad_(True)
 
-    # rand_token_idxs = torch.randint(0, student_token_embeddings.num_embeddings, (args.dataset_size, sequence_length - 1), device=args.device)
-    # rand_token_one_hots = simple_soft_one_hot(rand_token_idxs, student_token_embeddings.num_embeddings, temperature=0.1)
-    # token_embeddings_syn = rand_token_one_hots @ student_token_embeddings.weight
-    # token_embeddings_syn = token_embeddings_syn[None, None].repeat(args.dataset_size, sequence_length, 1)
-    # token_embeddings_syn = torch.randn(
-    #     size=(args.dataset_size, sequence_length, hidden_size
-    #     ), dtype=torch.float32
-    # )
-    assert token_embeddings_syn.shape == (args.dataset_size, sequence_length - 1, hidden_size), f"invalid shape: {token_embeddings_syn.shape}, need {(args.dataset_size, sequence_length - 1, hidden_size)}"
-
-    num_classes = 4
-    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=args.device) # for AG_News
-    token_labels_syn = torch.randint(low=0, high=num_classes, size=[args.dataset_size], device=args.device)
-    token_labels_syn = CLASS_MAP[token_labels_syn]
+    # train model for a couple steps
+    student_net = get_model("gpt2")
+    student_net = ReparamModule(student_net)
 
     syn_lr = torch.tensor(args.lr_teacher).to(args.device)
-
-    token_embeddings_syn = token_embeddings_syn.detach().to(args.device).requires_grad_(True)
     syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
 
     # optimizer_token_embeddings = torch.optim.AdamW([token_embeddings_syn], lr=args.lr_img)
@@ -130,13 +189,7 @@ def main(args):
     print('%s [time] training begins'%get_time())
 
     # load expert trajectories
-    expert_paths = EXPERT_PATHS
-    # random.shuffle(expert_revisions)
-    if args.max_experts is not None:
-        expert_start_epoch = random.randint(0, len(expert_paths) - args.max_experts)
-        expert_paths = expert_paths[expert_start_epoch:expert_start_epoch + args.max_experts]
-    
-    buffer = [get_model_state_dict(model_path) for model_path in expert_paths]
+    buffer = load_expert_paths(ds=ds)
     for it in tqdm.trange(0, args.Iteration+1, desc="Iterations"):
         wandb.log({"Progress": it, "Synthetic_LR": syn_lr.detach().cpu()}, step=it)
 
