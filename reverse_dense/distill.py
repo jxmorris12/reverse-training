@@ -18,6 +18,9 @@ from utils import get_network, evaluate_synset, get_time, limit_layers
 from reparam_module import ReparamModule
 
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 sequence_length = 32
 text_column_name = "text"        
 label_column_name = "label"
@@ -31,13 +34,13 @@ torch.autograd.set_detect_anomaly(True)
 
 
 def state_dict_to_tensor(ordered_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-    return torch.cat([p.data.to(args.device).reshape(-1) for n, p in ordered_dict.items()], 0)
+    return torch.cat([p.data.to(device).reshape(-1) for n, p in ordered_dict.items()], 0)
 
 def get_token_embeddings_syn(ds: datasets.Dataset) -> tuple[torch.Tensor, torch.Tensor]:
     """ initialize the synthetic data """
     student_net = get_model("gpt2")
     student_net.train()
-    student_token_embeddings = student_net.get_input_embeddings().to(args.device)
+    student_token_embeddings = student_net.get_input_embeddings().to(device)
     # TODO: Consider other initialization methods
     def simple_soft_one_hot(x, num_classes, temperature=1.0):
         one_hot = F.one_hot(x, num_classes).float()
@@ -57,8 +60,8 @@ def get_token_embeddings_syn(ds: datasets.Dataset) -> tuple[torch.Tensor, torch.
         max_length=sequence_length-1, 
         return_attention_mask=False
     )
-    token_embeddings_syn = student_token_embeddings(tokens["input_ids"].to(args.device))
-    # rand_token_idxs = torch.randint(0, student_token_embeddings.num_embeddings, (args.dataset_size, sequence_length - 1), device=args.device)
+    token_embeddings_syn = student_token_embeddings(tokens["input_ids"].to(device))
+    # rand_token_idxs = torch.randint(0, student_token_embeddings.num_embeddings, (args.dataset_size, sequence_length - 1), device=device)
     # rand_token_one_hots = simple_soft_one_hot(rand_token_idxs, student_token_embeddings.num_embeddings, temperature=0.1)
     # token_embeddings_syn = rand_token_one_hots @ student_token_embeddings.weight
     # token_embeddings_syn = token_embeddings_syn[None, None].repeat(args.dataset_size, sequence_length, 1)
@@ -69,8 +72,8 @@ def get_token_embeddings_syn(ds: datasets.Dataset) -> tuple[torch.Tensor, torch.
     assert token_embeddings_syn.shape == (args.dataset_size, sequence_length - 1, hidden_size), f"invalid shape: {token_embeddings_syn.shape}, need {(args.dataset_size, sequence_length - 1, hidden_size)}"
 
     num_classes = 4
-    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=args.device) # for AG_News... tmp
-    token_labels_syn = torch.randint(low=0, high=num_classes, size=[args.dataset_size], device=args.device)
+    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
+    token_labels_syn = torch.randint(low=0, high=num_classes, size=[args.dataset_size], device=device)
     token_labels_syn = CLASS_MAP[token_labels_syn]
     return (token_embeddings_syn, token_labels_syn)
 
@@ -82,6 +85,7 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
     )
     print("Warning: Limiting layers to 4")
     return limit_layers(model, 4) # TODO: Override from config?
+
 
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     state_dict = model.state_dict()
@@ -158,7 +162,6 @@ def main(args):
     assert args.expert_epochs < args.max_experts, "Expert epochs must be less than max experts"
 
     print("CUDNN STATUS: {}".format(torch.backends.cudnn.enabled))
-    args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     data_save = []
 
     wandb.init(
@@ -176,17 +179,16 @@ def main(args):
         args.batch_syn = args.dataset_size # Full-batch GD
     print('Hyperparameters: \n', dict(vars(args)))
 
-    # student_net = get_model(EXPERT_PATHS[0]).to(args.device)
     ds = datasets.load_dataset("fancyzhx/ag_news", split="train")
     X, Y = get_token_embeddings_syn(ds=ds)
-    X = X.detach().to(args.device).requires_grad_(True)
+    X = X.detach().to(device).requires_grad_(True)
 
     # train model for a couple steps
     student_net = get_model("gpt2")
-    student_net = ReparamModule(student_net)
+    student_net = ReparamModule(student_net).to(device)
 
-    syn_lr = torch.tensor(args.lr_teacher).to(args.device)
-    syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
+    syn_lr = torch.tensor(args.lr_teacher).to(device)
+    syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
     # optimizer_token_embeddings = torch.optim.AdamW([token_embeddings_syn], lr=args.lr_img)
     optimizer_token_embeddings = torch.optim.SGD([X], lr=args.lr_img, momentum=0.5)
@@ -197,7 +199,7 @@ def main(args):
 
     Z = X
     Λ = torch.rand_like(Z, device=Z.device)
-    ρ = 1.0 # TODO: Argparse. Paper says: 
+    ρ = 1.0 # [TODO]  Argparse this. Paper says: 
             #                   > ρ is chosen from
             #                   > the set {0.001, 0.05, 0.01, . . . , 10}
 
@@ -209,7 +211,7 @@ def main(args):
         start_epoch = np.random.randint(0, len(buffer) - args.expert_epochs)
         starting_params = buffer[start_epoch]
         target_params = buffer[start_epoch+args.expert_epochs]
-        student_params = [torch.cat([p.data.to(args.device).reshape(-1) for n, p in starting_params.items()], 0).requires_grad_(True)]
+        student_params = [torch.cat([p.data.to(device).reshape(-1) for n, p in starting_params.items()], 0).requires_grad_(True)]
 
         target_params = state_dict_to_tensor(target_params)
         starting_params = state_dict_to_tensor(starting_params)
@@ -271,10 +273,11 @@ def main(args):
         # TODO: Use a language model for this
         with torch.no_grad():
             embeddings = student_net.module.get_input_embeddings()
-            embeddings_norm = embeddings.weight / embeddings.weight.norm(p=2, dim=1, keepdim=True)
+            embeddings.to(device)
+            embeddings_norm = (embeddings.weight / embeddings.weight.norm(p=2, dim=1, keepdim=True)).to(device)
             X_norm = X / X.norm(p=2, dim=2, keepdim=True)
             Z_tokens = (X_norm @ embeddings_norm.T).argmax(dim=-1)
-            Z = embeddings(Z_tokens)
+            Z = embeddings(Z_tokens.cpu()).to(device)
 
         # 
         #  (3) Update Λ for ADMM
