@@ -26,7 +26,7 @@ text_column_name = "text"
 label_column_name = "label"
 
 num_experts = 20
-num_steps_per_expert = 100
+num_steps_per_expert = 400
 num_expert_datapoints = 128
 expert_lr = 1e-4
 
@@ -118,7 +118,7 @@ def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     return _get_state_dict(get_model(model_path))
 
 
-def load_expert_paths(ds: datasets.Dataset):
+def load_expert_trajectories(ds: datasets.Dataset):
     student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
@@ -158,7 +158,7 @@ def load_expert_paths(ds: datasets.Dataset):
                 ignore_index=-100,
                 reduction="mean"
             )
-            pbar.set_description(f"Expert {step+1} | Loss = {loss:.3f}")
+            pbar.set_description(f"Expert training step {step+1} | Loss = {loss:.3f}")
             pbar.update(1)
             loss.backward()
             optim.step()
@@ -168,6 +168,17 @@ def load_expert_paths(ds: datasets.Dataset):
         expert_paths.append(_get_state_dict(student_net))
 
     return expert_paths
+
+
+def project_x_to_embedding_space(X, Λ, ρ, initial_student_net) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        embeddings = initial_student_net.get_input_embeddings()
+        embeddings = embeddings.to(device)
+        X_proj = X + Λ / ρ
+        Z_distances = torch.cdist(X_proj, embeddings.weight.to(device))
+        Z_tokens = Z_distances.argmin(dim=2)
+        Z = embeddings(Z_tokens)
+    return Z, Z_tokens
 
 
 def main(args):
@@ -220,15 +231,18 @@ def main(args):
 
     print('%s [time] training begins' % get_time())
 
-    Z = X.detach().clone()
-    Λ = torch.rand_like(Z, device=Z.device).requires_grad_(False)
-    ρ = 0.1     # [TODO]  Argparse this. Paper says: 
-                #                   > ρ is chosen from
-                #                   > the set {0.001, 0.05, 0.01, . . . , 10}
-
-    # load expert trajectories
     initial_student_net = get_model("gpt2")
-    buffer = load_expert_paths(ds=ds)
+    # Λ = torch.rand_like(X, device=device).requires_grad_(False)
+    Λ = torch.zeros_like(X, device=device).requires_grad_(False)
+    ρ = args.penalty_term     # [TODO]  Argparse this. Paper says: 
+                                #                   > ρ is chosen from
+                                #                   > the set {0.001, 0.05, 0.01, . . . , 10}
+
+    Z, _ = project_x_to_embedding_space(X, Λ, ρ, initial_student_net)
+
+    # load/generate expert trajectories
+    buffer = load_expert_trajectories(ds=ds)
+
     pbar = tqdm.trange(0, args.max_iterations+1, desc="iterations")
     for it in pbar:
         num_params = sum([np.prod(p.size()) for p in (student_net.parameters())])
@@ -286,7 +300,9 @@ def main(args):
         optimizer_token_embeddings.zero_grad()
         optimizer_lr.zero_grad() 
 
-        aux_loss = (ρ / 2) * (X - Z - Λ / ρ).norm(p=2, dim=2).mean()
+        lagrangian_term = torch.sum(Λ * (X - Z), dim=2).mean()
+        quadratic_penalty = (ρ / 2) * ((X - Z).norm(p=2, dim=2) ** 2).mean()
+        aux_loss = lagrangian_term + quadratic_penalty
 
         if (it >= args.pretrain_iterations_x):
             (aux_loss + param_loss).backward()
@@ -302,12 +318,7 @@ def main(args):
                 # 
                 #  (2) Compute new Z based on projecting X back to word embedding space
                 #                       TODO: Use a language model for this, optionally.
-                embeddings = initial_student_net.get_input_embeddings()
-                embeddings = embeddings.to(device)
-                X_proj = X + Λ / ρ
-                Z_distances = torch.cdist(X_proj, embeddings.weight.to(device))
-                Z_tokens = Z_distances.argmin(dim=2)
-                Z = embeddings(Z_tokens)
+                Z, Z_tokens = project_x_to_embedding_space(X, Λ, ρ, initial_student_net)
                 # 
                 # Log Z
                 # 
@@ -325,7 +336,7 @@ def main(args):
                 optimizer_token_embeddings = torch.optim.Adam([X], lr=args.lr_tokens)
                 optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
 
-        Z_dist = (X - Z).norm(p=2).mean()
+        Z_dist = (X - Z).norm(p=2).mean().detach()
         ce_loss_avg = sum(ce_losses) / len(ce_losses)
         wandb.log(
             {
@@ -333,6 +344,8 @@ def main(args):
                 "param_loss_minus_one": (param_loss - 1).detach().cpu(),
                 "param_dist": param_dist.detach().cpu(),
                 "aux_loss":  aux_loss.detach().cpu(),
+                "aux_loss_lagrangian": lagrangian_term.detach().cpu(),
+                "aux_loss_quadratic_penalty": quadratic_penalty.detach().cpu(),
                 "start_epoch": start_epoch,
                 "ce_loss": ce_loss_avg,
                 "token_grad_norm": X.grad.norm().detach().cpu(),
@@ -361,6 +374,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_size", "--ds", type=int, default=1000, help="size of distilled dataset")
     parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
+    
+    parser.add_argument("--penalty_term", "--rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
 
     parser.add_argument('--max_iterations', type=int, default=5000, help='how many distillation steps to perform')
     parser.add_argument('--max_iterations_x', type=int, default=40, help='how many gradient steps per X update')
