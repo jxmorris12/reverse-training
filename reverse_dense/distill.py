@@ -21,13 +21,14 @@ from reparam_module import ReparamModule
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+MODEL_NUM_LAYERS = 8
 sequence_length = 32
 text_column_name = "text"        
 label_column_name = "label"
 
 num_experts = 20
-num_steps_per_expert = 400
-num_expert_datapoints = 128
+num_steps_per_expert = 50
+num_expert_datapoints = 256
 expert_lr = 1e-4
 
 
@@ -101,7 +102,7 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
         attn_implementation="eager"
     )
     print("Warning: Limiting layers to 4")
-    return limit_layers(model, 4) # TODO: Override from config?
+    return limit_layers(model, MODEL_NUM_LAYERS) # TODO: Override from config?
 
 
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -373,7 +374,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_size", "--ds", type=int, default=1000, help="size of distilled dataset")
-    parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
+    parser.add_argument("--batch_syn", "--batch_size_synthetic", type=int, default=None, help='should only use this if you run out of VRAM')
     
     parser.add_argument("--penalty_term", "--rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
 
