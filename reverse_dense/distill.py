@@ -25,10 +25,10 @@ sequence_length = 32
 text_column_name = "text"        
 label_column_name = "label"
 
-num_experts = 3
-num_steps_per_expert = 3
-num_expert_datapoints = 8
-expert_lr = 1e-3
+num_experts = 10
+num_steps_per_expert = 250
+num_expert_datapoints = 64
+expert_lr = 1e-4
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -61,20 +61,15 @@ def get_token_embeddings_syn(ds: datasets.Dataset) -> tuple[torch.Tensor, torch.
         return_attention_mask=False
     )
     token_embeddings_syn = student_token_embeddings(tokens["input_ids"].to(device))
-    # rand_token_idxs = torch.randint(0, student_token_embeddings.num_embeddings, (args.dataset_size, sequence_length - 1), device=device)
-    # rand_token_one_hots = simple_soft_one_hot(rand_token_idxs, student_token_embeddings.num_embeddings, temperature=0.1)
-    # token_embeddings_syn = rand_token_one_hots @ student_token_embeddings.weight
-    # token_embeddings_syn = token_embeddings_syn[None, None].repeat(args.dataset_size, sequence_length, 1)
-    # token_embeddings_syn = torch.randn(
-    #     size=(args.dataset_size, sequence_length, hidden_size
-    #     ), dtype=torch.float32
-    # )
     assert token_embeddings_syn.shape == (args.dataset_size, sequence_length - 1, hidden_size), f"invalid shape: {token_embeddings_syn.shape}, need {(args.dataset_size, sequence_length - 1, hidden_size)}"
 
     num_classes = 4
     CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
     token_labels_syn = torch.randint(low=0, high=num_classes, size=[args.dataset_size], device=device)
     token_labels_syn = CLASS_MAP[token_labels_syn]
+
+    token_embeddings_syn = torch.randn_like(token_embeddings_syn, device=device) # Actually just do random init.
+
     return (token_embeddings_syn, token_labels_syn)
 
 
@@ -102,7 +97,7 @@ def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
 
 
 def load_expert_paths(ds: datasets.Dataset):
-    student_net = get_model("gpt2")
+    student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left" # important for correct truncation
@@ -112,38 +107,42 @@ def load_expert_paths(ds: datasets.Dataset):
 
     expert_paths = [_get_state_dict(student_net)]
     step = 0
+    pbar = tqdm.tqdm(total=num_experts * num_steps_per_expert, colour="CYAN")
     for _i in range(num_experts):
         for _j in range(num_steps_per_expert):
-            step += 1
             batch_idxs = random.sample(range(len(ds)), k=num_expert_datapoints)
             examples = ds.select(batch_idxs)
             examples = [
                 f"{text} {label}" 
                 for text, label in zip(examples[text_column_name], examples[label_column_name])
             ]
-            tokens = tokenizer.batch_encode_plus(
+            tokens = tokenizer(
                 examples,
                 return_tensors="pt", 
                 padding="max_length", 
                 truncation=True, 
                 max_length=sequence_length, 
-            )
+            ).to(device)
             outputs = student_net(
                 input_ids=tokens.input_ids,
                 attention_mask=tokens.attention_mask,
             )
-            labels = tokens.input_ids.detach().clone()
+            logits = outputs.logits[:, :-1]
+            labels = tokens.input_ids[:, 1:].detach().clone() 
             labels[:, :-1] = -100
             loss = torch.nn.functional.cross_entropy(
-                outputs.logits.reshape(labels.numel(), -1), 
+                logits.reshape(labels.numel(), -1), 
                 labels.reshape(labels.numel(),),
-                ignore_index=-100
+                ignore_index=-100,
+                reduction="mean"
             )
-            print(f"Step {step+1} | Loss = {loss:.3f}")
+            pbar.set_description(f"Expert {step+1} | Loss = {loss:.3f}")
+            pbar.update(1)
             loss.backward()
             optim.step()
             optim.zero_grad()
             student_net.zero_grad()
+            step += 1
         expert_paths.append(_get_state_dict(student_net))
 
     # # random.shuffle(expert_revisions)
@@ -160,15 +159,14 @@ def main(args):
     np.random.seed(args.seed)
 
     assert args.expert_epochs < args.max_experts, "Expert epochs must be less than max experts"
-
-    print("CUDNN STATUS: {}".format(torch.backends.cudnn.enabled))
     data_save = []
 
+    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
     wandb.init(
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
-        mode="disabled",
+        # mode="disabled",
     )
 
     args = type('', (), {})()
@@ -190,20 +188,22 @@ def main(args):
     syn_lr = torch.tensor(args.lr_teacher).to(device)
     syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
-    # optimizer_token_embeddings = torch.optim.AdamW([token_embeddings_syn], lr=args.lr_img)
-    optimizer_token_embeddings = torch.optim.SGD([X], lr=args.lr_img, momentum=0.5)
-    optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5) # momentum=0.5
+    # optimizer_token_embeddings = torch.optim.AdamW([token_embeddings_syn], lr=args.lr_tokens)
+    # optimizer_token_embeddings = torch.optim.SGD([X], lr=args.lr_tokens, momentum=0.5)
+    optimizer_token_embeddings = torch.optim.Adam([X], lr=args.lr_tokens)
+    optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
     optimizer_token_embeddings.zero_grad()
 
     print('%s [time] training begins' % get_time())
 
     Z = X
     Λ = torch.rand_like(Z, device=Z.device)
-    ρ = 1.0 # [TODO]  Argparse this. Paper says: 
-            #                   > ρ is chosen from
-            #                   > the set {0.001, 0.05, 0.01, . . . , 10}
+    ρ = 0.1     # [TODO]  Argparse this. Paper says: 
+                #                   > ρ is chosen from
+                #                   > the set {0.001, 0.05, 0.01, . . . , 10}
 
     # load expert trajectories
+    initial_student_net = get_model("gpt2")
     buffer = load_expert_paths(ds=ds)
     for it in tqdm.trange(0, args.max_iterations+1, desc="iterations"):
         num_params = sum([np.prod(p.size()) for p in (student_net.parameters())])
@@ -261,31 +261,45 @@ def main(args):
         optimizer_token_embeddings.zero_grad()
         optimizer_lr.zero_grad() 
 
-        aux_loss = (ρ / 2) * (X - Z - Λ / ρ).norm(p=2)
+        aux_loss = (ρ / 2) * (X - Z - Λ / ρ).norm(p=2, dim=2).mean()
+
+        print("aux_loss", aux_loss, "param_loss", param_loss)
         (aux_loss + param_loss).backward()
 
         optimizer_token_embeddings.step()
         optimizer_lr.step()
 
-        # 
-        #  (2) Compute new Z based on projecting X back to word embedding space
-        # 
-        # TODO: Use a language model for this
-        with torch.no_grad():
-            embeddings = student_net.module.get_input_embeddings()
-            embeddings.to(device)
-            embeddings_norm = (embeddings.weight / embeddings.weight.norm(p=2, dim=1, keepdim=True)).to(device)
-            X_norm = X / X.norm(p=2, dim=2, keepdim=True)
-            Z_tokens = (X_norm @ embeddings_norm.T).argmax(dim=-1)
-            Z = embeddings(Z_tokens.cpu()).to(device)
+        if it % args.max_iterations_x == 0:
+            with torch.no_grad():
+                # 
+                #  (2) Compute new Z based on projecting X back to word embedding space
+                #                       TODO: Use a language model for this, optionally.
+                embeddings = initial_student_net.get_input_embeddings()
+                embeddings = embeddings.to(device)
+                embeddings_norm = (embeddings.weight / embeddings.weight.norm(p=2, dim=1, keepdim=True)).to(device)
+                X_proj = X + Λ / ρ
+                X_norm = X_proj / X_proj.norm(p=2, dim=2, keepdim=True)
+                Z_tokens = (X_norm @ embeddings_norm.T).argmax(dim=-1)
+                Z = embeddings(Z_tokens)
+                # 
+                # Log Z
+                # 
+                tokens = tokenizer.batch_decode(Z_tokens.cpu(), add_special_tokens=False)
+                labels = tokenizer.batch_decode(Y.cpu(), add_special_tokens=False)
+                table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
+                tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
+                wandb.log({ "Z": tokens_table }, step=it)
+                # 
+                #  (3) Update Λ for ADMM
+                # 
+                Λ = Λ + ρ * (X - Z)
 
-        # 
-        #  (3) Update Λ for ADMM
-        # 
-        with torch.no_grad():
-            Λ = Λ + ρ * (X - Z)
+                # TODO: Should we reset Adam here?
+                optimizer_token_embeddings = torch.optim.Adam([X], lr=args.lr_tokens)
+                optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
 
 
+        Z_dist = (X - Z).norm(p=2).mean()
         ce_loss_avg = sum(ce_losses) / len(ce_losses)
         wandb.log(
             {
@@ -296,16 +310,17 @@ def main(args):
                 "start_epoch": start_epoch,
                 "ce_loss": ce_loss_avg,
                 "token_grad_norm": X.grad.norm().detach().cpu(),
-                "synth_lr": syn_lr.detach().cpu()
-            }
+                "synth_lr": syn_lr.detach().cpu(),
+                "synth_lr_grad": syn_lr.grad.norm().detach().cpu(),
+                "Z_dist": Z_dist.detach().cpu(),
+            },
+            step=it
         )
+        print("%s step = %04d, loss = %.8f, oneoffloss = %.8f, ce_loss = %.8f" % (get_time(), it, param_loss.item(), (param_loss - 1).item(), ce_loss_avg))
+
 
         for _ in student_params:
             del _
-
-        if it % 10 == 0:
-            print('%s iter = %04d, loss = %.8f, oneofloss = %.8f, ce_loss = %.8f' % (get_time(), it, param_loss.item(), (param_loss - 1).item(), ce_loss_avg))
-
     wandb.finish()
 
 
@@ -314,13 +329,10 @@ if __name__ == '__main__':
     parser.add_argument('--eval_mode', type=str, default='S', help='eval_mode, check utils.py for more info')
 
     parser.add_argument("--dataset_size", "--ds", type=int, default=1000, help="size of distilled dataset")
-    parser.add_argument('--num_eval', type=int, default=5, help='how many networks to evaluate on')
-    parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
-    parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data')
-
     parser.add_argument('--max_iterations', type=int, default=5000, help='how many distillation steps to perform')
+    parser.add_argument('--max_iterations_x', type=int, default=50, help='how many gradient steps per X update')
 
-    parser.add_argument('--lr_img', type=float, default=1000, help='learning rate for updating synthetic images')
+    parser.add_argument('--lr_tokens', type=float, default=1.0, help='learning rate for updating synthetic tokens')
     parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
     parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
 
@@ -329,7 +341,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
 
     parser.add_argument('--expert_epochs', type=int, default=1, help='how many expert epochs the target params are')
-    parser.add_argument('--syn_steps', type=int, default=20, help='how many steps to take on synthetic data')
+    parser.add_argument('--syn_steps', type=int, default=8, help='how many steps to take on synthetic data')
     parser.add_argument('--max_experts', type=int, default=32, help='number of experts to read per file (leave as None unless doing ablations)')
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
