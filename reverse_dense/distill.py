@@ -25,12 +25,14 @@ sequence_length = 32
 text_column_name = "text"        
 label_column_name = "label"
 
-num_experts = 10
-num_steps_per_expert = 250
-num_expert_datapoints = 64
-expert_lr = 1e-4
+num_experts = 5
+num_steps_per_expert = 200
 
-torch.autograd.set_detect_anomaly(True)
+num_experts = 2
+num_steps_per_expert = 20
+
+num_expert_datapoints = 128
+expert_lr = 1e-4
 
 
 def state_dict_to_tensor(ordered_dict: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -196,8 +198,8 @@ def main(args):
 
     print('%s [time] training begins' % get_time())
 
-    Z = X
-    Λ = torch.rand_like(Z, device=Z.device)
+    Z = X.detach().clone()
+    Λ = torch.rand_like(Z, device=Z.device).requires_grad_(False)
     ρ = 0.1     # [TODO]  Argparse this. Paper says: 
                 #                   > ρ is chosen from
                 #                   > the set {0.001, 0.05, 0.01, . . . , 10}
@@ -264,12 +266,16 @@ def main(args):
         aux_loss = (ρ / 2) * (X - Z - Λ / ρ).norm(p=2, dim=2).mean()
 
         print("aux_loss", aux_loss, "param_loss", param_loss)
-        (aux_loss + param_loss).backward()
+        if (it >= args.pretrain_iterations_x):
+            (aux_loss + param_loss).backward()
+        else:
+            param_loss.backward()
+            Z = X.detach().clone()
 
         optimizer_token_embeddings.step()
         optimizer_lr.step()
 
-        if it % args.max_iterations_x == 0:
+        if (it >= args.pretrain_iterations_x) and (it % args.max_iterations_x == 0):
             with torch.no_grad():
                 # 
                 #  (2) Compute new Z based on projecting X back to word embedding space
@@ -298,7 +304,6 @@ def main(args):
                 optimizer_token_embeddings = torch.optim.Adam([X], lr=args.lr_tokens)
                 optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
 
-
         Z_dist = (X - Z).norm(p=2).mean()
         ce_loss_avg = sum(ce_losses) / len(ce_losses)
         wandb.log(
@@ -325,14 +330,15 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Parameter Processing')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--eval_mode', type=str, default='S', help='eval_mode, check utils.py for more info')
 
     parser.add_argument("--dataset_size", "--ds", type=int, default=1000, help="size of distilled dataset")
     parser.add_argument('--max_iterations', type=int, default=5000, help='how many distillation steps to perform')
-    parser.add_argument('--max_iterations_x', type=int, default=50, help='how many gradient steps per X update')
+    parser.add_argument('--max_iterations_x', type=int, default=40, help='how many gradient steps per X update')
+    parser.add_argument('--pretrain_iterations_x', type=int, default=100, help='how many gradient steps in initial X training phase')
 
-    parser.add_argument('--lr_tokens', type=float, default=1.0, help='learning rate for updating synthetic tokens')
+    parser.add_argument('--lr_tokens', type=float, default=0.001, help='learning rate for updating synthetic tokens')
     parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
     parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
 
@@ -343,7 +349,6 @@ if __name__ == '__main__':
     parser.add_argument('--expert_epochs', type=int, default=1, help='how many expert epochs the target params are')
     parser.add_argument('--syn_steps', type=int, default=8, help='how many steps to take on synthetic data')
     parser.add_argument('--max_experts', type=int, default=32, help='number of experts to read per file (leave as None unless doing ablations)')
-    parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
 
     args = parser.parse_args()
