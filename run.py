@@ -20,15 +20,14 @@ def main(args):
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
-        mode="disabled",
     )
 
     args = type('', (), {})()
     for key in wandb.config._items:
         setattr(args, key, wandb.config._items[key])
 
-    if args.batch_syn is None:
-        args.batch_syn = args.dataset_size # Full-batch GD
+    if args.minibatch_size is None:
+        args.minibatch_size = args.dataset_size # Full-batch GD
 
     print("[time] Distillation begins:", get_time())
     distiller = DatasetDistiller(args=args)
@@ -41,7 +40,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="ag_news", help="dataset to distill (optional)")
     parser.add_argument("--dataset_size", "--ds", type=int, default=100, help="size of distilled dataset")
-    parser.add_argument("--batch_syn", "--batch_size_synthetic", type=int, default=None, help='should only use this if you run out of VRAM')
+    parser.add_argument("--minibatch_size", "--batch_size_synthetic", type=int, default=None, help='minibatch size for synthetic data (optional)')
     
     parser.add_argument("--penalty_term", "--rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
 
