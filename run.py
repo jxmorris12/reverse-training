@@ -42,7 +42,6 @@ if __name__ == '__main__':
     parser.add_argument("--dataset_size", "--ds", type=int, default=100, help="size of distilled dataset")
     parser.add_argument("--minibatch_size", "--batch_size_synthetic", type=int, default=None, help='minibatch size for synthetic data (optional)')
     
-    parser.add_argument("--penalty_term", "--rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
 
     parser.add_argument('--max_iterations', type=int, default=5000, help='how many distillation steps to perform')
     parser.add_argument('--max_iterations_x', type=int, default=40, help='how many gradient steps per X update')
@@ -62,6 +61,8 @@ if __name__ == '__main__':
     parser.add_argument("--num_expert_datapoints", default=256, type=int, help="number of datapoints per expert")
     parser.add_argument("--expert_lr", default=1e-4, type=float, help="learning rate for expert")
 
+    parser.add_argument("--discrete_optimizer", "--opt", default="ADMM", type=str, help="discrete optimizer to use", choices=["ADMM", "GCG"])
+    parser.add_argument("--penalty_term", "--rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
 
     args = parser.parse_args()
 

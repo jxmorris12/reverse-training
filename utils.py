@@ -182,20 +182,12 @@ def load_expert_trajectories(
 @torch.no_grad
 def project_x_to_embedding_space(
         X: torch.Tensor, 
-        Λ: torch.Tensor, 
-        ρ: float, 
         initial_student_net: transformers.PreTrainedModel,
         minibatch_size: Optional[int] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
     if minibatch_size is None:
         minibatch_size = X.shape[0]
     
-    # for
-    # with torch.no_grad():
-    #     X_proj = X + Λ / ρ
-    #     Z_distances = torch.cdist(X_proj, embeddings.weight.to(device))
-    #     Z_tokens = Z_distances.argmin(dim=2)
-    #     Z = embeddings(Z_tokens)
     embeddings = initial_student_net.get_input_embeddings()
     embeddings = embeddings.to(device)
     Z = []
@@ -203,9 +195,7 @@ def project_x_to_embedding_space(
 
     for i in tqdm.trange(0, X.shape[0], minibatch_size, leave=False):
         X_batch = X[i:i+minibatch_size]
-        Λ_batch = Λ[i:i+minibatch_size]
-        X_proj = X_batch + Λ_batch / ρ
-        Z_distances = torch.cdist(X_proj, embeddings.weight.to(device))
+        Z_distances = torch.cdist(X_batch, embeddings.weight.to(device))
         Z_tokens_batch = Z_distances.argmin(dim=2)
         Z_batch = embeddings(Z_tokens_batch)
         Z.append(Z_batch)

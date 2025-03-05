@@ -33,9 +33,7 @@ class ADMMOptimizer(DiscreteOptimizer):
         self.optimizer_token_embeddings.zero_grad()
         self.Λ = torch.zeros_like(X, device=device).requires_grad_(False)
         self.Z, _ = project_x_to_embedding_space(
-            self.X, 
-            self.Λ, 
-            self.ρ, 
+            self.X - self.Λ / self.ρ, 
             self.initial_student_net, 
             self.args.minibatch_size
         )   
@@ -56,35 +54,18 @@ class ADMMOptimizer(DiscreteOptimizer):
         start_epoch = np.random.randint(0, len(buffer) - self.args.expert_epochs)
         starting_params = buffer[start_epoch]
         target_params = buffer[start_epoch + self.args.expert_epochs]
-
-        target_params = state_dict_to_tensor(target_params)
-        starting_params = state_dict_to_tensor(starting_params)
         # 
         #  (1) Compute overall loss on X using trajectory matching
         # 
-        final_student_params, ce_loss_avg = self.step_x_inner_loop(
+        param_loss_normalized, ce_loss_avg = self.step_x_inner_loop(
             X=X, 
             Y=Y,
-            starting_params=starting_params, 
-            target_params=target_params,
+            starting_params=state_dict_to_tensor(starting_params), 
+            target_params=state_dict_to_tensor(target_params),
             syn_lr=syn_lr,
         )
-        # param_loss = torch.nn.functional.mse_loss(final_student_params, target_params, reduction="sum") / num_params
-        # param_dist = torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum") / num_params
-        param_loss_normalized = 1 - F.cosine_similarity(
-            final_student_params - starting_params,
-            target_params - starting_params,
-            dim=0
-        ).mean()
-        # if torch.isclose(param_dist, torch.tensor(0.0)):
-        #     print("zero distance detected – stopping!")
-        #     exit()
-
-        ρ = self.args.penalty_term     # [TODO]  Argparse this. Paper says: 
-        # param_loss_normalized = param_loss / param_dist
-
         lagrangian_term = torch.sum(Λ * (X - Z), dim=2).mean()
-        quadratic_penalty = (ρ / 2) * ((X - Z).norm(p=2, dim=2) ** 2).mean()
+        quadratic_penalty = (self.ρ / 2) * ((X - Z).norm(p=2, dim=2) ** 2).mean()
         aux_loss = lagrangian_term + quadratic_penalty
 
         (aux_loss + param_loss_normalized).backward()
@@ -121,7 +102,7 @@ class ADMMOptimizer(DiscreteOptimizer):
         #  (2) Compute new Z based on projecting X back to word embedding space
         #                       TODO: Use a language model for this, optionally.
         Z, Z_tokens = project_x_to_embedding_space(
-            X, Λ, self.ρ, self.initial_student_net, self.args.minibatch_size)
+            X - Λ / self.ρ, self.initial_student_net, self.args.minibatch_size)
         # 
         # Log Z
         # 

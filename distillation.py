@@ -4,7 +4,7 @@ import transformers
 import wandb
 import tqdm
 
-from optimizers import ADMMOptimizer
+from optimizers import ADMMOptimizer, GCGOptimizer
 from reparam_module import ReparamModule
 from utils import device, get_model, get_token_embeddings_random, get_token_embeddings_from_dataset, load_expert_trajectories
 
@@ -55,14 +55,26 @@ class DatasetDistiller:
     
     def _init_discrete_optimizer(self):
         X, Y = self._init_synthetic_data()
-        optimizer = ADMMOptimizer(
-            args=self.args,
-            X=X, 
-            Y=Y,
-            tokenizer=self.tokenizer,
-            student_net=self.student_net,
-            initial_student_net=self.initial_student_net,
-        )
+        if self.args.discrete_optimizer == "ADMM":
+            optimizer = ADMMOptimizer(
+                args=self.args,
+                X=X, 
+                Y=Y,
+                tokenizer=self.tokenizer,
+                student_net=self.student_net,
+                initial_student_net=self.initial_student_net,
+            )
+        elif self.args.discrete_optimizer == "GCG":
+            optimizer = GCGOptimizer(
+                args=self.args,
+                X=X, 
+                Y=Y,
+                tokenizer=self.tokenizer,
+                student_net=self.student_net,
+                initial_student_net=self.initial_student_net,
+            )
+        else:
+            raise NotImplementedError(f"Optimizer {args.discrete_optimizer} not implemented")
         return optimizer
 
     def run_distillation(self):
