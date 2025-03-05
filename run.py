@@ -50,12 +50,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--lr_tokens', type=float, default=0.001, help='learning rate for updating synthetic tokens')
     parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
-    parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
-    parser.add_argument('--expert_epochs', type=int, default=1, help='how many expert epochs the target params are')
+    parser.add_argument('--lr_teacher', type=float, default=0.001, help='initialization for synthetic learning rate')
     parser.add_argument('--syn_steps', type=int, default=8, help='how many steps to take on synthetic data')
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
     parser.add_argument("--token_init", type=str, default="random", help="how to initialize the synthetic tokens", choices=["random", "dataset"])
 
+    parser.add_argument('--expert_epochs', type=int, default=1, help='how many expert epochs the target params are')
     parser.add_argument("--sequence_length", default=32, type=int, help="sequence length for the model")
     parser.add_argument("--num_experts", default=20, type=int, help="number of experts to read")
     parser.add_argument("--num_steps_per_expert", default=50, type=int, help="number of steps per expert")

@@ -37,10 +37,17 @@ class DatasetDistiller:
     
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.args.token_init == "random":
-            X, Y = get_token_embeddings_random(
-                dataset_size=self.args.dataset_size,
-                sequence_length=self.args.sequence_length,
-            )
+            X, Y = [], []
+            init_minibatch_size = 512
+            for _ in tqdm.trange(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
+                x, y = get_token_embeddings_random(
+                    dataset_size=init_minibatch_size,
+                    sequence_length=self.args.sequence_length,
+                )
+                X.append(x)
+                Y.append(y)
+            X = torch.cat(X, dim=0)
+            Y = torch.cat(Y, dim=0)
         elif self.args.token_init == "dataset":
             X, Y = get_token_embeddings_from_dataset(
                 dataset_size=self.args.dataset_size, 
@@ -53,7 +60,14 @@ class DatasetDistiller:
         X = X.detach().to(device).requires_grad_(True)
         return X, Y
     
-    def step_x_inner_loop(self, X: torch.Tensor, Y: torch.Tensor, starting_params: torch.Tensor, target_params: torch.Tensor, syn_lr: torch.Tensor):
+    def step_x_inner_loop(
+            self, 
+            X: torch.Tensor, 
+            Y: torch.Tensor, 
+            starting_params: torch.Tensor, 
+            target_params: torch.Tensor, 
+            syn_lr: torch.Tensor
+        ):
         student_params = [starting_params.clone().detach().requires_grad_(True)]
         ce_losses = []
         indices_chunks = []
@@ -103,35 +117,42 @@ class DatasetDistiller:
             target_params=target_params,
             syn_lr=syn_lr,
         )
-        param_loss = torch.nn.functional.mse_loss(final_student_params, target_params, reduction="sum") / num_params
-        param_dist = torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum") / num_params
-        if torch.isclose(param_dist, torch.tensor(0.0)):
-            print("zero distance detected – stopping!")
-            exit()
+        # param_loss = torch.nn.functional.mse_loss(final_student_params, target_params, reduction="sum") / num_params
+        # param_dist = torch.nn.functional.mse_loss(starting_params, target_params, reduction="sum") / num_params
+        param_loss_normalized = 1 - F.cosine_similarity(
+            final_student_params - starting_params,
+            target_params - starting_params,
+            dim=0
+        ).mean()
+        # if torch.isclose(param_dist, torch.tensor(0.0)):
+        #     print("zero distance detected – stopping!")
+        #     exit()
 
         ρ = self.args.penalty_term     # [TODO]  Argparse this. Paper says: 
-        param_loss = param_loss / param_dist
+        # param_loss_normalized = param_loss / param_dist
 
         lagrangian_term = torch.sum(Λ * (X - Z), dim=2).mean()
         quadratic_penalty = (ρ / 2) * ((X - Z).norm(p=2, dim=2) ** 2).mean()
         aux_loss = lagrangian_term + quadratic_penalty
 
-        (aux_loss + param_loss).backward()
+        (aux_loss + param_loss_normalized).backward()
         Z_dist = (X - Z).norm(p=2).mean().detach()
 
         metrics = {
-            "param_loss": param_loss.detach().cpu(),
-            "param_loss_minus_one": (param_loss - 1).detach().cpu(),
-            "param_dist": param_dist.detach().cpu(),
-            "aux_loss":  aux_loss.detach().cpu(),
-            "aux_loss_lagrangian": lagrangian_term.detach().cpu(),
-            "aux_loss_quadratic_penalty": quadratic_penalty.detach().cpu(),
+            # "param_loss": param_loss.detach().cpu(),
+            "param_loss_normalized": param_loss_normalized.detach().cpu(),
+            # "param_dist": param_dist.detach().cpu(),
+            # "param_loss_normalized_minus_one": (param_loss_normalized - 1).detach().cpu(),
+            # "param_dist": param_dist.detach().cpu(),
+            "aux_loss":  aux_loss.detach().cpu().item(),
+            "aux_loss_lagrangian": lagrangian_term.detach().cpu().item(),
+            "aux_loss_quadratic_penalty": quadratic_penalty.detach().cpu().item(),
             "start_epoch": start_epoch,
             "ce_loss": ce_loss_avg,
-            "token_grad_norm": X.grad.norm().detach().cpu(),
+            "token_grad_norm": X.grad.norm().detach().cpu().item(),
             "synth_lr": syn_lr.detach().cpu(),
-            "synth_lr_grad": syn_lr.grad.norm().detach().cpu(),
-            "Z_dist": Z_dist,
+            "synth_lr_grad": syn_lr.grad.norm().detach().cpu().item(),
+            "Z_dist": Z_dist.detach().cpu().item(),
         }
         return X, Y, metrics
     
@@ -159,6 +180,19 @@ class DatasetDistiller:
         return Z, Λ, {}
 
     def run_distillation(self):
+        # load/generate expert trajectories
+        buffer = load_expert_trajectories(
+            num_experts=self.args.num_experts,
+            num_steps_per_expert=self.args.num_steps_per_expert,
+            num_expert_datapoints=self.args.minibatch_size,
+            expert_lr=self.args.expert_lr,
+            sequence_length=self.args.sequence_length,
+            ds=self.ds,
+            text_column_name=self.ds_text_column_name,
+            label_column_name=self.ds_label_column_name,
+        )
+
+        # initialize parameters & optimizers
         X, Y = self._init_synthetic_data()
         syn_lr = torch.tensor(self.args.lr_teacher).to(device)
         syn_lr = syn_lr.detach().to(device).requires_grad_(True)
@@ -168,18 +202,6 @@ class DatasetDistiller:
         optimizer_token_embeddings.zero_grad()
         Λ = torch.zeros_like(X, device=device).requires_grad_(False)
         Z, _ = project_x_to_embedding_space(X, Λ, self.ρ, self.initial_student_net, self.args.minibatch_size)
-
-        # load/generate expert trajectories
-        buffer = load_expert_trajectories(
-            num_experts=self.args.num_experts,
-            num_steps_per_expert=self.args.pretrain_iterations_x,
-            num_expert_datapoints=self.args.minibatch_size,
-            expert_lr=self.args.expert_lr,
-            sequence_length=self.args.sequence_length,
-            ds=self.ds,
-            text_column_name=self.ds_text_column_name,
-            label_column_name=self.ds_label_column_name,
-        )
 
         # run optimization
         pbar = tqdm.trange(0, self.args.max_iterations+1, desc="iterations")
