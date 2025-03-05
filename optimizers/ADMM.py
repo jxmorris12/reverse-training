@@ -2,7 +2,6 @@ from .optimizer import DiscreteOptimizer
 
 import numpy as np
 import torch
-import wandb
 
 from utils import device, project_x_to_embedding_space, state_dict_to_tensor
 
@@ -105,11 +104,7 @@ class ADMMOptimizer(DiscreteOptimizer):
         # 
         # Log Z
         # 
-        tokens = self.tokenizer.batch_decode(Z_tokens.cpu(), add_special_tokens=False)
-        labels = self.tokenizer.batch_decode(Y.cpu(), add_special_tokens=False)
-        table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
-        tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
-        wandb.log({ "Z": tokens_table }, step=it)
+        self._log_table(Z_tokens, Y, step=it)
         # 
         #  (3) Update Λ for ADMM
         # 

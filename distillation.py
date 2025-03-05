@@ -4,7 +4,7 @@ import transformers
 import wandb
 import tqdm
 
-from optimizers import ADMMOptimizer, GCGOptimizer
+from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer
 from reparam_module import ReparamModule
 from utils import device, get_model, get_token_embeddings_random, get_token_embeddings_from_dataset, load_expert_trajectories
 
@@ -66,6 +66,15 @@ class DatasetDistiller:
             )
         elif self.args.discrete_optimizer == "GCG":
             optimizer = GCGOptimizer(
+                args=self.args,
+                X=X, 
+                Y=Y,
+                tokenizer=self.tokenizer,
+                student_net=self.student_net,
+                initial_student_net=self.initial_student_net,
+            )
+        elif self.args.discrete_optimizer == "GCGA":
+            optimizer = GCGAOptimizer(
                 args=self.args,
                 X=X, 
                 Y=Y,

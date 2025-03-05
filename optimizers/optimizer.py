@@ -4,11 +4,19 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 import tqdm
+import wandb
 
 
 class DiscreteOptimizer(ABC):
     def __init__(self, args):
         self.args = args
+    
+    def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
+        tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
+        labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
+        table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
+        tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
+        wandb.log({ "Z": tokens_table }, step=step)
 
     def step_x_inner_loop(
             self, 
