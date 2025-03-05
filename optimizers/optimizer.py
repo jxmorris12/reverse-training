@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import tqdm
 
 
@@ -46,6 +47,7 @@ class DiscreteOptimizer(ABC):
             student_params.append(student_params[-1] - syn_lr * grad)
         ce_loss_avg = sum(ce_losses) / len(ce_losses)
 
+        final_student_params = student_params[-1]
         param_loss = 1 - F.cosine_similarity(
             final_student_params - starting_params,
             target_params - starting_params,

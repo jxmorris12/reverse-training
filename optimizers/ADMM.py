@@ -1,7 +1,6 @@
 from .optimizer import DiscreteOptimizer
 
 import numpy as np
-import torch.nn.functional as F
 import torch
 import wandb
 
@@ -40,7 +39,7 @@ class ADMMOptimizer(DiscreteOptimizer):
 
     @property
     def ρ(self):
-        return self.args.penalty_term
+        return self.args.admm_penalty_term
 
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         X = self.X

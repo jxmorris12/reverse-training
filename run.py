@@ -62,7 +62,9 @@ if __name__ == '__main__':
     parser.add_argument("--expert_lr", default=1e-4, type=float, help="learning rate for expert")
 
     parser.add_argument("--discrete_optimizer", "--opt", default="ADMM", type=str, help="discrete optimizer to use", choices=["ADMM", "GCG"])
-    parser.add_argument("--penalty_term", "--rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
+    parser.add_argument("--admm_penalty_term", "--admm_rho", type=float, default=0.1, help="ADMM penalty term (ρ)")
+    parser.add_argument("--gcg_search_width", type=int, default=8, help="how many random samples to take in GCG")
+    parser.add_argument("--gcg_tokens_to_swap", type=int, default=1, help="how many tokens to swap in GCG")
 
     args = parser.parse_args()
 
