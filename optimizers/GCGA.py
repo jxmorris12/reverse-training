@@ -43,15 +43,17 @@ class GCGAOptimizer(GCGOptimizer):
             )
             X_tokens[chunk_idxs[:, None], random_token_mask_idxs] = random_token_idxs
         
-        X_mask_on_count = torch.zeros(X_tokens.shape, dtype=torch.long, device=device)
-        X_mask_on_sum = torch.zeros(X_tokens.shape, dtype=torch.double, device=device)
-        X_mask_off_count = torch.zeros(X_tokens.shape, dtype=torch.long, device=device)
-        X_mask_off_sum = torch.zeros(X_tokens.shape, dtype=torch.double, device=device)
+        X_mask_on_count = torch.zeros(X_tokens.shape[0:1], dtype=torch.long, device=device)
+        X_mask_on_sum = torch.zeros(X_tokens.shape[0:1], dtype=torch.double, device=device)
+        X_mask_off_count = torch.zeros(X_tokens.shape[0:1], dtype=torch.long, device=device)
+        X_mask_off_sum = torch.zeros(X_tokens.shape[0:1], dtype=torch.double, device=device)
 
+        all_losses = []
+        all_X_tokens_batch = []
         for i in tqdm.trange(search_width, colour="#bf40bf", desc="GCG", leave=False):
             indices_chunks = list(torch.split(indices, self.args.minibatch_size))
-            X_mask = torch.bernoulli(0.5 * torch.ones_like(X_tokens, device=device)).bool()
-            X_tokens_batch = torch.where(X_mask, X_tokens, self.X_tokens)
+            X_mask = torch.bernoulli(0.5 * torch.ones(X_tokens.shape[0], device=device)).bool()
+            X_tokens_batch = torch.where(X_mask[:, None], X_tokens, self.X_tokens)
             with torch.no_grad():
                 X = self.initial_student_net.get_input_embeddings()(X_tokens_batch)
 
@@ -61,7 +63,8 @@ class GCGAOptimizer(GCGOptimizer):
                 starting_params=state_dict_to_tensor(starting_params), 
                 target_params=state_dict_to_tensor(target_params),
                 syn_lr=self.syn_lr,
-                indices_chunks=indices_chunks,
+                # TODO: Figure out why we can't pass indices_chunks
+                # indices_chunks=indices_chunks,
             )
             
             X_mask_on_count[X_mask] += 1
@@ -69,6 +72,9 @@ class GCGAOptimizer(GCGOptimizer):
 
             X_mask_off_count[~X_mask] += 1
             X_mask_off_sum[~X_mask] += param_loss.detach()
+
+            all_X_tokens_batch.append(X_tokens_batch.detach())
+            all_losses.append(param_loss.detach())
         
         X_mask_on_avg = X_mask_on_sum / X_mask_on_count
         X_mask_on_avg = torch.nan_to_num(X_mask_on_avg, nan=float("inf"))
@@ -76,7 +82,8 @@ class GCGAOptimizer(GCGOptimizer):
         X_mask_off_avg = torch.nan_to_num(X_mask_off_avg, nan=float("inf"))
         
         # Take the token-swaps that improved the loss on average
-        self.X_tokens = torch.where(X_mask_on_avg < X_mask_off_avg, X_tokens, self.X_tokens)
+        sequences_to_swap_mask = (X_mask_on_avg < X_mask_off_avg)[:, None]
+        self.X_tokens = torch.where(sequences_to_swap_mask, X_tokens, self.X_tokens)
 
         metrics = {
             "param_loss": param_loss.detach().cpu(),
@@ -84,5 +91,6 @@ class GCGAOptimizer(GCGOptimizer):
             "start_epoch": start_epoch,
             "ce_loss": ce_loss_avg,
             "synth_lr": self.syn_lr.detach().cpu(),
+            "num_swapped_sequences": sequences_to_swap_mask.sum().detach().cpu(),
         }
         return metrics

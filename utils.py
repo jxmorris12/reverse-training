@@ -134,7 +134,8 @@ def load_expert_trajectories(
     tokenizer.truncation_side = "left" # important for correct truncation
     tokenizer.padding_side = "left" 
 
-    optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
+    # optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
+    optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
 
     expert_paths = [_get_state_dict(student_net)]
     step = 0
