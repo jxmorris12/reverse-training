@@ -67,6 +67,8 @@ if __name__ == '__main__':
     parser.add_argument("--gcg_tokens_to_swap", type=int, default=1, help="how many tokens to swap in GCG")
     parser.add_argument("--gcg_documents_to_swap", type=int, default=None, help="how many documents to swap in GCG")
 
+    parser.add_argument("--select_seed_dataset", type=str, default="nq", help="dataset to use for SELECT")
+
     args = parser.parse_args()
 
     main(args)

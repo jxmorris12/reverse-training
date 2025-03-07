@@ -7,7 +7,12 @@ import torch
 import tqdm
 import wandb
 
-from utils import device, project_x_to_embedding_space, state_dict_to_tensor
+from utils import (
+    device, 
+    load_dataset_from_name,
+    project_x_to_embedding_space, 
+    state_dict_to_tensor
+)
 
 class SELECTOptimizer(DiscreteOptimizer):
     X: torch.Tensor
@@ -27,7 +32,10 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
         # self.dataset = datasets.load_dataset("fancyzhx/ag_news")["train"]
-        self.dataset = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
+        self.dataset, self.dataset_text_column_name, __ = (
+            load_dataset_from_name(self.args.select_seed_dataset)
+        )
+        self.dataset = self.dataset["train"]
         print(f"SELECTOptimizer: dataset size: {len(self.dataset)}")
 
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:

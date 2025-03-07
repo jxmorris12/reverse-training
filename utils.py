@@ -65,9 +65,11 @@ def get_token_embeddings_from_dataset(dataset_size: int, sequence_length: int, d
     assert token_embeddings_syn.shape == (dataset_size, sequence_length - 1, hidden_size), f"invalid shape: {token_embeddings_syn.shape}, need {(dataset_size, sequence_length - 1, hidden_size)}"
 
     num_classes = 4
-    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
+    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device)
     token_labels_syn = torch.randint(low=0, high=num_classes, size=[dataset_size], device=device)
     token_labels_syn = CLASS_MAP[token_labels_syn]
+
+    breakpoint() # TODO: Autogen CLASS_MAP!
 
     return (token_embeddings_syn, token_labels_syn)
 
@@ -266,3 +268,21 @@ def project_x_to_embedding_space(
     Z = torch.cat(Z, dim=0)
     Z_tokens = torch.cat(Z_tokens, dim=0)
     return Z, Z_tokens
+
+
+def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, str]:
+    if dataset_name == "ag_news":
+        ds = datasets.load_dataset("fancyzhx/ag_news")
+        text_column_name = "text"        
+        label_column_name = "label"
+    elif dataset_name == "nq":
+        ds = datasets.load_dataset("jxm/nq_corpus_dpr")
+        text_column_name = "text"
+        label_column_name = None
+    elif dataset_name == "msmarco":
+        ds = datasets.load_dataset("Tevatron/msmarco-passage-corpus")
+        text_column_name = "text"
+        label_column_name = None
+    else:
+        raise NotImplementedError(f"Dataset {dataset_name} not implemented")
+    return ds, text_column_name, label_column_name

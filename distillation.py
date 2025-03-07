@@ -6,7 +6,14 @@ import tqdm
 
 from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer, SELECTOptimizer
 from reparam_module import ReparamModule
-from utils import device, get_model, get_token_embeddings_random, get_token_embeddings_from_dataset, train_expert_model
+from utils import (
+    device, 
+    get_model, 
+    get_token_embeddings_random,
+    get_token_embeddings_from_dataset, 
+    load_dataset_from_name, 
+    train_expert_model
+)
 
 
 LABEL_MAP = {
@@ -56,14 +63,10 @@ class DatasetDistiller:
         return X, Y
     
     def _init_dataset(self) -> tuple[datasets.Dataset, str, str]:
-        if self.args.dataset == "ag_news":
-            ds = datasets.load_dataset("fancyzhx/ag_news")
-            text_column_name = "text"        
-            label_column_name = "label"
-        else:
-            raise NotImplementedError(f"Dataset {args.dataset} not implemented")
-        
-        return ds, text_column_name, label_column_name
+        dataset, text_column_name, label_column_name = load_dataset_from_name(
+            self.args.dataset
+        )
+        return dataset, text_column_name, label_column_name
     
     def _init_discrete_optimizer(self):
         X, Y = self._init_synthetic_data()
