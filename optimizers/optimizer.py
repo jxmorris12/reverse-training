@@ -7,6 +7,13 @@ import tqdm
 import wandb
 
 
+LABEL_MAP = {
+    "0": "World",
+    "1": "Sports",
+    "2": "Business",
+    "3": "Sci/Tech",
+}
+
 class DiscreteOptimizer(ABC):
     def __init__(self, args):
         self.args = args
@@ -14,6 +21,7 @@ class DiscreteOptimizer(ABC):
     def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
         tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
         labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
+        labels = list(map(lambda x: LABEL_MAP[x.strip()], labels))
         table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)

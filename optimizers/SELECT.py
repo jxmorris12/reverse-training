@@ -26,8 +26,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         syn_lr = torch.tensor(self.args.lr_teacher).to(device)
         self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
-        self.dataset = datasets.load_dataset("fancyzhx/ag_news")["train"]
-        # self.dataset = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
+        # self.dataset = datasets.load_dataset("fancyzhx/ag_news")["train"]
+        self.dataset = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
         print(f"SELECTOptimizer: dataset size: {len(self.dataset)}")
 
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:

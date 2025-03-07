@@ -70,6 +70,7 @@ def get_token_embeddings_from_dataset(dataset_size: int, sequence_length: int, d
 
     return (token_embeddings_syn, token_labels_syn)
 
+
 def get_token_embeddings_random(dataset_size: int, sequence_length: int,) -> tuple[torch.Tensor, torch.Tensor]:
     """ initialize the synthetic data """
     student_net = get_model("gpt2")
