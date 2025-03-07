@@ -104,8 +104,4 @@ class SELECTOptimizer(DiscreteOptimizer):
 
     def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         metrics = self.step_x(it, buffer)
-
-        if it % 100 == 0:
-            self._log_table(self.X_tokens, self.Y, step=it)
-
         return self.X_tokens, metrics

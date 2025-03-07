@@ -6,7 +6,15 @@ import tqdm
 
 from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer, SELECTOptimizer
 from reparam_module import ReparamModule
-from utils import device, get_model, get_token_embeddings_random, get_token_embeddings_from_dataset, load_expert_trajectories
+from utils import device, get_model, get_token_embeddings_random, get_token_embeddings_from_dataset, train_expert_model
+
+
+LABEL_MAP = {
+    "0": "World",
+    "1": "Sports",
+    "2": "Business",
+    "3": "Sci/Tech",
+}
 
 
 class DatasetDistiller:
@@ -20,6 +28,7 @@ class DatasetDistiller:
         self.initial_student_net = get_model("gpt2")
         self.student_net = ReparamModule(get_model("gpt2")).to(device)
         self.ds, self.ds_text_column_name, self.ds_label_column_name = self._init_dataset()
+        self.dataset_token_counts = None
 
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.args.token_init == "random":
@@ -48,7 +57,7 @@ class DatasetDistiller:
     
     def _init_dataset(self) -> tuple[datasets.Dataset, str, str]:
         if self.args.dataset == "ag_news":
-            ds = datasets.load_dataset("fancyzhx/ag_news", split="train")
+            ds = datasets.load_dataset("fancyzhx/ag_news")
             text_column_name = "text"        
             label_column_name = "label"
         else:
@@ -97,10 +106,53 @@ class DatasetDistiller:
         else:
             raise NotImplementedError(f"Optimizer {args.discrete_optimizer} not implemented")
         return optimizer
+    
+    def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
+        tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
+        labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
+        labels = list(map(lambda x: LABEL_MAP[x.strip()], labels))
+        table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
+        tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
+        wandb.log({ "Z": tokens_table }, step=step)
+
+    def _evaluate_and_log(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
+        self._log_table(tokens, labels, step=step)
+        # TODO: Recheck the below logic!
+        # compare tokens to dataset_token_counts
+        dataset_token_counts = self.dataset_token_counts.bool()
+        token_counts = tokens.flatten().bincount(minlength=self.tokenizer.vocab_size).bool()
+        
+        # compute precision & recall
+        precision = (dataset_token_counts & token_counts).sum() / token_counts.sum()
+        recall = (dataset_token_counts & token_counts).sum() / dataset_token_counts.sum()
+        f1 = 2 * (precision * recall) / (precision + recall)
+        dataset_metrics = {
+            "dataset_token_precision": precision.detach().cpu().item(),
+            "dataset_token_recall": recall.detach().cpu().item(),
+            "dataset_token_f1": f1.detach().cpu().item(),
+        }
+
+        # run full evaluation
+        _, __, evaluation_metrics = train_expert_model(
+            num_experts=self.args.num_experts,
+            num_steps_per_expert=self.args.num_steps_per_expert,
+            num_expert_datapoints=self.args.minibatch_size,
+            expert_lr=self.args.expert_lr,
+            sequence_length=self.args.sequence_length,
+            ds=self.ds,
+            text_column_name=self.ds_text_column_name,
+            label_column_name=self.ds_label_column_name,
+            ds_tokens=tokens,
+            ds_labels=labels,
+            num_evaluation_batches=10, # TODO: Argparse!
+        )
+
+        # log
+        wandb.log({ **dataset_metrics, **evaluation_metrics }, step=step)
 
     def run_distillation(self):
         # load/generate expert trajectories
-        expert_buffer = load_expert_trajectories(
+        expert_buffer, dataset_token_counts, _ = train_expert_model(
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
             num_expert_datapoints=self.args.minibatch_size,
@@ -110,6 +162,7 @@ class DatasetDistiller:
             text_column_name=self.ds_text_column_name,
             label_column_name=self.ds_label_column_name,
         )
+        self.dataset_token_counts = dataset_token_counts
 
         # initialize parameters & optimizers
         discrete_optimizer = self._init_discrete_optimizer()
@@ -120,3 +173,6 @@ class DatasetDistiller:
             Z, metrics = discrete_optimizer.step(it, expert_buffer)
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=it)
+
+            if it % 100 == 0:
+                self._evaluate_and_log(Z, discrete_optimizer.Y, step=it)
