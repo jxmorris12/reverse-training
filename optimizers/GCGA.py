@@ -43,10 +43,8 @@ class GCGAOptimizer(GCGOptimizer):
             )
             X_tokens[chunk_idxs[:, None], random_token_mask_idxs] = random_token_idxs
         
-        X_mask_on_count = torch.zeros(X_tokens.shape[0:1], dtype=torch.long, device=device)
-        X_mask_on_sum = torch.zeros(X_tokens.shape[0:1], dtype=torch.double, device=device)
-        X_mask_off_count = torch.zeros(X_tokens.shape[0:1], dtype=torch.long, device=device)
-        X_mask_off_sum = torch.zeros(X_tokens.shape[0:1], dtype=torch.double, device=device)
+        X_mask_on_min = torch.zeros(X_tokens.shape[0:1], dtype=torch.double, device=device) + 10**10
+        X_mask_off_min = torch.zeros(X_tokens.shape[0:1], dtype=torch.double, device=device) + 10**10
 
         all_losses = []
         all_X_tokens_batch = []
@@ -67,30 +65,23 @@ class GCGAOptimizer(GCGOptimizer):
                 # indices_chunks=indices_chunks,
             )
             
-            X_mask_on_count[X_mask] += 1
-            X_mask_on_sum[X_mask] += param_loss.detach()
-
-            X_mask_off_count[~X_mask] += 1
-            X_mask_off_sum[~X_mask] += param_loss.detach()
+            X_mask_on_min[X_mask]   = torch.min(X_mask_on_min[X_mask]  , param_loss.detach())
+            X_mask_off_min[~X_mask] = torch.min(X_mask_off_min[~X_mask], param_loss.detach())
 
             all_X_tokens_batch.append(X_tokens_batch.detach())
             all_losses.append(param_loss.detach())
         
-        X_mask_on_avg = X_mask_on_sum / X_mask_on_count
-        X_mask_on_avg = torch.nan_to_num(X_mask_on_avg, nan=float("inf"))
-        X_mask_off_avg = X_mask_off_sum / X_mask_off_count
-        X_mask_off_avg = torch.nan_to_num(X_mask_off_avg, nan=float("inf"))
-        
-        # Take the token-swaps that improved the loss on average
-        sequences_to_swap_mask = (X_mask_on_avg < X_mask_off_avg)[:, None]
+        # Take the token-swaps that improved the loss the most
+        sequences_to_swap_mask = (X_mask_on_min < X_mask_off_min)[:, None]
         self.X_tokens = torch.where(sequences_to_swap_mask, X_tokens, self.X_tokens)
 
+        X_best_loss = min(X_mask_on_min.min(), X_mask_off_min.min()).detach().item()
         metrics = {
-            "param_loss": param_loss.detach().cpu(),
-            "X_best_loss": min(X_mask_on_avg.min(), X_mask_off_avg.min()).detach().cpu(),
+            "param_loss": param_loss.detach().item(),
+            "X_best_loss": X_best_loss,
             "start_epoch": start_epoch,
             "ce_loss": ce_loss_avg,
-            "synth_lr": self.syn_lr.detach().cpu(),
-            "num_swapped_sequences": sequences_to_swap_mask.sum().detach().cpu(),
+            "synth_lr": self.syn_lr.detach().item(),
+            "num_swapped_sequences": sequences_to_swap_mask.sum().detach().item(),
         }
         return metrics

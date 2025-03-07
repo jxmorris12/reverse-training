@@ -4,7 +4,7 @@ import transformers
 import wandb
 import tqdm
 
-from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer
+from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer, SELECTOptimizer
 from reparam_module import ReparamModule
 from utils import device, get_model, get_token_embeddings_random, get_token_embeddings_from_dataset, load_expert_trajectories
 
@@ -13,7 +13,10 @@ class DatasetDistiller:
     def __init__(self, args):
         # train model for a couple steps
         self.args = args
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+        self.tokenizer = tokenizer
         self.initial_student_net = get_model("gpt2")
         self.student_net = ReparamModule(get_model("gpt2")).to(device)
         self.ds, self.ds_text_column_name, self.ds_label_column_name = self._init_dataset()
@@ -24,7 +27,7 @@ class DatasetDistiller:
             init_minibatch_size = 512
             for _ in tqdm.trange(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
                 x, y = get_token_embeddings_random(
-                    dataset_size=init_minibatch_size,
+                    dataset_size=min(init_minibatch_size, self.args.dataset_size),
                     sequence_length=self.args.sequence_length,
                 )
                 X.append(x)
@@ -75,6 +78,15 @@ class DatasetDistiller:
             )
         elif self.args.discrete_optimizer == "GCGA":
             optimizer = GCGAOptimizer(
+                args=self.args,
+                X=X, 
+                Y=Y,
+                tokenizer=self.tokenizer,
+                student_net=self.student_net,
+                initial_student_net=self.initial_student_net,
+            )
+        elif self.args.discrete_optimizer == "SELECT":
+            optimizer = SELECTOptimizer(
                 args=self.args,
                 X=X, 
                 Y=Y,

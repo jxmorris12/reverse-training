@@ -30,7 +30,7 @@ class DiscreteOptimizer(ABC):
         student_params = [starting_params.clone().detach().requires_grad_(True)]
         ce_losses = []
         for step in tqdm.trange(self.args.syn_steps, desc="Synthetic steps", leave=False):
-            if indices_chunks is None:
+            if (indices_chunks is None) or len(indices_chunks) == 0:
                 indices = torch.randperm(len(X))
                 indices_chunks = list(torch.split(indices, self.args.minibatch_size))
 

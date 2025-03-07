@@ -1,6 +1,6 @@
 from .optimizer import DiscreteOptimizer
 
-import copy
+import datasets
 import numpy as np
 import random
 import torch
@@ -9,7 +9,7 @@ import wandb
 
 from utils import device, project_x_to_embedding_space, state_dict_to_tensor
 
-class GCGOptimizer(DiscreteOptimizer):
+class SELECTOptimizer(DiscreteOptimizer):
     X: torch.Tensor
     Y: torch.Tensor
     syn_lr: torch.Tensor
@@ -25,6 +25,10 @@ class GCGOptimizer(DiscreteOptimizer):
 
         syn_lr = torch.tensor(self.args.lr_teacher).to(device)
         self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
+
+        self.dataset = datasets.load_dataset("fancyzhx/ag_news")["train"]
+        # self.dataset = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
+        print(f"SELECTOptimizer: dataset size: {len(self.dataset)}")
 
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         start_epoch = np.random.randint(0, len(buffer) - self.args.expert_epochs)
@@ -53,20 +57,20 @@ class GCGOptimizer(DiscreteOptimizer):
 
                 documents_to_swap = self.args.gcg_documents_to_swap or len(all_mutated_idxs)
                 all_mutated_idxs = all_mutated_idxs[:documents_to_swap]
+
+                random_documents = self.dataset.select(random.sample(range(len(self.dataset)), documents_to_swap))
+                random_documents = [d["text"] for d in random_documents]
+                random_document_tokens = self.tokenizer(
+                    random_documents, 
+                    padding="max_length", 
+                    truncation=True, 
+                    max_length=self.args.sequence_length-1, 
+                    return_tensors="pt", 
+                    return_attention_mask=False
+                )["input_ids"].to(device)
                 
-                random_token_mask_idxs = torch.randint(
-                    low=0,
-                    high=self.args.sequence_length - 1,
-                    size=(documents_to_swap, tokens_to_swap),
-                    device=device,
-                )
-                random_token_idxs = torch.randint(
-                    low=0,
-                    high=self.tokenizer.vocab_size,
-                    size=(documents_to_swap, tokens_to_swap),
-                    device=device,
-                )
-                X_tokens[all_mutated_idxs[:, None], random_token_mask_idxs] = random_token_idxs
+                assert random_document_tokens.shape == (documents_to_swap, self.args.sequence_length-1)
+                X_tokens[all_mutated_idxs] = random_document_tokens
                         
             with torch.no_grad():
                 X = self.initial_student_net.get_input_embeddings()(X_tokens)
