@@ -242,20 +242,14 @@ def preprocess(
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, dataset: datasets.Dataset, tokenizer: transformers.PreTrainedTokenizer):
+    def __init__(self, list_data_dict: datasets.Dataset, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
-        logging.warning("Loading data...")
-        list_data_dict = dataset
-
-        logging.warning("Formatting inputs...")
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
         sources = [
             prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
             for example in list_data_dict
         ]
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
-
-        logging.warning("Tokenizing inputs... This may take some time...")
         data_dict = preprocess(sources, targets, tokenizer)
 
         self.input_ids = data_dict["input_ids"]
@@ -309,12 +303,36 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+device = "cuda"
+
+def get_sims(base_model, dataset, data_collator, param_diff) -> torch.Tensor:
+    all_sims = []
+    pbar = tqdm.trange(0, len(dataset), 1)
+    for i in pbar:
+        batch = dataset[i]
+        inputs = data_collator([batch])
+        inputs = { k: v.to(device) for k, v in inputs.items() }
+        outputs = base_model(**inputs)
+        outputs.loss.backward()
+        grad_flattened = torch.cat([
+            p.grad.flatten() for p in base_model.parameters()]
+        )
+
+        # TODO: down-project and store.
+        sim = torch.nn.functional.cosine_similarity(grad_flattened, param_diff, dim=0)
+        all_sims.append(sim.item())
+        pbar.set_description(f"similarity: {sim.item():.3f}")
+
+        base_model.zero_grad()
+    return torch.tensor(all_sims)
+
 def main():
-    device = "cuda"
-    new_vocab_size = 51_000
+    base_model = transformers.AutoModelForCausalLM.from_pretrained("gpt2")
+    other_model = transformers.AutoModelForCausalLM.from_pretrained("vicgalle/gpt2-alpaca")
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         "gpt2",
-        model_max_length=64,
+        model_max_length=256,
         padding_side="right",
         use_fast=False,
     )
@@ -330,12 +348,19 @@ def main():
     smart_tokenizer_and_embedding_resize(
         special_tokens_dict=special_tokens_dict,
         tokenizer=tokenizer,
-        model=model,
+        model=other_model,
+    )
+    smart_tokenizer_and_embedding_resize(
+        special_tokens_dict=special_tokens_dict,
+        tokenizer=tokenizer,
+        model=base_model,
     )
     
-    base_model = transformers.AutoModelForCausalLM.from_pretrained("gpt2")
-    other_model = transformers.AutoModelForCausalLM.from_pretrained("vicgalle/gpt2-alpaca")
 
+    # average params
+    for (n1, p1), (n2, p2) in zip(base_model.named_parameters(), other_model.named_parameters()):
+        p1.data = (p1.data + p2.data) / 2
+    
     base_model_param_names = [(n, p.shape) for n, p in base_model.named_parameters()]
     other_model_param_names = [(n, p.shape) for n, p in other_model.named_parameters()]
 
@@ -343,11 +368,12 @@ def main():
     other_params = torch.cat([p.flatten() for p in other_model.parameters()]).double().to(device)
     param_diff = base_params - other_params
 
-    dataset = datasets.load_dataset("yahma/alpaca-cleaned")["train"]
+    train_dataset = datasets.load_dataset("tatsu-lab/alpaca")["train"]
+    # dataset = datasets.load_dataset("yahma/alpaca-cleaned")["train"]
     # data = datasets.load_dataset("wentingzhao/one-million-instructions")["train"]
-    dataset = dataset.select(range(4_000))
+    train_dataset = train_dataset.select(range(4_096))
 
-    dataset = SupervisedDataset(dataset, tokenizer)
+    dataset = SupervisedDataset(train_dataset, tokenizer)
 
 
     # project_interval = 16  # project every 16 batches
@@ -371,26 +397,42 @@ def main():
 
     # get all grads
     base_model.to(device)
-    base_model.config.vocab_size = new_vocab_size
-    all_sims = []
-    pbar = tqdm.trange(0, len(data), 1)
+
+    # initial filtering
     data_collator = DataCollatorForSupervisedDataset(tokenizer)
-    for i in pbar:
-        batch = dataset[i]
-        inputs = data_collator([batch])
+    all_sims = get_sims(base_model, dataset, data_collator, param_diff)
+    top_k = 1000
+    top_k_indices = torch.argsort(all_sims, descending=True)[:top_k]
+
+    # train + filter
+    train_dataset = train_dataset.select(top_k_indices)
+    filtered_train_dataset = train_dataset
+    dataset = SupervisedDataset(filtered_train_dataset, tokenizer)
+    batch_size = 8
+    steps_before_reranking = 10
+    steps_total = 1000
+    optimizer = torch.optim.AdamW(base_model.parameters(), lr=1e-5)
+    j = 0
+    pbar = tqdm.trange(0, 1000)
+    for _ in pbar:
+        batch = [dataset[j] for j in range(j * batch_size, (j + 1) * batch_size)]
+        inputs = data_collator(batch)
+        inputs = { k: v.to(device) for k, v in inputs.items() }
         outputs = base_model(**inputs)
         loss = outputs.loss
         loss.backward()
-        grad_flattened = torch.cat([p.grad.flatten() for p in base_model.parameters()])
-
-        # TODO: down-project and store.
-        sim = torch.nn.functional.cosine_similarity(grad_flattened, param_diff, dim=0)
-        all_sims.append(sim.item())
-        pbar.set_description(f"similarity: {sim.item():.3f}")
-
-        base_model.zero_grad()
-    all_sims = torch.tensor(all_sims)
-    breakpoint()
+        optimizer.step()
+        optimizer.zero_grad()
+        # print(f"loss: {loss.item()}")
+        pbar.set_description(f"loss: {loss.item():.3f}")
+        j += 1
+        if (j > 0) and (j % steps_before_reranking == 0):
+            all_sims = get_sims(base_model, dataset, data_collator, param_diff)
+            top_indices = torch.argsort(all_sims, descending=True)
+            filtered_train_dataset = train_dataset.select(top_indices)
+            dataset = SupervisedDataset(filtered_train_dataset, tokenizer)
+            j = 0
+            breakpoint()
 
 
 if __name__ == "__main__":
