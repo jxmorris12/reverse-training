@@ -15,13 +15,23 @@ class GCGAOptimizer(GCGOptimizer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.x_counter = 0
-        self.random_switch_perc = 0.2 # TODO: Argparse for this.
-        self.it_per_x = 96 # 200 # TODO: Argparse for this.
+        self.random_switch_perc = 0.0 # TODO: Argparse for this.
+        self.it_per_x = 500 # 200 # TODO: Argparse for this.
         self.X_tokens_full = self.X_tokens.clone()
         self.X_tokens = torch.tensor([], dtype=torch.int64).to(device)
         self.X_tokens.requires_grad_(False)
         self.X_tokens_full.requires_grad_(False)
         self.Y.requires_grad_(False)
+        self._distributed_broadcast_everything()
+
+
+    def _distributed_broadcast_everything(self) -> None:
+        if get_world_size() <= 1:
+            return
+        # broadcast from rank 0
+        torch.distributed.broadcast(self.X_tokens_full, src=0)
+        torch.distributed.broadcast(self.X_tokens, src=0)
+        torch.distributed.broadcast(self.Y, src=0)
 
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if it % self.it_per_x == 0:
@@ -39,6 +49,7 @@ class GCGAOptimizer(GCGOptimizer):
         # Randomly mutate token(s) from a chunk
         best_X_loss = float("inf")
         best_X_tokens = None
+        best_X_swap_idx = None
 
         for _ in trange_if_main_worker(search_width, colour="#bf40bf", desc="GCG", leave=False):
             X_tokens_batch = X_tokens.clone()
@@ -68,20 +79,24 @@ class GCGAOptimizer(GCGOptimizer):
             if param_loss < best_X_loss:
                 best_X_loss = param_loss
                 best_X_tokens = X_tokens_batch
+                best_X_swap_idx = swap_idx
         
         # Take the token-swaps that improved the loss the most
         self.X_tokens = best_X_tokens.detach()
 
         # Broadcast for distributed setup
         if get_world_size() > 1:
-            prev_X_tokens = self.X_tokens[:-get_world_size()]
-            new_token = self.X_tokens[-1 * get_rank()].unsqueeze(0)
-            all_new_tokens = gather(new_token)
-            self.X_tokens = torch.cat([prev_X_tokens, all_new_tokens], dim=0)
+            # TODO: Fix this to accomodate swap_idx
+            swap_idxs = gather(torch.tensor([best_X_swap_idx], device=device))
+            all_new_tokens = gather(self.X_tokens[-1 * get_rank()].unsqueeze(0))
+            self.X_tokens[swap_idxs] = all_new_tokens
+        
+        # print("rank", get_rank(), "X_tokens", self.X_tokens.tolist())
+        # print()
 
         metrics = {
             "param_loss": param_loss.detach().item(),
-            "X_best_loss": best_X_loss,
+            "X_best_loss": best_X_loss.detach().item(),
             "start_epoch": start_epoch,
             "ce_loss": ce_loss_avg,
             "synth_lr": self.syn_lr.detach().item(),

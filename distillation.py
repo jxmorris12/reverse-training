@@ -128,7 +128,7 @@ class DatasetDistiller:
                 initial_student_net=self.initial_student_net,
             )
         else:
-            raise NotImplementedError(f"Optimizer {args.discrete_optimizer} not implemented")
+            raise NotImplementedError(f"Optimizer {self.args.discrete_optimizer} not implemented")
         return optimizer
     
     def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
@@ -174,9 +174,15 @@ class DatasetDistiller:
         # log
         wandb.log({ **dataset_metrics, **evaluation_metrics }, step=step)
     
-    def _distributed_broadcast_everything(self) -> None:
+    def _distributed_broadcast_everything(self, expert_buffer: list[dict[str, torch.Tensor]], dataset_token_counts: torch.Tensor) -> None:
         if get_world_size() <= 1:
             return
+        # broadcast expert_buffer from rank 0 to all other ranks
+        # for i in range(len(expert_buffer)):
+        #     expert_buffer[i] = torch.broadcast_coalesced(expert_buffer[i], devices=[0])[0]
+        torch.distributed.broadcast_object_list(expert_buffer, src=0)
+        # broadcast dataset_token_counts from rank 0 to all other ranks
+        torch.distributed.broadcast(dataset_token_counts, src=0)
 
     def run_distillation(self):
         # load/generate expert trajectories
@@ -196,7 +202,7 @@ class DatasetDistiller:
         discrete_optimizer = self._init_discrete_optimizer()
 
         # handle distributed
-        self._distributed_broadcast_everything()
+        self._distributed_broadcast_everything(expert_buffer, dataset_token_counts)
 
         # run optimization
         pbar = trange_if_main_worker(0, self.args.max_iterations+1, desc="iterations")

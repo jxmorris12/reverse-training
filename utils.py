@@ -152,7 +152,7 @@ def train_expert_model(
     pbar = tqdm_if_main_worker(total=num_experts * num_steps_per_expert, colour="CYAN")
     all_token_counts = torch.zeros([tokenizer.vocab_size], device=device)
 
-    print(f"[rank {get_rank()}]   device ->", all_token_counts.device)
+    # print(f"[rank {get_rank()}] device ->", all_token_counts.device)
 
     # training loop
     evaluation_metrics = collections.defaultdict(list)
