@@ -1,18 +1,26 @@
 import argparse
+import os
 import random
+
 import numpy as np
 import torch
+import torch.distributed as dist
 import wandb
 
 from distillation import DatasetDistiller
-from utils import device, get_time
+from utils import get_rank, get_time
 
 
 def main(args):
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    np.random.seed(args.seed)
+    if torch.cuda.device_count() > 1:
+        dist.init_process_group('nccl')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+    
+    random.seed(args.seed + get_rank())
+    torch.manual_seed(args.seed + get_rank())
+    torch.cuda.manual_seed_all(args.seed + get_rank())
+    np.random.seed(args.seed + get_rank())
 
     wandb.init(
         sync_tensorboard=False,
@@ -26,7 +34,7 @@ def main(args):
     if args.minibatch_size is None:
         args.minibatch_size = args.dataset_size # Full-batch GD
 
-    print("[time] Distillation begins:", get_time())
+    print(f"[rank {get_rank()}] Distillation begins:", get_time())
     distiller = DatasetDistiller(args=args)
     distiller.run_distillation()
         

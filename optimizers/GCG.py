@@ -2,10 +2,8 @@ from .optimizer import DiscreteOptimizer
 
 import numpy as np
 import torch
-import tqdm
 
-
-from utils import device, project_x_to_embedding_space, state_dict_to_tensor
+from utils import device, project_x_to_embedding_space, state_dict_to_tensor, trange_if_main_worker
 
 class GCGOptimizer(DiscreteOptimizer):
     X: torch.Tensor
@@ -34,7 +32,7 @@ class GCGOptimizer(DiscreteOptimizer):
         X_best = None
         X_best_loss = float("inf")
         all_losses = []
-        for i in tqdm.trange(search_width + 1, colour="#bf40bf", desc="GCG", leave=False):
+        for i in trange_if_main_worker(search_width + 1, colour="#bf40bf", desc="GCG", leave=False):
             X_tokens = self.X_tokens.clone()
             indices = torch.randperm(len(X_tokens))
             indices_chunks = list(torch.split(indices, self.args.minibatch_size))

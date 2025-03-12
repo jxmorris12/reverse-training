@@ -3,8 +3,8 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-import tqdm
-import wandb
+
+from utils import trange_if_main_worker
 
 
 class DiscreteOptimizer(ABC):
@@ -22,7 +22,7 @@ class DiscreteOptimizer(ABC):
         ):
         student_params = [starting_params.clone().detach().requires_grad_(True)]
         ce_losses = []
-        for step in tqdm.trange(self.args.syn_steps, desc="Synthetic steps", leave=False):
+        for step in trange_if_main_worker(self.args.syn_steps, desc="Synthetic steps", leave=False):
             if (indices_chunks is None) or len(indices_chunks) == 0:
                 indices = torch.randperm(len(X))
                 indices_chunks = list(torch.split(indices, self.args.minibatch_size))
@@ -60,7 +60,7 @@ class DiscreteOptimizer(ABC):
         for _ in student_params:
             del _
         del student_params
-        
+
         return param_loss, ce_loss_avg
     
     @abstractmethod

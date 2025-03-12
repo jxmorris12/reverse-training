@@ -303,7 +303,9 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
-device = "cuda"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def get_sims(base_model, dataset, data_collator, param_diff) -> torch.Tensor:
     all_sims = []

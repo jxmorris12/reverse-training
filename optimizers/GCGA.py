@@ -4,9 +4,8 @@ import random
 
 import numpy as np
 import torch
-import tqdm
 
-from utils import device, state_dict_to_tensor
+from utils import gather, get_rank, get_world_size, device, state_dict_to_tensor, trange_if_main_worker
 
 class GCGAOptimizer(GCGOptimizer):
     X: torch.Tensor
@@ -19,6 +18,7 @@ class GCGAOptimizer(GCGOptimizer):
         self.random_switch_perc = 0.2 # TODO: Argparse for this.
         self.it_per_x = 96 # 200 # TODO: Argparse for this.
         self.X_tokens_full = self.X_tokens.clone()
+        self.X_tokens = torch.tensor([], dtype=torch.int64).to(device)
         self.X_tokens.requires_grad_(False)
         self.X_tokens_full.requires_grad_(False)
         self.Y.requires_grad_(False)
@@ -26,20 +26,21 @@ class GCGAOptimizer(GCGOptimizer):
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if it % self.it_per_x == 0:
             self.x_counter += 1
-            self.X_tokens = torch.cat([self.X_tokens, self.X_tokens_full[-1].unsqueeze(0)], dim=0)
+            new_X_tokens = gather(self.X_tokens_full[self.x_counter + get_rank()].unsqueeze(0))
+            self.X_tokens = torch.cat([self.X_tokens, new_X_tokens], dim=0)
         start_epoch = np.random.randint(0, len(buffer) - self.args.expert_epochs)
         starting_params = buffer[start_epoch]
         target_params = buffer[start_epoch + self.args.expert_epochs]
         search_width = self.args.gcg_search_width
         tokens_to_swap = self.args.gcg_tokens_to_swap
 
-        X_tokens = self.X_tokens[:self.x_counter].clone()
+        X_tokens = self.X_tokens.to(device)
 
         # Randomly mutate token(s) from a chunk
         best_X_loss = float("inf")
         best_X_tokens = None
 
-        for _ in tqdm.trange(search_width, colour="#bf40bf", desc="GCG", leave=False):
+        for _ in trange_if_main_worker(search_width, colour="#bf40bf", desc="GCG", leave=False):
             X_tokens_batch = X_tokens.clone()
             # Randomly mutate `tokens_to_swap` tokens in the last document
             rand_token_indices = torch.randint(0, X_tokens.shape[1], (tokens_to_swap,))
@@ -47,14 +48,13 @@ class GCGAOptimizer(GCGOptimizer):
             if random.random() < self.random_switch_perc:
                 swap_idx = torch.randint(0, X_tokens.shape[0], (1,))
             else:
-                swap_idx = -1
+                swap_idx = int(-1 * get_rank())
             X_tokens_batch[swap_idx, rand_token_indices] = rand_tokens
-
 
             # indices_chunks = list(torch.split(indices, self.args.minibatch_size))
             with torch.no_grad():
                 X = self.initial_student_net.get_input_embeddings()(X_tokens_batch)
-            Y = self.Y[:self.x_counter]
+            Y = self.Y[:X.shape[0]]
 
             param_loss, ce_loss_avg = self.step_x_inner_loop(
                 X=X, 
@@ -71,6 +71,14 @@ class GCGAOptimizer(GCGOptimizer):
         
         # Take the token-swaps that improved the loss the most
         self.X_tokens = best_X_tokens.detach()
+
+        # Broadcast for distributed setup
+        if get_world_size() > 1:
+            prev_X_tokens = self.X_tokens[:-get_world_size()]
+            new_token = self.X_tokens[-1 * get_rank()].unsqueeze(0)
+            all_new_tokens = gather(new_token)
+            self.X_tokens = torch.cat([prev_X_tokens, all_new_tokens], dim=0)
+
         metrics = {
             "param_loss": param_loss.detach().item(),
             "X_best_loss": best_X_loss,

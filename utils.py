@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Iterable, Optional
 import collections
 import random
 import time
@@ -149,8 +149,10 @@ def train_expert_model(
 
     expert_state_dicts = [_get_state_dict(student_net)]
     step = 0
-    pbar = tqdm.tqdm(total=num_experts * num_steps_per_expert, colour="CYAN")
+    pbar = tqdm_if_main_worker(total=num_experts * num_steps_per_expert, colour="CYAN")
     all_token_counts = torch.zeros([tokenizer.vocab_size], device=device)
+
+    print(f"[rank {get_rank()}]   device ->", all_token_counts.device)
 
     # training loop
     evaluation_metrics = collections.defaultdict(list)
@@ -245,7 +247,7 @@ def train_expert_model(
     pbar.close()
     best_eval_loss = min({ v for k,v in evaluation_metrics.items() if "loss" in k } | { float("inf") })
     best_eval_accuracy = max({ v for k,v in evaluation_metrics.items() if "accuracy" in k } | { float("0") })
-    print(f"Best eval loss: {best_eval_loss:.3f} | Best eval accuracy: {best_eval_accuracy:.3f}")
+    print0(f"Best eval loss: {best_eval_loss:.3f} | Best eval accuracy: {best_eval_accuracy:.3f}")
 
     return expert_state_dicts, all_token_counts, evaluation_metrics
 
@@ -264,7 +266,7 @@ def project_x_to_embedding_space(
     Z = []
     Z_tokens = []
 
-    for i in tqdm.trange(0, X.shape[0], minibatch_size, leave=False):
+    for i in trange_if_main_worker(0, X.shape[0], minibatch_size, leave=False):
         X_batch = X[i:i+minibatch_size]
         Z_distances = torch.cdist(X_batch, embeddings.weight.to(device))
         Z_tokens_batch = Z_distances.argmin(dim=2)
@@ -293,3 +295,54 @@ def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, st
     else:
         raise NotImplementedError(f"Dataset {dataset_name} not implemented")
     return ds, text_column_name, label_column_name
+
+def get_world_size() -> int:
+    try:
+        return torch.distributed.get_world_size()
+    except (RuntimeError, ValueError):
+        return 1
+
+
+def get_rank() -> int:
+    try:
+        return int(torch.distributed.get_rank())
+    except (RuntimeError, ValueError):
+        return 0
+
+
+def gather(t: torch.Tensor) -> torch.Tensor:
+    # torch.distributed.nn.all_gather scales by world size since the reduce op is SUM
+    # https://github.com/pytorch/pytorch/issues/58005
+    # only should use torch.distributed.nn.all_gather if we implement a `local_loss`
+    # like: https://github.com/mlfoundations/open_clip/issues/616
+    world_size = get_world_size()
+    if world_size == 1:
+        return t
+
+    if t.ndim == 0:
+        t = t.unsqueeze(0)
+
+    gathered = [torch.empty_like(t) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, t)
+    gathered[get_rank()] = t
+
+    return torch.cat(gathered, dim=0)
+
+
+def print0(*args, **kwargs) -> None:
+    if get_rank() == 0:
+        print(*args, **kwargs)
+
+
+def tqdm_if_main_worker(*args, **kwargs) -> Iterable:
+    if get_rank() == 0:
+        return tqdm.tqdm(*args, **kwargs)
+    else:
+        return tqdm.tqdm(*args, **kwargs, disable=True)
+
+
+def trange_if_main_worker(*args, **kwargs) -> tqdm.tqdm:
+    if get_rank() == 0:
+        return tqdm.trange(*args, **kwargs)
+    else:
+        return tqdm.trange(*args, **kwargs, disable=True)

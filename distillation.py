@@ -11,10 +11,12 @@ from reparam_module import ReparamModule
 from utils import (
     device, 
     get_model, 
+    get_world_size,
     get_token_embeddings_random_soft,
     get_token_embeddings_from_dataset, 
     load_dataset_from_name, 
-    train_expert_model
+    train_expert_model,
+    trange_if_main_worker
 )
 
 
@@ -59,7 +61,7 @@ class DatasetDistiller:
         elif self.args.token_init == "random_soft":
             X, Y = [], []
             init_minibatch_size = 512
-            for _ in tqdm.trange(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
+            for _ in trange_if_main_worker(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
                 x, y = get_token_embeddings_random_soft(
                     student_net=self.initial_student_net,
                     dataset_size=min(init_minibatch_size, self.args.dataset_size),
@@ -171,6 +173,10 @@ class DatasetDistiller:
 
         # log
         wandb.log({ **dataset_metrics, **evaluation_metrics }, step=step)
+    
+    def _distributed_broadcast_everything(self) -> None:
+        if get_world_size() <= 1:
+            return
 
     def run_distillation(self):
         # load/generate expert trajectories
@@ -189,8 +195,11 @@ class DatasetDistiller:
         # initialize parameters & optimizers
         discrete_optimizer = self._init_discrete_optimizer()
 
+        # handle distributed
+        self._distributed_broadcast_everything()
+
         # run optimization
-        pbar = tqdm.trange(0, self.args.max_iterations+1, desc="iterations")
+        pbar = trange_if_main_worker(0, self.args.max_iterations+1, desc="iterations")
         for it in pbar:
             Z, metrics = discrete_optimizer.step(it, expert_buffer)
             pbar.set_postfix(**metrics)
