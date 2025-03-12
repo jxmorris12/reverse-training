@@ -141,6 +141,8 @@ def train_expert_model(
     tokenizer.truncation_side = "left" # important for correct truncation
     tokenizer.padding_side = "left" 
 
+    evaluation_steps: list[int] = [10, 100,]
+
     train_ds = ds["train"]
     eval_ds = ds["test"]
 
@@ -153,10 +155,16 @@ def train_expert_model(
     all_token_counts = torch.zeros([tokenizer.vocab_size], device=device)
 
     # training loop
+    evaluation_metrics = collections.defaultdict(list)
+    eval_loss = -1 
+    eval_accuracy = -1
     for _i in range(num_experts):
         for _j in range(num_steps_per_expert):
             if ds_tokens is not None:
-                batch_idxs = random.sample(range(len(ds_tokens)), k=num_expert_datapoints)
+                if len(ds_tokens) < num_expert_datapoints:
+                    batch_idxs = torch.randint(0, len(ds_tokens), (num_expert_datapoints,)).tolist()
+                else:
+                    batch_idxs = random.sample(range(len(ds_tokens)), k=num_expert_datapoints)
                 tokens = ds_tokens[batch_idxs]
                 labels = ds_labels[batch_idxs]
                 outputs = student_net(
@@ -183,6 +191,7 @@ def train_expert_model(
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
                 )
+                # use bincount to track token counts
                 all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
             logits = outputs.logits[:, :-1]
             loss = torch.nn.functional.cross_entropy(
@@ -198,47 +207,47 @@ def train_expert_model(
             optim.zero_grad()
             student_net.zero_grad()
             step += 1
-            # use bincount to track token counts
-        expert_state_dicts.append(_get_state_dict(student_net))
-    
-    # evaluation loop
-    evaluation_metrics = collections.defaultdict(list)
-    for _ in range(num_evaluation_batches):
-        batch_idxs = random.sample(range(len(eval_ds)), k=num_expert_datapoints)
-        examples = eval_ds.select(batch_idxs)
-        examples = [
-            f"{text} {label}" 
-            for text, label in zip(examples[text_column_name], examples[label_column_name])
-        ]
-        tokens = tokenizer(
-            examples,
-            return_tensors="pt", 
-            padding="max_length", 
-            truncation=True, 
-            max_length=sequence_length, 
-        ).to(device)
-        outputs = student_net(
-            input_ids=tokens.input_ids,
-            attention_mask=tokens.attention_mask,
-        )
-        logits = outputs.logits[:, :-1]
-        labels = tokens.input_ids[:, 1:].detach().clone() 
-        labels[:, :-1] = -100
-        loss = torch.nn.functional.cross_entropy(
-            logits.reshape(labels.numel(), -1), 
-            labels.reshape(labels.numel(),),
-            ignore_index=-100,
-            reduction="mean"
-        )
-        evaluation_metrics["eval_loss"].append(loss.item())
+            if (step + 1) in evaluation_steps:
+                 # evaluation loop
+                for _ in range(num_evaluation_batches):
+                    batch_idxs = random.sample(range(len(eval_ds)), k=num_expert_datapoints)
+                    examples = eval_ds.select(batch_idxs)
+                    examples = [
+                        f"{text} {label}" 
+                        for text, label in zip(examples[text_column_name], examples[label_column_name])
+                    ]
+                    tokens = tokenizer(
+                        examples,
+                        return_tensors="pt", 
+                        padding="max_length", 
+                        truncation=True, 
+                        max_length=sequence_length, 
+                    ).to(device)
+                    outputs = student_net(
+                        input_ids=tokens.input_ids,
+                        attention_mask=tokens.attention_mask,
+                    )
+                    logits = outputs.logits[:, :-1]
+                    labels = tokens.input_ids[:, 1:].detach().clone() 
+                    labels[:, :-1] = -100
+                    eval_loss = torch.nn.functional.cross_entropy(
+                        logits.reshape(labels.numel(), -1), 
+                        labels.reshape(labels.numel(),),
+                        ignore_index=-100,
+                        reduction="mean"
+                    )
+                    evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss.item())
 
-        token_mask = (labels != -100)
-        evaluation_metrics["eval_accuracy"].append((logits.argmax(dim=-1)[token_mask] == labels[token_mask]).float().mean())
-        evaluation_metrics["eval_perplexity"].append(torch.exp(loss).item())
+                    token_mask = (labels != -100)
+                    eval_accuracy = (logits.argmax(dim=-1)[token_mask] == labels[token_mask]).float().mean()
+                    evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy.item())
+        expert_state_dicts.append(_get_state_dict(student_net))
     
     evaluation_metrics = { k: torch.tensor(v).mean().item() for k, v in evaluation_metrics.items() }
     pbar.close()
-    print(f"Eval loss: {evaluation_metrics['eval_loss']:.3f} | Accuracy: {evaluation_metrics['eval_accuracy']:.3f} | Perplexity: {evaluation_metrics['eval_perplexity']:.3f}")
+    best_eval_loss = min({ v for k,v in evaluation_metrics.items() if "loss" in k } | { float("inf") })
+    best_eval_accuracy = max({ v for k,v in evaluation_metrics.items() if "accuracy" in k } | { float("0") })
+    print(f"Best eval loss: {best_eval_loss:.3f} | Best eval accuracy: {best_eval_accuracy:.3f}")
 
     return expert_state_dicts, all_token_counts, evaluation_metrics
 

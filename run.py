@@ -2,11 +2,10 @@ import argparse
 import random
 import numpy as np
 import torch
-import transformers
 import wandb
 
 from distillation import DatasetDistiller
-from utils import device, get_time, limit_layers
+from utils import device, get_time
 
 
 def main(args):
@@ -15,14 +14,12 @@ def main(args):
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
     wandb.init(
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
     )
 
-    args = type('', (), {})()
     for key in wandb.config._items:
         setattr(args, key, wandb.config._items[key])
 

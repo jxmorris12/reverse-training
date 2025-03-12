@@ -1,8 +1,6 @@
 from .optimizer import DiscreteOptimizer
 
-import copy
 import numpy as np
-import random
 import torch
 import tqdm
 
@@ -15,7 +13,7 @@ class GCGOptimizer(DiscreteOptimizer):
     syn_lr: torch.Tensor
 
     def __init__(self, args, X: torch.Tensor, Y: torch.Tensor, tokenizer, student_net, initial_student_net):
-        super().__init__(args)
+        super().__init__(args=args)
         self.tokenizer = tokenizer
         self.student_net = student_net
         self.initial_student_net = initial_student_net
@@ -101,7 +99,6 @@ class GCGOptimizer(DiscreteOptimizer):
     def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         metrics = self.step_x(it, buffer)
 
-        if it % 100 == 0:
-            self._log_table(self.X_tokens, self.Y, step=it)
-
+        # if it % 100 == 0:
+        #     self._log_table(self.X_tokens, self.Y, step=it)
         return self.X_tokens, metrics
