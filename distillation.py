@@ -1,3 +1,5 @@
+import gc
+
 import datasets
 import torch
 import transformers
@@ -9,7 +11,7 @@ from reparam_module import ReparamModule
 from utils import (
     device, 
     get_model, 
-    get_token_embeddings_random,
+    get_token_embeddings_random_soft,
     get_token_embeddings_from_dataset, 
     load_dataset_from_name, 
     train_expert_model
@@ -39,10 +41,27 @@ class DatasetDistiller:
 
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.args.token_init == "random":
+            student_token_embeddings = self.initial_student_net.get_input_embeddings().to(device)
+            tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+            X_tokens = torch.randint(
+                low=0,
+                high=tokenizer.vocab_size,
+                size=[self.args.dataset_size, self.args.sequence_length - 1],
+                device=device,
+            )
+            X = student_token_embeddings(X_tokens)
+
+            num_classes = 4
+            CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
+            token_labels_syn = torch.randint(low=0, high=num_classes, size=[self.args.dataset_size], device=device)
+            Y = CLASS_MAP[token_labels_syn]
+
+        elif self.args.token_init == "random_soft":
             X, Y = [], []
             init_minibatch_size = 512
             for _ in tqdm.trange(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
-                x, y = get_token_embeddings_random(
+                x, y = get_token_embeddings_random_soft(
+                    student_net=self.initial_student_net,
                     dataset_size=min(init_minibatch_size, self.args.dataset_size),
                     sequence_length=self.args.sequence_length,
                 )
@@ -58,7 +77,7 @@ class DatasetDistiller:
                 text_column_name=self.ds_text_column_name
             )
         else:
-            raise NotImplementedError(f"Token init {args.token_init} not implemented")
+            raise NotImplementedError(f"Token init {self.args.token_init} not implemented")
         X = X.detach().to(device).requires_grad_(True)
         return X, Y
     
@@ -177,5 +196,9 @@ class DatasetDistiller:
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=it)
 
-            if it % 100 == 0:
+            if it % 200 == 0:
                 self._evaluate_and_log(Z, discrete_optimizer.Y, step=it)
+
+            # clear cache
+            gc.collect()
+            torch.cuda.empty_cache()

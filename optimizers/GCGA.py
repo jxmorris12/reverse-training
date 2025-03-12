@@ -16,9 +16,12 @@ class GCGAOptimizer(GCGOptimizer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.x_counter = 0
-        self.random_switch_perc = 0.25 # TODO: Argparse for this.
-        self.it_per_x = 40 # 200 # TODO: Argparse for this.
+        self.random_switch_perc = 0.2 # TODO: Argparse for this.
+        self.it_per_x = 96 # 200 # TODO: Argparse for this.
         self.X_tokens_full = self.X_tokens.clone()
+        self.X_tokens.requires_grad_(False)
+        self.X_tokens_full.requires_grad_(False)
+        self.Y.requires_grad_(False)
 
     def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if it % self.it_per_x == 0:
@@ -67,12 +70,15 @@ class GCGAOptimizer(GCGOptimizer):
                 best_X_tokens = X_tokens_batch
         
         # Take the token-swaps that improved the loss the most
-        self.X_tokens = best_X_tokens
+        self.X_tokens = best_X_tokens.detach()
         metrics = {
             "param_loss": param_loss.detach().item(),
             "X_best_loss": best_X_loss,
             "start_epoch": start_epoch,
             "ce_loss": ce_loss_avg,
             "synth_lr": self.syn_lr.detach().item(),
+            "x_counter": self.x_counter,
+            "X_tokens_numel": self.X_tokens.numel(),
+            "it_per_x": self.it_per_x,
         }
         return metrics

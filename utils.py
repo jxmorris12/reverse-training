@@ -74,12 +74,10 @@ def get_token_embeddings_from_dataset(dataset_size: int, sequence_length: int, d
     return (token_embeddings_syn, token_labels_syn)
 
 
-def get_token_embeddings_random(dataset_size: int, sequence_length: int,) -> tuple[torch.Tensor, torch.Tensor]:
+def get_token_embeddings_random_soft(student_net: transformers.AutoModel, dataset_size: int, sequence_length: int,) -> tuple[torch.Tensor, torch.Tensor]:
     """ initialize the synthetic data """
-    student_net = get_model("gpt2")
-    student_net.train()
     student_token_embeddings = student_net.get_input_embeddings().to(device)
-    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+    # tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
 
     def simple_soft_one_hot(x, num_classes, temperature=1.0):
         one_hot = F.one_hot(x, num_classes).float()
@@ -141,7 +139,7 @@ def train_expert_model(
     tokenizer.truncation_side = "left" # important for correct truncation
     tokenizer.padding_side = "left" 
 
-    evaluation_steps: list[int] = [10, 100,]
+    evaluation_steps: list[int] = [10, 100, 500, 1000]
 
     train_ds = ds["train"]
     eval_ds = ds["test"]

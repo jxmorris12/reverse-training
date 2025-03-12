@@ -48,12 +48,19 @@ class DiscreteOptimizer(ABC):
             student_params.append(student_params[-1] - syn_lr * grad)
         ce_loss_avg = sum(ce_losses) / len(ce_losses)
 
-        final_student_params = student_params[-1]
-        param_loss = 1 - F.cosine_similarity(
-            final_student_params - starting_params,
-            target_params - starting_params,
-            dim=0
-        ).mean()
+        with torch.no_grad():
+            final_student_params = student_params[-1]
+            param_loss = 1 - F.cosine_similarity(
+                final_student_params - starting_params,
+                target_params - starting_params,
+                dim=0
+            ).mean()
+        
+        # Clean up memory
+        for _ in student_params:
+            del _
+        del student_params
+        
         return param_loss, ce_loss_avg
     
     @abstractmethod
