@@ -303,11 +303,14 @@ def train_expert_model(
     return expert_state_dicts, all_token_counts
 
 
-def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int) -> torch.Tensor:
+def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, batch_size: int) -> torch.Tensor:
     all_grads = []
-    pbar = tqdm.trange(0, len(dataset), 1)
-    for i in pbar:
-        batch = dataset[i]
+    pbar = tqdm.trange(0, len(dataset), batch_size)
+    
+    for batch_start in pbar:
+        batch_end = min(batch_start + batch_size, len(dataset))
+        batch = dataset.select(range(batch_start, batch_end))
+        
         inputs = tokenizer(
             batch["text"],
             return_tensors="pt",
@@ -317,16 +320,33 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int) -
         )
         inputs = { k: v.to(device) for k, v in inputs.items() }
         inputs["labels"] = inputs["input_ids"].detach().clone()
-        outputs = base_model(**inputs)
-        outputs.loss.backward()
-        grad_flattened = torch.cat([
-            p.grad.flatten() for p in base_model.parameters()]
-        )
+        inputs["output_hidden_states"] = True
+        
+        # https://pytorch.org/tutorials/intermediate/per_sample_grads.html
+        params = {k: v.detach() for k, v in base_model.named_parameters()}
+        buffers = {k: v.detach() for k, v in base_model.named_buffers()}
+        def compute_loss(params, buffers, hidden_states, labels):
+            hidden_states = hidden_states.unsqueeze(0)
+            labels = labels.unsqueeze(0)
 
-        # Project the gradients
-        projected_grad = projector.project(grad_flattened.unsqueeze(0), model_id=0)
-        all_grads.append(projected_grad.squeeze(0))
-        base_model.zero_grad()
+            outputs = torch.func.functional_call(base_model, (params, buffers), (hidden_states,))
+            logits = outputs.logits
+
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), 
+                labels.reshape(-1), ignore_index=-100, reduction="none"
+            )
+            return loss.mean()
+        
+        ft_compute_grad = torch.func.grad(compute_loss)
+        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
+        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["labels"])
+        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.named_parameters()], dim=1)
+
+        # Get all gradients at once
+        projected_grads = projector.project(grads_batch, model_id=0)
+        all_grads.extend(projected_grads)
+    
     return torch.stack(all_grads)
 
 
@@ -352,8 +372,8 @@ def main():
     train_dataset["train"] = train_dataset["train"].select(range(64))
     expert_state_dicts, _ = train_expert_model(
         num_experts=1,
-        num_steps_per_expert=100,
-        num_expert_datapoints=32,
+        num_steps_per_expert=1000,
+        num_expert_datapoints=8,
         expert_lr=1e-2, 
         sequence_length=32,
         train_ds=train_dataset["train"],
@@ -361,12 +381,12 @@ def main():
         text_column_name="text",
     )
     expert_model_params = expert_state_dicts[-1]
-    initial_expert_model_params = torch.cat([p.flatten() for p in expert_model_params.values()]).double().to(device).requires_grad_(False)
+    expert_model_params = torch.cat([p.flatten() for p in expert_model_params.values()]).double().to(device).requires_grad_(False)
 
     base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
     number_of_params = len(base_params)
 
-    initial_mse = (base_params[None] - initial_expert_model_params[None]).double().pow(2).mean().item()
+    initial_mse = (base_params - expert_model_params).double().pow(2).mean().item()
     print(f"Initial parameter MSE: {initial_mse:.8f}")
 
     projection_dim = 1024
@@ -379,40 +399,44 @@ def main():
         max_batch_size=32
     )
 
+    # create a larger dataset for search
+    other_dataset = datasets.load_dataset("fancyzhx/ag_news")
+    other_dataset["train"] = other_dataset["train"].select(range(256))
+    search_dataset = datasets.concatenate_datasets([train_dataset["train"], other_dataset["train"]])
+
     # train + filter
     student_lr = 1e-2
     optimizer = torch.optim.SGD(base_model.parameters(), lr=student_lr)
-    batch_size = 8
+    batch_size = 32
+    grad_batch_size = 64
     j = 0
     # num_steps = min(1000, len(train_dataset)) // batch_size
-    num_steps = 10
+    num_steps = 100
     pbar = tqdm.trange(0, num_steps)
+
+    expert_model_params = projector.project(expert_model_params, model_id=0)
 
     for _ in pbar:
         # get all grads
-        grads = get_grads(base_model, train_dataset["train"], tokenizer, projector, sequence_length=32)
-        assert grads.shape == (len(train_dataset["train"]), projection_dim)
+        grads = get_grads(base_model, search_dataset, tokenizer, projector, sequence_length=32, batch_size=grad_batch_size)
+        assert grads.shape == (len(search_dataset), projection_dim)
 
         # project params
         base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
         base_params = projector.project(base_params, model_id=0)
-        expert_model_params = projector.project(initial_expert_model_params, model_id=0)
+
 
         projected_mse = (base_params - expert_model_params).double().pow(2).mean().item()
         print(f"Projected MSE: {projected_mse:.8f}")
 
+        assert base_params.shape == expert_model_params.shape
+
         # greedily fill batch
         batch = []
-        batch_grads_sum = torch.zeros_like(grads[0])
+        batch_grads_sum = torch.zeros_like(grads[0], requires_grad=False)
         while len(batch) < batch_size:
-            # minimize |\sum_{i} batch_i  + x - grads_i|^2
-            # sims = torch.nn.functional.cosine_similarity(
-            #     batch_grads_sum[None] + grads + base_params,
-            #     expert_model_params,
-            #     dim=1
-            # )
             # use MSE
-            new_base_params = base_params + grads * student_lr
+            new_base_params = base_params - (grads + batch_grads_sum) * student_lr
             sims = (new_base_params - expert_model_params).double().pow(2).mean(dim=1)
             # check for nans
             if torch.isnan(sims).any():
@@ -421,16 +445,17 @@ def main():
                 break
             # filter out already selected grad
             batch_idxs = torch.tensor(batch, dtype=torch.int64)
-            sims[batch_idxs] = float("inf")
-            best_idx = torch.argmin(sims)
+            sims[batch_idxs] = float("-inf")
+            best_idx = torch.argmax(sims)
             batch.append(best_idx)
             batch_grads_sum += grads[best_idx]
             grads[best_idx] = torch.zeros_like(grads[best_idx])
             print(f"Best sim: {sims[best_idx].item():.3f} | Batch size: {len(batch)} | Best idx: {best_idx}")
+            breakpoint()
 
         # take step on batch
         inputs = tokenizer(
-            train_dataset["train"].select(batch)["text"],
+            search_dataset.select(batch)["text"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
