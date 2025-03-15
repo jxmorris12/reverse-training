@@ -81,7 +81,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             with torch.no_grad():
                 X = self.initial_student_net.get_input_embeddings()(X_tokens)
 
-            param_loss, ce_loss_avg = self.step_x_inner_loop(
+            param_loss, _, ce_loss_avg = self.step_x_inner_loop(
                 X=X, 
                 Y=self.Y,
                 starting_params=state_dict_to_tensor(starting_params), 

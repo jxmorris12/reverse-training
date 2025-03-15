@@ -1,186 +1,199 @@
-from typing import Dict, Sequence
+from abc import ABC, abstractmethod
+from typing import Dict, Sequence, Union
 from dataclasses import dataclass
+
 import copy
 import datasets
-import logging
 import torch
 import transformers
 import tqdm
+from enum import Enum
 
 from torch.utils.data import Dataset
 
+# from utils import train_expert_model
 
-# class AbstractProjector(ABC):
-#     """Implementations of the Projector class must implement the
-#     :meth:`AbstractProjector.project` method, which takes in model gradients and
-#     returns
-#     """
-
-#     @abstractmethod
-#     def __init__(
-#         self,
-#         grad_dim: int,
-#         proj_dim: int,
-#         seed: int,
-#         proj_type: Union[str, ProjectionType],
-#         device: Union[str, torch.device],
-#     ) -> None:
-#         """Initializes hyperparameters for the projection.
-
-#         Args:
-#             grad_dim (int):
-#                 number of parameters in the model (dimension of the gradient
-#                 vectors)
-#             proj_dim (int):
-#                 dimension after the projection
-#             seed (int):
-#                 random seed for the generation of the sketching (projection)
-#                 matrix
-#             proj_type (Union[str, ProjectionType]):
-#                 the random projection (JL transform) guearantees that distances
-#                 will be approximately preserved for a variety of choices of the
-#                 random matrix (see e.g. https://arxiv.org/abs/1411.2404). Here,
-#                 we provide an implementation for matrices with iid Gaussian
-#                 entries and iid Rademacher entries.
-#             device (Union[str, torch.device]):
-#                 CUDA device to use
-
-#         """
-#         self.grad_dim = grad_dim
-#         self.proj_dim = proj_dim
-#         self.seed = seed
-#         self.proj_type = proj_type
-#         self.device = device
-
-#     @abstractmethod
-#     def project(self, grads: Tensor, model_id: int) -> Tensor:
-#         """Performs the random projection. Model ID is included
-#         so that we generate different projection matrices for every
-#         model ID.
-
-#         Args:
-#             grads (Tensor): a batch of gradients to be projected
-#             model_id (int): a unique ID for a checkpoint
-
-#         Returns:
-#             Tensor: the projected gradients
-#         """
-
-#     def free_memory(self):
-#         """Frees up memory used by the projector."""
+class ProjectionType(str, Enum):
+    rademacher = "rademacher"
+    normal = "normal"
 
 
-# class CudaProjector(AbstractProjector):
-#     """
-#     A performant implementation of the projection for CUDA with compute
-#     capability >= 7.0.
-#     """
+class AbstractProjector(ABC):
+    """Implementations of the Projector class must implement the
+    :meth:`AbstractProjector.project` method, which takes in model gradients and
+    returns
+    """
 
-#     def __init__(
-#         self,
-#         grad_dim: int,
-#         proj_dim: int,
-#         seed: int,
-#         proj_type: ProjectionType,
-#         device,
-#         max_batch_size: int,
-#         *args,
-#         **kwargs,
-#     ) -> None:
-#         """
+    @abstractmethod
+    def __init__(
+        self,
+        grad_dim: int,
+        proj_dim: int,
+        seed: int,
+        proj_type: Union[str, ProjectionType],
+        device: Union[str, torch.device],
+    ) -> None:
+        """Initializes hyperparameters for the projection.
 
-#         Args:
-#             grad_dim (int):
-#                 Number of parameters
-#             proj_dim (int):
-#                 Dimension we project *to* during the projection step
-#             seed (int):
-#                 Random seed
-#             proj_type (ProjectionType):
-#                 Type of randomness to use for projection matrix (rademacher or normal)
-#             device:
-#                 CUDA device
-#             max_batch_size (int):
-#                 Explicitly constraints the batch size the CudaProjector is going
-#                 to use for projection. Set this if you get a 'The batch size of
-#                 the CudaProjector is too large for your GPU' error. Must be
-#                 either 8, 16, or 32.
+        Args:
+            grad_dim (int):
+                number of parameters in the model (dimension of the gradient
+                vectors)
+            proj_dim (int):
+                dimension after the projection
+            seed (int):
+                random seed for the generation of the sketching (projection)
+                matrix
+            proj_type (Union[str, ProjectionType]):
+                the random projection (JL transform) guearantees that distances
+                will be approximately preserved for a variety of torchoices of the
+                random matrix (see e.g. https://arxiv.org/abs/1411.2404). Here,
+                we provide an implementation for matrices with iid Gaussian
+                entries and iid Rademacher entries.
+            device (Union[str, torch.device]):
+                CUDA device to use
 
-#         Raises:
-#             ValueError:
-#                 When attempting to use this on a non-CUDA device
-#             ModuleNotFoundError:
-#                 When fast_jl is not installed
+        """
+        self.grad_dim = grad_dim
+        self.proj_dim = proj_dim
+        self.seed = seed
+        self.proj_type = proj_type
+        self.device = device
 
-#         """
-#         super().__init__(grad_dim, proj_dim, seed, proj_type, device)
-#         self.max_batch_size = max_batch_size
+    @abstractmethod
+    def project(self, grads: torch.Tensor, model_id: int) -> torch.Tensor:
+        """Performs the random projection. Model ID is included
+        so that we generate different projection matrices for every
+        model ID.
 
-#         if isinstance(device, str):
-#             device = ch.device(device)
+        Args:
+            grads (Tensor): a batch of gradients to be projected
+            model_id (int): a unique ID for a torcheckpoint
 
-#         if device.type != "cuda":
-#             err = "CudaProjector only works on a CUDA device; Either switch to a CUDA device, or use the BasicProjector"
-#             raise ValueError(err)
+        Returns:
+            torch.Tensor: the projected gradients
+        """
 
-#         self.num_sms = ch.cuda.get_device_properties(device.index).multi_processor_count
+    def free_memory(self):
+        """Frees up memory used by the projector."""
 
-#         try:
-#             import fast_jl
 
-#             # test run to catch at init time if projection goes through
-#             fast_jl.project_rademacher_8(
-#                 ch.zeros(8, 1_000, device="cuda"), 512, 0, self.num_sms
-#             )
-#         except ImportError:
-#             err = "You should make sure to install the CUDA projector for traker (called fast_jl).\
-#                   See the installation FAQs for more details."
-#             raise ModuleNotFoundError(err)
+class CudaProjector(AbstractProjector):
+    """
+    A performant implementation of the projection for CUDA with compute
+    capability >= 7.0.
+    """
 
-#     def project(
-#         self,
-#         grads: Union[dict, Tensor],
-#         model_id: int,
-#     ) -> Tensor:
-#         if isinstance(grads, dict):
-#             grads = vectorize(grads, device=self.device)
+    def __init__(
+        self,
+        grad_dim: int,
+        proj_dim: int,
+        seed: int,
+        proj_type: ProjectionType,
+        device,
+        max_batch_size: int,
+        *args,
+        **kwargs,
+    ) -> None:
+        """
 
-#         batch_size = grads.shape[0]
+        Args:
+            grad_dim (int):
+                Number of parameters
+            proj_dim (int):
+                Dimension we project *to* during the projection step
+            seed (int):
+                Random seed
+            proj_type (ProjectionType):
+                Type of randomness to use for projection matrix (rademacher or normal)
+            device:
+                CUDA device
+            max_batch_size (int):
+                Explicitly constraints the batch size the CudaProjector is going
+                to use for projection. Set this if you get a 'The batch size of
+                the CudaProjector is too large for your GPU' error. Must be
+                either 8, 16, or 32.
 
-#         effective_batch_size = 32
-#         if batch_size <= 8:
-#             effective_batch_size = 8
-#         elif batch_size <= 16:
-#             effective_batch_size = 16
+        Raises:
+            ValueError:
+                When attempting to use this on a non-CUDA device
+            ModuleNotFoundError:
+                When fast_jl is not installed
 
-#         effective_batch_size = min(self.max_batch_size, effective_batch_size)
+        """
+        super().__init__(grad_dim, proj_dim, seed, proj_type, device)
+        self.max_batch_size = max_batch_size
 
-#         function_name = f"project_{self.proj_type.value}_{effective_batch_size}"
-#         import fast_jl
+        if isinstance(device, str):
+            device = torch.device(device)
 
-#         fn = getattr(fast_jl, function_name)
+        if device.type != "cuda":
+            err = "CudaProjector only works on a CUDA device; Either switch to a CUDA device, or use the BasicProjector"
+            raise ValueError(err)
 
-#         try:
-#             result = fn(
-#                 grads, self.proj_dim, self.seed + int(1e4) * model_id, self.num_sms
-#             )
-#         except RuntimeError as e:
-#             if "CUDA error: too many resources requested for launch" in str(e):
-#                 # provide a more helpful error message
-#                 raise RuntimeError(
-#                     (
-#                         "The batch size of the CudaProjector is too large for your GPU. "
-#                         "Reduce it by using the proj_max_batch_size argument of the TRAKer.\nOriginal error:"
-#                     )
-#                 )
-#             else:
-#                 raise e
+        self.num_sms = torch.cuda.get_device_properties(device.index).multi_processor_count
 
-#         return result
+        try:
+            import fast_jl
 
-#     def free_memory(self):
-#         """A no-op method."""
-        # pass
+            # test run to catch at init time if projection goes through
+            fast_jl.project_rademacher_8(
+                torch.zeros(8, 1_000, device="cuda"), 512, 0, self.num_sms
+            )
+        except ImportError:
+            err = "You should make sure to install the CUDA projector for traker (called fast_jl).\
+                  See the installation FAQs for more details."
+            raise ModuleNotFoundError(err)
+
+    def project(
+        self,
+        grads: Union[dict, torch.Tensor],
+        model_id: int,
+    ) -> torch.Tensor:
+        if isinstance(grads, dict):
+            grads = vectorize(grads, device=self.device)
+
+        batch_size = grads.shape[0]
+
+        # Downcast from double to float
+        if grads.dtype == torch.float64:
+            grads = grads.to(torch.float32)
+
+        effective_batch_size = 32
+        if batch_size <= 8:
+            effective_batch_size = 8
+        elif batch_size <= 16:
+            effective_batch_size = 16
+
+        effective_batch_size = min(self.max_batch_size, effective_batch_size)
+
+        function_name = f"project_{self.proj_type.value}_{effective_batch_size}"
+        import fast_jl
+
+        fn = getattr(fast_jl, function_name)
+
+        try:
+            result = fn(
+                grads, self.proj_dim, self.seed + int(1e4) * model_id, self.num_sms
+            )
+        except RuntimeError as e:
+            if "CUDA error: too many resources requested for launch" in str(e):
+                # provide a more helpful error message
+                raise RuntimeError(
+                    (
+                        "The batch size of the CudaProjector is too large for your GPU. "
+                        "Reduce it by using the proj_max_batch_size argument of the TRAKer.\nOriginal error:"
+                    )
+                )
+            else:
+                print("Error for dtype: ", grads.dtype, "and shape: ", grads.shape)
+                raise e
+
+        return result
+
+    def free_memory(self):
+        """A no-op method."""
+        pass
 
 
 IGNORE_INDEX = -100
@@ -307,8 +320,8 @@ def smart_tokenizer_and_embedding_resize(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def get_sims(base_model, dataset, data_collator, param_diff) -> torch.Tensor:
-    all_sims = []
+def get_grads(base_model, dataset, data_collator, projector) -> torch.Tensor:
+    all_grads = []
     pbar = tqdm.trange(0, len(dataset), 1)
     for i in pbar:
         batch = dataset[i]
@@ -320,13 +333,11 @@ def get_sims(base_model, dataset, data_collator, param_diff) -> torch.Tensor:
             p.grad.flatten() for p in base_model.parameters()]
         )
 
-        # TODO: down-project and store.
-        sim = torch.nn.functional.cosine_similarity(grad_flattened, param_diff, dim=0)
-        all_sims.append(sim.item())
-        pbar.set_description(f"similarity: {sim.item():.3f}")
-
+        # Project the gradients
+        projected_grad = projector.project(grad_flattened.unsqueeze(0), model_id=0)
+        all_grads.append(projected_grad.squeeze(0))
         base_model.zero_grad()
-    return torch.tensor(all_sims)
+    return torch.stack(all_grads)
 
 def main():
     base_model = transformers.AutoModelForCausalLM.from_pretrained("gpt2")
@@ -363,46 +374,39 @@ def main():
     for (n1, p1), (n2, p2) in zip(base_model.named_parameters(), other_model.named_parameters()):
         p1.data = (p1.data + p2.data) / 2
     
-    base_model_param_names = [(n, p.shape) for n, p in base_model.named_parameters()]
-    other_model_param_names = [(n, p.shape) for n, p in other_model.named_parameters()]
 
     base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
     other_params = torch.cat([p.flatten() for p in other_model.parameters()]).double().to(device)
     param_diff = base_params - other_params
+    number_of_params = len(base_params)
 
     train_dataset = datasets.load_dataset("tatsu-lab/alpaca")["train"]
-    # dataset = datasets.load_dataset("yahma/alpaca-cleaned")["train"]
-    # data = datasets.load_dataset("wentingzhao/one-million-instructions")["train"]
-    train_dataset = train_dataset.select(range(4_096))
+    # train_dataset = train_dataset.select(range(4_096))
+    train_dataset = train_dataset.select(range(64))
 
     dataset = SupervisedDataset(train_dataset, tokenizer)
 
-
-    # project_interval = 16  # project every 16 batches
-    # projection_dim = 1024
-
-    # proj = CudaProjector(grad_dim=number_of_params,
-    #                     proj_dim=dim,
-    #                     seed=0,
-    #                     proj_type=ProjectionType.rademacher,
-    #                     device=device,
-    #                     dtype=dtype,
-    #                     block_size=block_size,
-    #                     max_batch_size=projector_batch_size)
-    # def _project(current_full_grads, projected_grads):
-    #     current_full_grads = torch.stack(current_full_grads).to(torch.float16)
-    #     for i, projector in enumerate(projectors):
-    #         current_projected_grads = projector.project(
-    #             current_full_grads, model_id=model_id)
-    #         projected_grads[proj_dim[i]].append(current_projected_grads.cpu())
-
+    projection_dim = 1024
+    projector = CudaProjector(
+        grad_dim=number_of_params,
+        proj_dim=projection_dim,
+        seed=0,
+        proj_type=ProjectionType.rademacher,
+        device=device,
+        max_batch_size=32
+    )
 
     # get all grads
     base_model.to(device)
 
     # initial filtering
     data_collator = DataCollatorForSupervisedDataset(tokenizer)
-    all_sims = get_sims(base_model, dataset, data_collator, param_diff)
+    all_grads = get_grads(base_model, dataset, data_collator, projector)
+    
+    # Compute similarities with projected param_diff
+    projected_param_diff = projector.project(param_diff.unsqueeze(0), model_id=0).squeeze(0)
+    all_sims = torch.nn.functional.cosine_similarity(all_grads, projected_param_diff.unsqueeze(0), dim=1)
+    
     top_k = 1000
     top_k_indices = torch.argsort(all_sims, descending=True)[:top_k]
 
@@ -412,10 +416,10 @@ def main():
     dataset = SupervisedDataset(filtered_train_dataset, tokenizer)
     batch_size = 8
     steps_before_reranking = 10
-    steps_total = 1000
     optimizer = torch.optim.AdamW(base_model.parameters(), lr=1e-5)
     j = 0
-    pbar = tqdm.trange(0, 1000)
+    num_steps = min(1000, len(dataset)) // batch_size
+    pbar = tqdm.trange(0, num_steps)
     for _ in pbar:
         batch = [dataset[j] for j in range(j * batch_size, (j + 1) * batch_size)]
         inputs = data_collator(batch)
@@ -429,7 +433,9 @@ def main():
         pbar.set_description(f"loss: {loss.item():.3f}")
         j += 1
         if (j > 0) and (j % steps_before_reranking == 0):
-            all_sims = get_sims(base_model, dataset, data_collator, param_diff)
+            all_grads = get_grads(base_model, dataset, data_collator, projector)
+            projected_param_diff = projector.project(param_diff.unsqueeze(0), model_id=0).squeeze(0)
+            all_sims = torch.nn.functional.cosine_similarity(all_grads, projected_param_diff.unsqueeze(0), dim=1)
             top_indices = torch.argsort(all_sims, descending=True)
             filtered_train_dataset = train_dataset.select(top_indices)
             dataset = SupervisedDataset(filtered_train_dataset, tokenizer)

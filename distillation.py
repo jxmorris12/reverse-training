@@ -4,7 +4,7 @@ import datasets
 import torch
 import transformers
 import wandb
-import tqdm
+
 
 from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer, SELECTOptimizer
 from reparam_module import ReparamModule
