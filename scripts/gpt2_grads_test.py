@@ -224,6 +224,11 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
         model_path, 
         attn_implementation="eager"
     )
+    # disable dropout
+    dropout_modules = [m for m in model.modules() if isinstance(m, torch.nn.Dropout)]
+    for m in dropout_modules:
+        m.p = 0.0
+
     return limit_layers(model, 6)
 
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -305,6 +310,7 @@ def train_expert_model(
 
 def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, batch_size: int) -> torch.Tensor:
     all_grads = []
+    # all_grads_true = []
     pbar = tqdm.trange(0, len(dataset), batch_size)
     
     for batch_start in pbar:
@@ -320,33 +326,46 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
         )
         inputs = { k: v.to(device) for k, v in inputs.items() }
         inputs["labels"] = inputs["input_ids"].detach().clone()
-        inputs["output_hidden_states"] = True
+
+        # measure grads one-by-one
+        # for i in range(len(batch)):
+            # batch_inputs = { k: v[i:i+1].to(device) for k, v in inputs.items() }
+            # loss = base_model(**batch_inputs).loss
+            # loss.backward()
+            # batch_grads_true = torch.cat([p.grad.flatten().detach() for p in base_model.parameters()], dim=0)
+            # batch_grads_true_projected = projector.project(batch_grads_true, model_id=0)
+            # all_grads_true.extend(batch_grads_true_projected)
+            # base_model.zero_grad()
+            # print("loss 1: ", loss)
+
         
-        # https://pytorch.org/tutorials/intermediate/per_sample_grads.html
+        # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
         params = {k: v.detach() for k, v in base_model.named_parameters()}
         buffers = {k: v.detach() for k, v in base_model.named_buffers()}
-        def compute_loss(params, buffers, hidden_states, labels):
-            hidden_states = hidden_states.unsqueeze(0)
-            labels = labels.unsqueeze(0)
-
-            outputs = torch.func.functional_call(base_model, (params, buffers), (hidden_states,))
-            logits = outputs.logits
-
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), 
-                labels.reshape(-1), ignore_index=-100, reduction="none"
+        def compute_loss(params, buffers, input_ids, attention_mask, labels):
+            # No need to unsqueeze - vmap will handle that
+            outputs = torch.func.functional_call(
+                module=base_model,
+                parameter_and_buffer_dicts=(params, buffers),
+                kwargs={
+                    "input_ids": input_ids[None],
+                    "attention_mask": attention_mask[None],
+                    "labels": labels[None],
+                }
             )
-            return loss.mean()
-        
-        ft_compute_grad = torch.func.grad(compute_loss)
-        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["labels"])
-        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.named_parameters()], dim=1)
+            return outputs.loss
 
-        # Get all gradients at once
+        # Create vectorized gradient function
+        ft_compute_grad = torch.func.grad(compute_loss)
+        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0, 0))
+
+        # Compute per-sample gradients
+        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
+        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.named_parameters()], dim=1)
         projected_grads = projector.project(grads_batch, model_id=0)
         all_grads.extend(projected_grads)
-    
+        
+    # return torch.stack(all_grads_true)
     return torch.stack(all_grads)
 
 
@@ -370,10 +389,11 @@ def main():
 
     # train_dataset = train_dataset.select(range(4_096))
     train_dataset["train"] = train_dataset["train"].select(range(64))
+    train_dataset = train_dataset.map(lambda ex: { "text": ex["instruction"] + "\n" + ex["output"] })
     expert_state_dicts, _ = train_expert_model(
         num_experts=1,
         num_steps_per_expert=1000,
-        num_expert_datapoints=8,
+        num_expert_datapoints=64,
         expert_lr=1e-2, 
         sequence_length=32,
         train_ds=train_dataset["train"],
@@ -389,16 +409,6 @@ def main():
     initial_mse = (base_params - expert_model_params).double().pow(2).mean().item()
     print(f"Initial parameter MSE: {initial_mse:.8f}")
 
-    projection_dim = 1024
-    projector = CudaProjector(
-        grad_dim=number_of_params,
-        proj_dim=projection_dim,
-        seed=0,
-        proj_type=ProjectionType.rademacher,
-        device=device,
-        max_batch_size=32
-    )
-
     # create a larger dataset for search
     other_dataset = datasets.load_dataset("fancyzhx/ag_news")
     other_dataset["train"] = other_dataset["train"].select(range(256))
@@ -407,26 +417,38 @@ def main():
     # train + filter
     student_lr = 1e-2
     optimizer = torch.optim.SGD(base_model.parameters(), lr=student_lr)
-    batch_size = 32
-    grad_batch_size = 64
     j = 0
     # num_steps = min(1000, len(train_dataset)) // batch_size
-    num_steps = 100
+    num_steps = 200
+    batch_size = 32
+    grad_batch_size = 32
+
     pbar = tqdm.trange(0, num_steps)
 
-    expert_model_params = projector.project(expert_model_params, model_id=0)
+    projection_dim = 2048
+    projector = CudaProjector(
+        grad_dim=number_of_params,
+        proj_dim=projection_dim,
+        seed=0,
+        block_size=128,
+        proj_type=ProjectionType.rademacher,
+        device=device,
+        max_batch_size=256,
+    )
+    # expert_model_params = projector.project(expert_model_params, model_id=0)
 
+    best_idx_counter = collections.Counter()
     for _ in pbar:
         # get all grads
         grads = get_grads(base_model, search_dataset, tokenizer, projector, sequence_length=32, batch_size=grad_batch_size)
-        assert grads.shape == (len(search_dataset), projection_dim)
+        assert grads.shape == (len(search_dataset), projection_dim), f"grads.shape: {grads.shape} != (len(search_dataset), projection_dim): {(len(search_dataset), projection_dim)}"
 
         # project params
         base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
-        base_params = projector.project(base_params, model_id=0)
+        base_params_diff = projector.project(base_params - expert_model_params, model_id=0)
 
 
-        projected_mse = (base_params - expert_model_params).double().pow(2).mean().item()
+        projected_mse = (-grads + base_params_diff).double().pow(2).mean().item()
         print(f"Projected MSE: {projected_mse:.8f}")
 
         assert base_params.shape == expert_model_params.shape
@@ -436,8 +458,11 @@ def main():
         batch_grads_sum = torch.zeros_like(grads[0], requires_grad=False)
         while len(batch) < batch_size:
             # use MSE
-            new_base_params = base_params - (grads + batch_grads_sum) * student_lr
-            sims = (new_base_params - expert_model_params).double().pow(2).mean(dim=1)
+            # TODO: Update params somehow to make a grad_sum?
+            grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
+            base_params_diff_norm = base_params_diff / (base_params_diff.norm(dim=1, p=2, keepdim=True) + 1e-10)
+
+            sims = grads_norm @ base_params_diff_norm.T
             # check for nans
             if torch.isnan(sims).any():
                 print("NaNs in sims")
@@ -450,8 +475,12 @@ def main():
             batch.append(best_idx)
             batch_grads_sum += grads[best_idx]
             grads[best_idx] = torch.zeros_like(grads[best_idx])
+            best_idx_counter[best_idx.item()] += 1
             print(f"Best sim: {sims[best_idx].item():.3f} | Batch size: {len(batch)} | Best idx: {best_idx}")
-            breakpoint()
+
+        # Print top-10 most-selected indices
+        top_10_selected = best_idx_counter.most_common(10)
+        print(f"Top-10 most-selected indices: {top_10_selected}")
 
         # take step on batch
         inputs = tokenizer(
