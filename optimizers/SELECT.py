@@ -18,7 +18,7 @@ from utils import (
 from projection_utils import (
     CudaProjector,
     ProjectionType,
-    get_grads
+    get_grads_final_layer
 )
 
 class SELECTOptimizer(DiscreteOptimizer):
@@ -70,7 +70,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get all gradients
         # TODO: Control randomness to get same results each time
         self.base_model.to(device)
-        grads = get_grads(
+        grads = get_grads_final_layer(
             self.base_model, 
             self.dataset, 
             self.tokenizer, 
@@ -124,7 +124,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             best_sim = sims[best_idx].item()
 
             # Compute full-resolution gradient
-            batch_grad = get_grads(
+            batch_grad = get_grads_final_layer(
                 self.base_model, 
                 self.dataset.select([best_idx]), 
                 self.tokenizer, 
