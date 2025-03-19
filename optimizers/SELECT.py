@@ -65,10 +65,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         """Rank dataset examples by influence on optimization direction"""
         assert self.args.select_max_batch_size < len(self.dataset), \
             f"select_max_batch_size: {self.args.select_max_batch_size} must be less than dataset size: {len(self.dataset)}"
-        
-        # Calculate current MSE
-        current_mse = (base_params - expert_model_params).double().pow(2).sum().item()
-        print(f"Current MSE: {current_mse:.8f}")
 
         # Get all gradients
         # TODO: Control randomness to get same results each time
@@ -121,7 +117,6 @@ class SELECTOptimizer(DiscreteOptimizer):
             # Add the selected gradient to our batch
             batch.append(best_idx.item())
             grads[best_idx] = torch.zeros_like(grads[best_idx])  # Zero out the selected gradient
-            self.best_idx_counter[best_idx.item()] += 1
 
             # Update best similarity for logging purposes
             best_sim = sims[best_idx].item()
@@ -158,6 +153,10 @@ class SELECTOptimizer(DiscreteOptimizer):
         if it % self.args.select_steps_per_grad == 0:
             self.batch, best_sim = self._rank_dataset_by_influence(base_params, expert_model_params)
         
+
+        # Calculate current MSE
+        current_mse = (base_params - expert_model_params).double().pow(2).sum().item()
+        
         # Select random minibatch from batch
         minibatch = random.sample(self.batch, min(self.args.select_minibatch_size, len(self.batch)))
 
@@ -190,19 +189,10 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Print loss
         print(f"loss: {loss.item():.3f}")
-        
-        # Calculate parameter loss (cosine similarity)
-        with torch.no_grad():
-            updated_params = torch.cat([p.flatten() for p in self.base_model.lm_head.parameters()]).double().to(device)
-            param_loss = 1 - torch.nn.functional.cosine_similarity(
-                updated_params - base_params,
-                expert_model_params - base_params,
-                dim=0
-            ).mean()
-        
+
         # Report metrics
         metrics = {
-            "param_loss": param_loss.detach().item(),
+            "param_mse": current_mse,
             "ce_loss": loss.detach().item(),
             "grad_step_size": grad_step_size.item() if not torch.isnan(grad_step_size) else 0.0,
             "synth_lr": self.syn_lr.detach().item(),
@@ -210,6 +200,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Free memory
         torch.cuda.empty_cache()
+        
+        #   add minibatch to self.best_idx_counter
+        self.best_idx_counter.update(minibatch)
         
         # Print top-10 most selected indices
         top_10_selected = self.best_idx_counter.most_common(10)

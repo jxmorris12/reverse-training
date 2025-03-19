@@ -26,7 +26,7 @@ def main(args):
         sync_tensorboard=False,
         project="dataset-distillation",
         config=args,
-        mode="disabled" if get_rank() > 0 else os.getenv("WANDB_MODE", "online"),
+        # mode="disabled" if get_rank() > 0 else os.getenv("WANDB_MODE", "online"),
     )
 
     for key in wandb.config._items:

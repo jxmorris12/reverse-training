@@ -231,13 +231,10 @@ def _train_expert_model_uncached(
                     max_length=sequence_length, 
                 ).to(device)
                 
+                labels = tokens.input_ids[:, 1:].detach().clone() 
                 if label_column_name is not None:
                     # For classification, only predict the last token
-                    labels = tokens.input_ids[:, 1:].detach().clone() 
                     labels[:, :-1] = -100
-                else:
-                    # For language modeling, predict all next tokens
-                    labels = tokens.input_ids[:, 1:].detach().clone()
                 
                 outputs = student_net(
                     input_ids=tokens.input_ids,
@@ -439,6 +436,11 @@ def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, st
     elif dataset_name == "nq_1000":
         ds = datasets.load_dataset("jxm/nq_corpus_dpr")
         ds["train"] = ds["train"].select(range(1000))
+        text_column_name = "text"
+        label_column_name = None
+    elif dataset_name == "nq_5000":
+        ds = datasets.load_dataset("jxm/nq_corpus_dpr")
+        ds["train"] = ds["train"].select(range(5000))
         text_column_name = "text"
         label_column_name = None
     elif dataset_name == "msmarco":
