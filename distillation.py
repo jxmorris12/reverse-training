@@ -38,7 +38,7 @@ class DatasetDistiller:
         self.tokenizer = tokenizer
         self.initial_student_net = get_model("gpt2")
         self.student_net = ReparamModule(get_model("gpt2")).to(device)
-        self.ds, self.ds_text_column_name, self.ds_label_column_name = self._init_dataset()
+        self.ds, self.ds_text_column_name, self.ds_label_column_name = self._load_dataset()
         self.dataset_token_counts = None
 
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -83,7 +83,7 @@ class DatasetDistiller:
         X = X.detach().to(device).requires_grad_(True)
         return X, Y
     
-    def _init_dataset(self) -> tuple[datasets.Dataset, str, str]:
+    def _load_dataset(self) -> tuple[datasets.Dataset, str, str]:
         dataset, text_column_name, label_column_name = load_dataset_from_name(
             self.args.dataset
         )
@@ -141,6 +141,9 @@ class DatasetDistiller:
 
     def _evaluate_and_log(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
         self._log_table(tokens, labels, step=step)
+        tokens = tokens.cpu()
+        labels = labels.cpu()
+        
         # TODO: Recheck the below logic!
         # compare tokens to dataset_token_counts
         dataset_token_counts = self.dataset_token_counts.bool()
@@ -196,7 +199,7 @@ class DatasetDistiller:
             text_column_name=self.ds_text_column_name,
             label_column_name=self.ds_label_column_name,
         )
-        self.dataset_token_counts = dataset_token_counts
+        self.dataset_token_counts = dataset_token_counts.cpu()
 
         # initialize parameters & optimizers
         discrete_optimizer = self._init_discrete_optimizer()

@@ -6,13 +6,10 @@ import random
 from enum import Enum
 
 import torch
-
+import tqdm
 from utils import (
     device, 
     load_dataset_from_name,
-    project_x_to_embedding_space, 
-    state_dict_to_tensor,
-    trange_if_main_worker
 )
 
 from projection_utils import (
@@ -46,7 +43,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         print(f"SELECTOptimizer: dataset size: {len(self.dataset)}")
         
         # Setup projector
-        param_count = sum(p.numel() for p in self.student_net.lm_head.parameters())
+        param_count = sum(p.numel() for p in self.base_model.lm_head.parameters())
         self.projector = CudaProjector(
             grad_dim=param_count,
             proj_dim=args.select_projection_dim,
@@ -59,10 +56,16 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         self.best_idx_counter = collections.Counter()
         self.batch = []
-        self.optimizer = torch.optim.SGD(self.base_model.lm_head.parameters(), lr=self.args.select_lr_student)
+        self.optimizer = torch.optim.SGD(
+            self.base_model.lm_head.parameters(), 
+            lr=self.args.select_lr_student
+        )
     
     def _rank_dataset_by_influence(self, base_params: torch.Tensor, expert_model_params: torch.Tensor) -> list:
         """Rank dataset examples by influence on optimization direction"""
+        assert self.args.select_max_batch_size < len(self.dataset), \
+            f"select_max_batch_size: {self.args.select_max_batch_size} must be less than dataset size: {len(self.dataset)}"
+        
         # Calculate current MSE
         current_mse = (base_params - expert_model_params).double().pow(2).sum().item()
         print(f"Current MSE: {current_mse:.8f}")
@@ -91,7 +94,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         current_grad = torch.zeros_like(base_params)
         student_lr = self.args.select_lr_student
         
-        while len(batch) < self.args.max_batch_size:
+        batch_pbar = tqdm.trange(0, self.args.select_max_batch_size, disable=(self.args.select_max_batch_size < 32))
+        while len(batch) < self.args.select_max_batch_size:
             # Project parameter difference
             base_params_diff_projected = self.projector.project(
                 (base_params - current_grad * student_lr) - expert_model_params, 
@@ -118,7 +122,6 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch.append(best_idx.item())
             grads[best_idx] = torch.zeros_like(grads[best_idx])  # Zero out the selected gradient
             self.best_idx_counter[best_idx.item()] += 1
-            print(f"Batch size: {len(batch)} | Best idx: {best_idx}")
 
             # Update best similarity for logging purposes
             best_sim = sims[best_idx].item()
@@ -134,13 +137,18 @@ class SELECTOptimizer(DiscreteOptimizer):
                 do_projection=False
             )
             current_grad += batch_grad.flatten()
+            batch_pbar.update(1)
+            batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx.item()} | Batch size: {len(batch)}")
+        
+
+        print(f"Picked new batch of size {len(batch)}: {sorted(batch)}")
         
         return batch, best_sim
 
     def step_x(self, it: int, buffer: list) -> dict[str, torch.Tensor]:
         """Perform one step of SELECT optimization"""
         # Get current model parameters
-        base_params = torch.cat([p.flatten().detach().requires_grad_(False) for p in self.student_net.lm_head.parameters()]).double().to(device)
+        base_params = torch.cat([p.flatten().detach().requires_grad_(False) for p in self.base_model.lm_head.parameters()]).double().to(device)
         
         # Get expert model parameters from buffer
         expert_state_dict = buffer[-1]
@@ -164,14 +172,14 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
         inputs["labels"] = inputs["input_ids"].detach().clone()
-        outputs = self.student_net(**inputs)
+        outputs = self.base_model(**inputs)
         loss = outputs.loss
         loss.backward()
 
         # Calculate gradient direction and step size
         base_params_diff = base_params - expert_model_params
         with torch.no_grad():
-            grad = torch.cat([p.grad.flatten().detach() for p in self.student_net.lm_head.parameters()], dim=0)
+            grad = torch.cat([p.grad.flatten().detach() for p in self.base_model.lm_head.parameters()], dim=0)
             grad_direction = grad / (grad.norm(dim=0, p=2, keepdim=True) + 1e-10)
             grad_step_size = (grad_direction.double() @ base_params_diff).float()
 
@@ -185,7 +193,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Calculate parameter loss (cosine similarity)
         with torch.no_grad():
-            updated_params = torch.cat([p.flatten() for p in self.student_net.lm_head.parameters()]).double().to(device)
+            updated_params = torch.cat([p.flatten() for p in self.base_model.lm_head.parameters()]).double().to(device)
             param_loss = 1 - torch.nn.functional.cosine_similarity(
                 updated_params - base_params,
                 expert_model_params - base_params,

@@ -352,6 +352,7 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
             last_hidden_state = outputs.hidden_states[-1]
         
         def compute_loss(params, buffers, last_hidden_states, labels):
+            base_model.lm_head.requires_grad_(False)
             logits = torch.func.functional_call(
                 module=base_model.lm_head,
                 parameter_and_buffer_dicts=(params, buffers),
