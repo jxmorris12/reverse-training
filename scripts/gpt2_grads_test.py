@@ -312,6 +312,10 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
     all_grads = []
     # all_grads_true = []
     pbar = tqdm.trange(0, len(dataset), batch_size)
+
+    # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
+    params = {k: v.detach() for k, v in base_model.lm_head.named_parameters()}
+    buffers = {k: v.detach() for k, v in base_model.lm_head.named_buffers()}
     
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
@@ -338,29 +342,38 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
             # base_model.zero_grad()
             # print("loss 1: ", loss)
 
-        
-        # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
-        params = {k: v.detach() for k, v in base_model.named_parameters()}
-        buffers = {k: v.detach() for k, v in base_model.named_buffers()}
-        def compute_loss(params, buffers, input_ids, attention_mask, labels):
-            outputs = torch.func.functional_call(
-                module=base_model,
-                parameter_and_buffer_dicts=(params, buffers),
-                kwargs={
-                    "input_ids": input_ids[None],
-                    "attention_mask": attention_mask[None],
-                    "labels": labels[None],
-                }
+        # get last hidden state for inputs
+        with torch.no_grad():
+            outputs = base_model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                output_hidden_states=True,
             )
-            return outputs.loss
+            last_hidden_state = outputs.hidden_states[-1]
+        
+        def compute_loss(params, buffers, last_hidden_states, labels):
+            logits = torch.func.functional_call(
+                module=base_model.lm_head,
+                parameter_and_buffer_dicts=(params, buffers),
+                args=(last_hidden_states,),
+            )
+            logits = logits[:-1, :]
+            labels = labels[1:]
+            loss = torch.nn.functional.cross_entropy(
+                logits, 
+                labels,
+                ignore_index=-100,
+                reduction="mean"
+            )
+            return loss
 
         # Create vectorized gradient function
         ft_compute_grad = torch.func.grad(compute_loss)
-        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0, 0))
+        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
 
         # Compute per-sample gradients
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
-        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.named_parameters()], dim=1)
+        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, inputs["labels"])
+        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.lm_head.named_parameters()], dim=1)
 
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
@@ -396,7 +409,7 @@ def main():
     train_dataset = train_dataset.map(lambda ex: { "text": ex["instruction"] + "\n" + ex["output"] })
     expert_state_dicts, _ = train_expert_model(
         num_experts=1,
-        num_steps_per_expert=1000,
+        num_steps_per_expert=10,
         num_expert_datapoints=64,
         expert_lr=1e-3, 
         sequence_length=32,
@@ -405,9 +418,9 @@ def main():
         text_column_name="text",
     )
     expert_model_params = expert_state_dicts[-1]
-    expert_model_params = torch.cat([p.flatten() for p in expert_model_params.values()]).double().to(device).requires_grad_(False)
+    expert_model_params = torch.cat([p.flatten() for k, p in expert_model_params.items() if "wte" in k]).double().to(device).requires_grad_(False)
 
-    base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
+    base_params = torch.cat([p.flatten() for k, p in base_model.lm_head.named_parameters()]).double().to(device)
     number_of_params = len(base_params)
 
     initial_mse = (base_params - expert_model_params).double().pow(2).sum().item()
@@ -436,23 +449,22 @@ def main():
     #########################################################
     ############### Diagnostic Code 
     #########################################################
-    # all_grads = {}
-    # param_diff_proj = projector.project(base_params - expert_model_params, model_id=0)
-    # param_diff_proj = param_diff_proj / (param_diff_proj.norm(dim=1, p=2, keepdim=True) + 1e-10)
-    # for i in range(10 + 1):
-    #     params_diff_step = (
-    #         (base_params * (1 - i / 10))
-    #         + 
-    #         (expert_model_params * (i / 10))
-    #     )
-    #     # set base model params
-    #     counter = 0
-    #     for k, v in base_model.named_parameters():
-    #         v.data = params_diff_step[counter:counter+v.numel()].reshape(v.data.shape)
-    #         counter += v.numel()
-    #     all_grads[i] = get_grads(base_model, search_dataset, tokenizer, projector, sequence_length=32, batch_size=1, do_projection=True).cpu()
-    #     all_grads[i] = all_grads[i] / (all_grads[i].norm(dim=1, p=2, keepdim=True) + 1e-10)
-    # breakpoint()
+    all_grads = {}
+    param_diff_proj = projector.project(base_params - expert_model_params, model_id=0)
+    param_diff_proj = param_diff_proj / (param_diff_proj.norm(dim=1, p=2, keepdim=True) + 1e-10)
+    for i in range(10 + 1):
+        params_diff_step = (
+            (base_params * (1 - i / 10))
+            + 
+            (expert_model_params * (i / 10))
+        )
+        # set base model params
+        counter = 0
+        for k, v in base_model.lm_head.named_parameters():
+            v.data = params_diff_step[counter:counter+v.numel()].reshape(v.data.shape).to(v.data.dtype)
+            counter += v.numel()
+        all_grads[i] = get_grads(base_model, search_dataset, tokenizer, projector, sequence_length=32, batch_size=128, do_projection=True).cpu()
+        all_grads[i] = all_grads[i] / (all_grads[i].norm(dim=1, p=2, keepdim=True) + 1e-10)
     #########################################################
 
     # num_steps = min(1000, len(train_dataset)) // batch_size
@@ -475,8 +487,7 @@ def main():
     minibatch_size = 16
     steps_per_grad = 8
     for j in pbar:
-
-        minibatch = random.sample(batch, minibatch_size)
+        minibatch = random.sample(range(len(search_dataset)), minibatch_size)
 
         print("** TAKINGSTEP **")
         # take step on batch
