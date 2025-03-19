@@ -3,13 +3,13 @@ from typing import Dict, Sequence, Union, Optional
 from dataclasses import dataclass
 
 import collections
-import copy
 import random
 
 import datasets
 import torch
 import transformers
 import tqdm
+import wandb
 from enum import Enum
 
 from torch.utils.data import Dataset
@@ -308,7 +308,7 @@ def train_expert_model(
     return expert_state_dicts, all_token_counts
 
 
-def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, batch_size: int) -> torch.Tensor:
+def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, batch_size: int, do_projection: bool = True) -> torch.Tensor:
     all_grads = []
     # all_grads_true = []
     pbar = tqdm.trange(0, len(dataset), batch_size)
@@ -343,7 +343,6 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
         params = {k: v.detach() for k, v in base_model.named_parameters()}
         buffers = {k: v.detach() for k, v in base_model.named_buffers()}
         def compute_loss(params, buffers, input_ids, attention_mask, labels):
-            # No need to unsqueeze - vmap will handle that
             outputs = torch.func.functional_call(
                 module=base_model,
                 parameter_and_buffer_dicts=(params, buffers),
@@ -362,8 +361,12 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
         # Compute per-sample gradients
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.named_parameters()], dim=1)
-        projected_grads = projector.project(grads_batch, model_id=0)
-        all_grads.extend(projected_grads)
+
+        if do_projection:
+            projected_grads = projector.project(grads_batch, model_id=0)
+            all_grads.extend(projected_grads)
+        else:
+            all_grads.extend(grads_batch)
         
     # return torch.stack(all_grads_true)
     return torch.stack(all_grads)
@@ -393,9 +396,9 @@ def main():
     train_dataset = train_dataset.map(lambda ex: { "text": ex["instruction"] + "\n" + ex["output"] })
     expert_state_dicts, _ = train_expert_model(
         num_experts=1,
-        num_steps_per_expert=400,
+        num_steps_per_expert=1000,
         num_expert_datapoints=64,
-        expert_lr=1e-2, 
+        expert_lr=1e-3, 
         sequence_length=32,
         train_ds=train_dataset["train"],
         tokenizer=tokenizer,
@@ -407,23 +410,8 @@ def main():
     base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
     number_of_params = len(base_params)
 
-    initial_mse = (base_params - expert_model_params).double().pow(2).mean().item()
+    initial_mse = (base_params - expert_model_params).double().pow(2).sum().item()
     print(f"Initial parameter MSE: {initial_mse:.8f}")
-
-    # create a larger dataset for search
-    # other_dataset = datasets.load_dataset("fancyzhx/ag_news")
-    other_dataset = datasets.load_dataset("jxm/nq_corpus_dpr")
-    other_dataset["train"] = other_dataset["train"].select(range(256))
-    # other_dataset["train"] = other_dataset["train"].select(range(10_112))
-    search_dataset = datasets.concatenate_datasets([train_dataset["train"], other_dataset["train"]])
-
-    # optimizer = torch.optim.SGD(base_model.parameters(), lr=student_lr)
-    j = 0
-    # num_steps = min(1000, len(train_dataset)) // batch_size
-    num_steps = 200
-    grad_batch_size = 16
-
-    pbar = tqdm.trange(0, num_steps)
 
     projection_dim = 2048
     projector = CudaProjector(
@@ -436,57 +424,64 @@ def main():
         max_batch_size=256,
     )
 
+    # create a larger dataset for search
+    # other_dataset = datasets.load_dataset("fancyzhx/ag_news")
+    other_dataset = datasets.load_dataset("jxm/nq_corpus_dpr")
+    other_dataset["train"] = other_dataset["train"].select(range(256))
+    # other_dataset["train"] = other_dataset["train"].select(range(1_280))
+    search_dataset = datasets.concatenate_datasets([train_dataset["train"], other_dataset["train"]])
+    # search_dataset = other_dataset["train"]
+
+
+    #########################################################
+    ############### Diagnostic Code 
+    #########################################################
+    # all_grads = {}
+    # param_diff_proj = projector.project(base_params - expert_model_params, model_id=0)
+    # param_diff_proj = param_diff_proj / (param_diff_proj.norm(dim=1, p=2, keepdim=True) + 1e-10)
+    # for i in range(10 + 1):
+    #     params_diff_step = (
+    #         (base_params * (1 - i / 10))
+    #         + 
+    #         (expert_model_params * (i / 10))
+    #     )
+    #     # set base model params
+    #     counter = 0
+    #     for k, v in base_model.named_parameters():
+    #         v.data = params_diff_step[counter:counter+v.numel()].reshape(v.data.shape)
+    #         counter += v.numel()
+    #     all_grads[i] = get_grads(base_model, search_dataset, tokenizer, projector, sequence_length=32, batch_size=1, do_projection=True).cpu()
+    #     all_grads[i] = all_grads[i] / (all_grads[i].norm(dim=1, p=2, keepdim=True) + 1e-10)
+    # breakpoint()
+    #########################################################
+
+    # num_steps = min(1000, len(train_dataset)) // batch_size
+    num_steps = 2000
+    grad_batch_size = 32
+
+    pbar = tqdm.trange(0, num_steps)
+
+
+    wandb.init(
+        sync_tensorboard=False,
+        project="dataset-distillation-2",
+        # config=args,
+        # mode="disabled" if get_rank() > 0 else os.getenv("WANDB_MODE", "online"),
+    )
     best_idx_counter = collections.Counter()
-    optimizer = torch.optim.SGD(base_model.parameters(), lr=1e-2)
-    for _ in pbar:
-        # get all grads
-        grads = get_grads(base_model, search_dataset, tokenizer, projector, sequence_length=32, batch_size=grad_batch_size)
-        assert grads.shape == (len(search_dataset), projection_dim), f"grads.shape: {grads.shape} != (len(search_dataset), projection_dim): {(len(search_dataset), projection_dim)}"
+    student_lr = 1e-3
+    optimizer = torch.optim.SGD(base_model.parameters(), lr=student_lr)
+    max_batch_size = 64
+    minibatch_size = 16
+    steps_per_grad = 8
+    for j in pbar:
 
-        # project params
-        base_params = torch.cat([p.flatten() for p in base_model.parameters()]).double().to(device)
-        base_params_diff = base_params - expert_model_params
-        base_params_diff_projected = projector.project(base_params_diff, model_id=0)
+        minibatch = random.sample(batch, minibatch_size)
 
-        projected_mse = (-grads + base_params_diff_projected).double().pow(2).mean().item()
-        print(f"Projected MSE: {projected_mse:.8f}")
-
-        # greedily fill batch
-        assert base_params.shape == expert_model_params.shape
-        batch = []
-        batch_grads_sum = torch.zeros_like(grads[0], requires_grad=False)
-        best_sim = float("-inf")
-        while len(batch) < len(grads):
-            # use cosine similarity to find best grad
-            batch_grads = batch_grads_sum + grads
-            batch_grads_norm = batch_grads / (batch_grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
-            base_params_diff_norm = base_params_diff_projected / (base_params_diff_projected.norm(dim=1, p=2, keepdim=True) + 1e-10)
-
-            sims = batch_grads_norm @ base_params_diff_norm.T
-            sims[batch] = float("-inf")
-
-            # check for nans
-            if torch.isnan(sims).any():
-                print("NaNs in sims")
-                breakpoint()
-                exit()
-            # filter out already selected grad
-            best_idx = torch.argmax(sims)
-            if sims[best_idx].item() < best_sim:
-                print(f"-> Best sim: {sims[best_idx].item():.3f} | Batch size: {len(batch)} | Best idx: {best_idx}")
-                break
-
-            batch.append(best_idx.item())
-            batch_grads_sum += grads[best_idx]
-            grads[best_idx] = torch.zeros_like(grads[best_idx])
-            best_idx_counter[best_idx.item()] += 1
-            print(f"Best sim: {sims[best_idx].item():.3f} | Batch size: {len(batch)} | Best idx: {best_idx}")
-            grads[best_idx] = grads[best_idx] * 0.0
-            best_sim = max(best_sim, sims[best_idx].item())
-
+        print("** TAKINGSTEP **")
         # take step on batch
         inputs = tokenizer(
-            search_dataset.select(batch)["text"],
+            search_dataset.select(minibatch)["text"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
@@ -498,17 +493,22 @@ def main():
         loss = outputs.loss
         loss.backward()
 
-        # basic SGD update
+        # project grad from base_model to expert_model_params
+        base_params_diff = base_params - expert_model_params
+        with torch.no_grad():
+            grad = torch.cat([p.grad.flatten().detach() for p in base_model.parameters()], dim=0)
+            grad_direction = grad / (grad.norm(dim=0, p=2, keepdim=True) + 1e-10)
+            grad_step_size = (grad_direction.double() @ base_params_diff).float()
+
+
+        # [basic SGD update]
         optimizer.step()
         optimizer.zero_grad()
-        pbar.set_description(f"loss: {loss.item():.3f} | projected mse: {projected_mse:.3f}")
-        print(f"loss: {loss.item():.3f} | projected mse: {projected_mse:.3f}")
-        
-        # project grad from base_model to expert_model_params
-        # with torch.no_grad():
-        #     grad = torch.cat([p.grad.flatten().detach() for p in base_model.parameters()], dim=0)
-        #     grad_direction = grad / (grad.norm(dim=0, p=2, keepdim=True) + 1e-10)
-        #     grad_step_size = (grad_direction.double() @ base_params_diff).float()
+        base_model.zero_grad()
+        pbar.set_description(f"loss: {loss.item():.3f}")
+        print(f"loss: {loss.item():.3f}")
+
+        # [projected update]
         # if grad_step_size.item() <= 0.0:
         #     print(f"Step size is negative or zero (got {grad_step_size.item()})")
         #     break
@@ -522,7 +522,21 @@ def main():
         
         # pbar.set_description(f"loss: {loss.item():.3f} | step size: {grad_step_size.item():.3f} | projected mse: {projected_mse:.3f}")
 
-        j += 1
+        if grad_step_size.item() <= 0.0:
+            print(f"Warning: Step size is negative or zero (got {grad_step_size.item()})")
+
+        wandb.log({
+            "loss": loss.item(),
+            "current_mse": current_mse,
+            # "projected_mse": projected_mse,
+            "grad_step_size": grad_step_size.item(),
+            "best_sim": best_sim,
+            "batch_size": len(batch),
+            "num_steps": j,
+            "grad_batch_size": grad_batch_size,
+            "projection_dim": projection_dim,
+            "sims_max": sims.max().item(),
+        })
 
         # free memory
         torch.cuda.empty_cache()
