@@ -433,14 +433,11 @@ def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, st
         ds = ds.train_test_split(test_size=0.1, seed=42)
         text_column_name = "text"
         label_column_name = None
-    elif dataset_name == "nq_1000":
+    elif dataset_name.startswith("nq_") and dataset_name[3:].isdigit():
+        # Handle nq_BBB where BBB is any integer
+        num_samples = int(dataset_name[3:])
         ds = datasets.load_dataset("jxm/nq_corpus_dpr")
-        ds["train"] = ds["train"].select(range(1000))
-        text_column_name = "text"
-        label_column_name = None
-    elif dataset_name == "nq_5000":
-        ds = datasets.load_dataset("jxm/nq_corpus_dpr")
-        ds["train"] = ds["train"].select(range(5000))
+        ds["train"] = ds["train"].select(range(num_samples))
         text_column_name = "text"
         label_column_name = None
     elif dataset_name == "msmarco":

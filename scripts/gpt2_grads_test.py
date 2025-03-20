@@ -309,8 +309,10 @@ def train_expert_model(
 
 
 def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, batch_size: int, do_projection: bool = True) -> torch.Tensor:
+    dataset = dataset.select(range(5, 7))
+    
     all_grads = []
-    # all_grads_true = []
+    all_grads_true = []
     pbar = tqdm.trange(0, len(dataset), batch_size)
 
     # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
@@ -320,7 +322,7 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
-        
+        print(batch)
         inputs = tokenizer(
             batch["text"],
             return_tensors="pt",
@@ -332,15 +334,18 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
         inputs["labels"] = inputs["input_ids"].detach().clone()
 
         # measure grads one-by-one
-        # for i in range(len(batch)):
-            # batch_inputs = { k: v[i:i+1].to(device) for k, v in inputs.items() }
-            # loss = base_model(**batch_inputs).loss
-            # loss.backward()
-            # batch_grads_true = torch.cat([p.grad.flatten().detach() for p in base_model.parameters()], dim=0)
-            # batch_grads_true_projected = projector.project(batch_grads_true, model_id=0)
-            # all_grads_true.extend(batch_grads_true_projected)
-            # base_model.zero_grad()
-            # print("loss 1: ", loss)
+        batch_grads_true_list = []
+        for i in range(len(batch)):
+            batch_inputs = { k: v[i:i+1].to(device) for k, v in inputs.items() }
+            loss = base_model(**batch_inputs).loss
+            loss.backward()
+            batch_grads_true = torch.cat([p.grad.flatten().detach() for p in base_model.lm_head.parameters()], dim=0)
+            batch_grads_true_list.append(batch_grads_true)
+            batch_grads_true_projected = projector.project(batch_grads_true, model_id=0)
+            all_grads_true.extend(batch_grads_true_projected)
+            base_model.zero_grad()
+            print("loss 1: ", loss)
+        batch_grads_true_list = torch.stack(batch_grads_true_list)
 
         # get last hidden state for inputs
         with torch.no_grad():
@@ -351,29 +356,66 @@ def get_grads(base_model, dataset, tokenizer, projector, sequence_length: int, b
             )
             last_hidden_state = outputs.hidden_states[-1]
         
-        def compute_loss(params, buffers, last_hidden_states, labels):
-            base_model.lm_head.requires_grad_(False)
-            logits = torch.func.functional_call(
-                module=base_model.lm_head,
-                parameter_and_buffer_dicts=(params, buffers),
-                args=(last_hidden_states,),
-            )
-            logits = logits[:-1, :]
-            labels = labels[1:]
-            loss = torch.nn.functional.cross_entropy(
-                logits, 
-                labels,
-                ignore_index=-100,
-                reduction="mean"
-            )
-            return loss
+        # def compute_loss(params, buffers, last_hidden_states, labels):
+        #     base_model.lm_head.requires_grad_(False)
+        #     logits = torch.func.functional_call(
+        #         module=base_model.lm_head,
+        #         parameter_and_buffer_dicts=(params, buffers),
+        #         args=(last_hidden_states,),
+        #     )
+        #     logits = logits[:-1, :]
+        #     labels = labels[1:]
+        #     loss = torch.nn.functional.cross_entropy(
+        #         logits, 
+        #         labels,
+        #         ignore_index=-100,
+        #         reduction="mean"
+        #     )
+        #     return loss
 
-        # Create vectorized gradient function
-        ft_compute_grad = torch.func.grad(compute_loss)
-        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
+        # # Create vectorized gradient function
+        # ft_compute_grad = torch.func.grad(compute_loss)
+        # ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
+        # Compute per-sample gradients
+        # ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, inputs["labels"])
 
         # Compute per-sample gradients
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, inputs["labels"])
+        cs = torch.nn.functional.cosine_similarity
+        with torch.no_grad():
+            logits = base_model.lm_head(last_hidden_state)
+            logits = logits[:, :-1, :]
+            labels = inputs["labels"][:, 1:]
+            loss_mask = (inputs["attention_mask"][:, :-1] & (inputs["labels"] != -100)[:, :-1])
+
+            # Calculate probs directly
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+
+            # Initialize the one-hot targets with zeros
+            batch_size, seq_len, vocab_size = logits.shape
+            labels_one_hot = torch.zeros_like(probs)
+
+            # Only set one-hot values for valid positions
+            valid_indices = loss_mask.nonzero(as_tuple=True)
+            valid_labels = labels[valid_indices]
+            labels_one_hot[valid_indices[0], valid_indices[1], valid_labels] = 1.0
+
+            # Gradient calculation
+            grad_logits = probs - labels_one_hot
+            grad_logits = grad_logits * loss_mask.unsqueeze(-1)
+
+            # compute gradient
+            # TODO: Find out why my gradient only has a cosine sim of 0.98 with the true gradient
+            grad_W = (
+                torch.einsum(
+                    "bsd, bsv -> bdv", 
+                    grad_logits, 
+                    last_hidden_state[:, :-1, :] # * loss_mask[:, :, None]
+                ) # / loss_mask.sum(dim=1)[:, None, None]
+            )
+            grad_W = grad_W.reshape(len(logits), -1)
+            # TODO: Diagnose.
+        breakpoint()
+
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_size, -1) for n, _ in base_model.lm_head.named_parameters()], dim=1)
 
         if do_projection:
@@ -484,13 +526,11 @@ def main():
     best_idx_counter = collections.Counter()
     student_lr = 1e-3
     optimizer = torch.optim.SGD(base_model.parameters(), lr=student_lr)
-    max_batch_size = 64
     minibatch_size = 16
-    steps_per_grad = 8
     for j in pbar:
         minibatch = random.sample(range(len(search_dataset)), minibatch_size)
 
-        print("** TAKINGSTEP **")
+        print("** TAKING STEP **")
         # take step on batch
         inputs = tokenizer(
             search_dataset.select(minibatch)["text"],
@@ -511,7 +551,6 @@ def main():
             grad = torch.cat([p.grad.flatten().detach() for p in base_model.parameters()], dim=0)
             grad_direction = grad / (grad.norm(dim=0, p=2, keepdim=True) + 1e-10)
             grad_step_size = (grad_direction.double() @ base_params_diff).float()
-
 
         # [basic SGD update]
         optimizer.step()

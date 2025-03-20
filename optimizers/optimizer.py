@@ -10,6 +10,7 @@ from utils import trange_if_main_worker
 class DiscreteOptimizer(ABC):
     def __init__(self, args):
         self.args = args
+        self.should_stop = False
     
     def step_x_inner_loop(
             self, 

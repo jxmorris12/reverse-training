@@ -74,12 +74,13 @@ if __name__ == '__main__':
     parser.add_argument("--gcg_documents_to_swap", type=int, default=None, help="how many documents to swap in GCG")
 
     parser.add_argument("--select_seed_dataset", type=str, default="nq", help="dataset to use for SELECT")
-    parser.add_argument("--select_projection_dim", type=int, default=1024, help="projection dimension for SELECT")
+    parser.add_argument("--select_projection_dim", type=int, default=2048, help="projection dimension for SELECT")
     parser.add_argument("--select_steps_per_grad", type=int, default=256, help="how many steps between gradient rerankings in SELECT")
     parser.add_argument("--select_minibatch_size", type=int, default=32, help="how many examples to select in SELECT")
-    parser.add_argument("--select_grad_batch_size", type=int, default=64, help="how many examples to compute gradients for in SELECT")
-    parser.add_argument("--select_max_batch_size", type=int, default=256, help="how many examples to select per gradient reranking in SELECT")
+    parser.add_argument("--select_grad_batch_size", type=int, default=128, help="how many examples to compute gradients for in SELECT")
+    parser.add_argument("--select_max_batch_size", type=int, default=2048, help="how many examples to select per gradient reranking in SELECT")
     parser.add_argument("--select_lr_student", type=float, default=0.001, help="learning rate for SELECT")  
+    parser.add_argument("--select_num_pseudoexperts", type=int, default=1, help="number of pseudoexperts to use in SELECT")
     args = parser.parse_args()
 
     main(args)

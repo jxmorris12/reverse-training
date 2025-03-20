@@ -9,6 +9,7 @@ import torch
 import tqdm
 from utils import (
     device, 
+    get_model,
     load_dataset_from_name,
 )
 
@@ -28,7 +29,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.tokenizer = tokenizer
         self.student_net = student_net
         self.initial_student_net = initial_student_net
-        self.base_model = copy.deepcopy(initial_student_net)
+        self.base_model = get_model("gpt2")
 
         self.Y = Y
 
@@ -57,11 +58,18 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.best_idx_counter = collections.Counter()
         self.batch = []
         self.optimizer = torch.optim.SGD(
-            self.base_model.lm_head.parameters(), 
+            self.base_model.parameters(), 
             lr=self.args.select_lr_student
         )
+        self.steps_since_last_improvement = 0
+        self.best_mse = float("inf")
+        self.tokenization_cache = {}  # Cache for tokenized dataset entries
     
-    def _rank_dataset_by_influence(self, base_params: torch.Tensor, expert_model_params: torch.Tensor) -> list:
+    def _rank_dataset_by_influence(
+            self, 
+            full_base_params, full_expert_model_params,
+            last_layer_base_params, last_layer_expert_model_params
+        ) -> list:
         """Rank dataset examples by influence on optimization direction"""
         assert self.args.select_max_batch_size < len(self.dataset), \
             f"select_max_batch_size: {self.args.select_max_batch_size} must be less than dataset size: {len(self.dataset)}"
@@ -69,14 +77,31 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get all gradients
         # TODO: Control randomness to get same results each time
         self.base_model.to(device)
-        grads = get_grads_final_layer(
-            self.base_model, 
-            self.dataset, 
-            self.tokenizer, 
-            self.projector, 
-            sequence_length=self.args.sequence_length, 
-            batch_size=self.args.select_grad_batch_size
-        )
+
+        base_model = copy.deepcopy(self.base_model)
+        grads = []
+        for i in range(self.args.select_num_pseudoexperts):
+            step_frac = i / self.args.select_num_pseudoexperts
+            pseudoexpert_params = (
+                step_frac * full_base_params + (1 - step_frac) * full_expert_model_params
+            )
+            # Set params
+            counter = 0
+            for i, p in enumerate(base_model.parameters()):
+                p.data = pseudoexpert_params[counter:counter+p.numel()].reshape(p.data.shape).to(p.data.dtype)
+                counter += p.numel()
+
+            batch_grads = get_grads_final_layer(
+                base_model, 
+                self.dataset, 
+                self.tokenizer, 
+                self.projector,
+                sequence_length=self.args.sequence_length, 
+                batch_size=self.args.select_grad_batch_size
+            )
+            grads.append(batch_grads)
+        
+        grads = torch.stack(grads, dim=0).double().sum(dim=0).float()
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
@@ -87,14 +112,14 @@ class SELECTOptimizer(DiscreteOptimizer):
         batch = []
         grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
         best_sim = float("-inf")
-        current_grad = torch.zeros_like(base_params)
+        current_grad = torch.zeros_like(last_layer_base_params)
         student_lr = self.args.select_lr_student
         
         batch_pbar = tqdm.trange(0, self.args.select_max_batch_size, disable=(self.args.select_max_batch_size < 32))
         while len(batch) < self.args.select_max_batch_size:
             # Project parameter difference
             base_params_diff_projected = self.projector.project(
-                (base_params - current_grad * student_lr) - expert_model_params, 
+                (last_layer_base_params - current_grad * student_lr) - last_layer_expert_model_params, 
                 model_id=0
             )
         
@@ -140,27 +165,31 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         return batch, best_sim
 
-    def step_x(self, it: int, buffer: list) -> dict[str, torch.Tensor]:
+    def step_with_grad(self, it: int, buffer: list) -> dict[str, torch.Tensor]:
         """Perform one step of SELECT optimization"""
         # Get current model parameters
-        base_params = torch.cat([p.flatten().detach().requires_grad_(False) for p in self.base_model.lm_head.parameters()]).double().to(device)
+        full_base_params = torch.cat([p.flatten().cpu().detach().requires_grad_(False) for p in self.base_model.parameters()]).double().to(device)
+        last_layer_base_params = torch.cat([p.flatten().cpu().detach().requires_grad_(False) for p in self.base_model.lm_head.parameters()]).double().to(device)
         
         # Get expert model parameters from buffer
         expert_state_dict = buffer[-1]
-        expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items() if "wte" in k]).double().to(device)
+        full_expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items()]).double().to(device)
+        last_layer_expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items() if "wte" in k]).double().to(device)
         
         # Update batch if needed
         if it % self.args.select_steps_per_grad == 0:
-            self.batch, best_sim = self._rank_dataset_by_influence(base_params, expert_model_params)
+            self.batch, best_sim = self._rank_dataset_by_influence(
+                full_base_params, full_expert_model_params,
+                last_layer_base_params, last_layer_expert_model_params
+            )
         
-
         # Calculate current MSE
-        current_mse = (base_params - expert_model_params).double().pow(2).sum().item()
+        base_params_diff = full_base_params - full_expert_model_params
+        current_mse = (base_params_diff).double().pow(2).sum().item()
         
         # Select random minibatch from batch
         minibatch = random.sample(self.batch, min(self.args.select_minibatch_size, len(self.batch)))
 
-        print("** TAKING STEP **")
         # Take step on batch
         inputs = self.tokenizer(
             self.dataset.select(minibatch)["text"],
@@ -176,9 +205,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         loss.backward()
 
         # Calculate gradient direction and step size
-        base_params_diff = base_params - expert_model_params
         with torch.no_grad():
-            grad = torch.cat([p.grad.flatten().detach() for p in self.base_model.lm_head.parameters()], dim=0)
+            grad = torch.cat([p.grad.flatten().detach() for p in self.base_model.parameters()], dim=0)
             grad_direction = grad / (grad.norm(dim=0, p=2, keepdim=True) + 1e-10)
             grad_step_size = (grad_direction.double() @ base_params_diff).float()
 
@@ -187,9 +215,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.optimizer.zero_grad()
         self.base_model.zero_grad()
         
-        # Print loss
-        print(f"loss: {loss.item():.3f}")
-
         # Report metrics
         metrics = {
             "param_mse": current_mse,
@@ -201,17 +226,52 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Free memory
         torch.cuda.empty_cache()
         
-        #   add minibatch to self.best_idx_counter
+        # add minibatch to self.best_idx_counter
         self.best_idx_counter.update(minibatch)
-        
+
         # Print top-10 most selected indices
         top_10_selected = self.best_idx_counter.most_common(10)
         print(f"Top-10 most-selected indices: {top_10_selected}")
+
+        self.best_mse = min(self.best_mse, current_mse)
+        if current_mse < self.best_mse:
+            self.steps_since_last_improvement = 0
+        else:
+            self.steps_since_last_improvement += 1
         
+        if self.steps_since_last_improvement > 20:
+            print("Stopping distillation early since no improvement for 20 steps")
+            self.should_stop = True
+
         return metrics
 
     def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        metrics = self.step_x(it, buffer)
-        X_text = self.dataset.select(self.batch)["text"]
-        X_tokens = self.tokenizer(X_text, return_tensors="pt", padding="max_length", truncation=True, max_length=self.args.sequence_length)["input_ids"]
+        metrics = self.step_with_grad(it, buffer)
+        best_idxs = self.best_idx_counter.most_common(self.args.dataset_size)
+        best_idxs = [i for i, _ in best_idxs]
+        X_tokens = torch.stack([
+            self._tokenize_dataset_cached(i)
+            for i in best_idxs
+        ])
         return X_tokens, metrics
+
+    def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:
+        """Tokenize dataset entry with caching.
+        
+        Args:
+            i: Index of dataset entry to tokenize
+            
+        Returns:
+            Tokenized text as tensor
+        """
+        if i not in self.tokenization_cache:
+            text = self.dataset[i][self.dataset_text_column_name]
+            tokens = self.tokenizer(
+                text,
+                return_tensors="pt",
+                padding="max_length", 
+                truncation=True,
+                max_length=self.args.sequence_length
+            )["input_ids"].squeeze(0)
+            self.tokenization_cache[i] = tokens
+        return self.tokenization_cache[i]

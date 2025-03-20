@@ -143,7 +143,7 @@ class DatasetDistiller:
         self._log_table(tokens, labels, step=step)
         tokens = tokens.cpu()
         labels = labels.cpu()
-        
+
         # TODO: Recheck the below logic!
         # compare tokens to dataset_token_counts
         dataset_token_counts = self.dataset_token_counts.bool()
@@ -220,3 +220,10 @@ class DatasetDistiller:
             # clear cache
             gc.collect()
             torch.cuda.empty_cache()
+
+            if discrete_optimizer.should_stop:
+                break
+
+        print("Stopping distillation...")
+        self._evaluate_and_log(Z, discrete_optimizer.Y, step=it)
+        wandb.finish()
