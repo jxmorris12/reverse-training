@@ -11,6 +11,7 @@ class DiscreteOptimizer(ABC):
     def __init__(self, args):
         self.args = args
         self.should_stop = False
+        self.dataset_label_map = {}
     
     def step_x_inner_loop(
             self, 

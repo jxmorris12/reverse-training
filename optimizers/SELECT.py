@@ -3,11 +3,11 @@ from .optimizer import DiscreteOptimizer
 import collections
 import copy
 import random
-from enum import Enum
 
 import torch
 import tqdm
 from utils import (
+    autolabel_dataset,
     device, 
     get_model,
     load_dataset_from_name,
@@ -42,7 +42,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
         self.dataset = self.dataset["train"]
         print(f"SELECTOptimizer: dataset size: {len(self.dataset)}")
-        
+
         # Setup projector
         param_count = sum(p.numel() for p in self.base_model.lm_head.parameters())
         self.projector = CudaProjector(
@@ -63,7 +63,16 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
         self.steps_since_last_improvement = 0
         self.best_mse = float("inf")
-        self.tokenization_cache = {}  # Cache for tokenized dataset entries
+        self.tokenization_cache = {}
+        self.Y = None
+        self.dataset_labels = None
+        # TODO: Make this dynamic
+        self.dataset_label_map = {
+            "0": "World",
+            "1": "Sports",
+            "2": "Business",
+            "3": "Sci/Tech",
+        }
     
     def _rank_dataset_by_influence(
             self, 
@@ -71,7 +80,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             last_layer_base_params, last_layer_expert_model_params
         ) -> list:
         """Rank dataset examples by influence on optimization direction"""
-        assert self.args.select_max_batch_size < len(self.dataset), \
+        assert self.args.select_max_batch_size <= len(self.dataset), \
             f"select_max_batch_size: {self.args.select_max_batch_size} must be less than dataset size: {len(self.dataset)}"
 
         # Get all gradients
@@ -94,6 +103,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch_grads = get_grads_final_layer(
                 base_model, 
                 self.dataset, 
+                self.dataset_labels,
                 self.tokenizer, 
                 self.projector,
                 sequence_length=self.args.sequence_length, 
@@ -111,6 +121,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Greedily fill batch
         batch = []
         grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
+        grads_norm = grads_norm.to(device)
         best_sim = float("-inf")
         current_grad = torch.zeros_like(last_layer_base_params)
         student_lr = self.args.select_lr_student
@@ -125,6 +136,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         
             # Use cosine similarity to find best gradient
             base_params_diff_norm = base_params_diff_projected / (base_params_diff_projected.norm(dim=1, p=2, keepdim=True) + 1e-10)
+            base_params_diff_norm = base_params_diff_norm.to(device)
             sims = grads_norm @ base_params_diff_norm.T
             
             # Exclude already selected examples
@@ -150,6 +162,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch_grad = get_grads_final_layer(
                 self.base_model, 
                 self.dataset.select([best_idx]), 
+                self.dataset_labels[None, best_idx],
                 self.tokenizer, 
                 self.projector, 
                 sequence_length=self.args.sequence_length, 
@@ -163,7 +176,7 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         print(f"Picked new batch of size {len(batch)}: {sorted(batch)}")
         
-        return batch, best_sim
+        return batch
 
     def step_with_grad(self, it: int, buffer: list) -> dict[str, torch.Tensor]:
         """Perform one step of SELECT optimization"""
@@ -178,7 +191,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Update batch if needed
         if it % self.args.select_steps_per_grad == 0:
-            self.batch, best_sim = self._rank_dataset_by_influence(
+            self.batch = self._rank_dataset_by_influence(
                 full_base_params, full_expert_model_params,
                 last_layer_base_params, last_layer_expert_model_params
             )
@@ -199,7 +212,16 @@ class SELECTOptimizer(DiscreteOptimizer):
             max_length=self.args.sequence_length,
         )
         inputs = {k: v.to(device) for k, v in inputs.items()}
-        inputs["labels"] = inputs["input_ids"].detach().clone()
+        if self.args.select_do_classification:
+            no_labels = (
+                torch.zeros(len(minibatch), self.args.sequence_length - 1, device=device, dtype=torch.long) 
+                - 
+                100
+            )
+            last_token_labels = self.dataset_labels[minibatch][:, None]
+            inputs["labels"] = torch.cat([no_labels, last_token_labels], dim=1)
+        else:
+            inputs["labels"] = inputs["input_ids"].detach().clone()
         outputs = self.base_model(**inputs)
         loss = outputs.loss
         loss.backward()
@@ -223,29 +245,36 @@ class SELECTOptimizer(DiscreteOptimizer):
             "synth_lr": self.syn_lr.detach().item(),
         }
         
-        # Free memory
         torch.cuda.empty_cache()
         
-        # add minibatch to self.best_idx_counter
         self.best_idx_counter.update(minibatch)
 
-        # Print top-10 most selected indices
         top_10_selected = self.best_idx_counter.most_common(10)
         print(f"Top-10 most-selected indices: {top_10_selected}")
 
-        self.best_mse = min(self.best_mse, current_mse)
         if current_mse < self.best_mse:
             self.steps_since_last_improvement = 0
+            self.best_mse = current_mse
         else:
             self.steps_since_last_improvement += 1
-        
-        if self.steps_since_last_improvement > 20:
-            print("Stopping distillation early since no improvement for 20 steps")
-            self.should_stop = True
+
+        # if self.steps_since_last_improvement > (2 * self.args.select_steps_per_grad):
+        #     print(f"Stopping distillation early since no improvement for {2 * self.args.select_steps_per_grad} steps")
+        #     self.should_stop = True
 
         return metrics
 
     def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.args.select_do_classification and self.dataset_labels is None:
+            # Get labels from expert model
+            expert_state_dict = buffer[-1]
+            expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"].to(device)
+            expert_model = copy.deepcopy(self.base_model)
+            expert_model.load_state_dict(expert_state_dict)
+            self.dataset_labels = autolabel_dataset(
+                self.dataset, expert_model, self.tokenizer, self.args.sequence_length)
+            expert_state_dict.pop("lm_head.weight")
+            
         metrics = self.step_with_grad(it, buffer)
         best_idxs = self.best_idx_counter.most_common(self.args.dataset_size)
         best_idxs = [i for i, _ in best_idxs]
@@ -253,6 +282,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             self._tokenize_dataset_cached(i)
             for i in best_idxs
         ])
+        self.Y = self.dataset_labels[best_idxs]
         return X_tokens, metrics
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:

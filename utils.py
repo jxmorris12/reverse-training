@@ -108,6 +108,47 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
     return limit_layers(model, 6)
 
 
+def autolabel_dataset(dataset: datasets.Dataset, model: transformers.PreTrainedModel, tokenizer: transformers.PreTrainedTokenizer, sequence_length: int, batch_size: int = 32) -> torch.Tensor:
+    """Get model predictions for the sequence_length-th token for each example in the dataset.
+    
+    Args:
+        dataset: Dataset to label
+        model: Model to use for labeling
+        tokenizer: Tokenizer for processing text
+        sequence_length: Maximum sequence length for tokenization
+        batch_size: Batch size for processing
+        
+    Returns:
+        Tensor of shape (len(dataset),) containing the predicted token ids
+    """
+    model.eval()
+    model.to(device)
+    all_labels = []
+    
+    for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset"):
+        batch_end = min(batch_start + batch_size, len(dataset))
+        batch = dataset.select(range(batch_start, batch_end))
+        
+        # Tokenize batch
+        inputs = tokenizer(
+            batch["text"],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=sequence_length,
+        )
+        inputs = { k: v.to(device) for k, v in inputs.items() }
+        
+        # Get model predictions
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits[:, sequence_length-1, :] # Get logits for sequence_length-th token
+            predictions = torch.argmax(logits, dim=-1)
+            all_labels.append(predictions)
+    
+    return torch.cat(all_labels)
+
+
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     state_dict = model.state_dict()
     
@@ -202,12 +243,14 @@ def _train_expert_model_uncached(
                     batch_idxs = torch.randint(0, len(ds_tokens), (num_expert_datapoints,)).tolist()
                 else:
                     batch_idxs = random.sample(range(len(ds_tokens)), k=num_expert_datapoints)
-                tokens = ds_tokens[batch_idxs]
-                labels = ds_labels[batch_idxs] if ds_labels is not None else tokens.clone()
+                tokens = ds_tokens[batch_idxs].to(device)
                 outputs = student_net(
                     input_ids=tokens,
                     attention_mask=(tokens != tokenizer.pad_token_id),
                 )
+                labels = ds_labels[batch_idxs] if ds_labels is not None else tokens[:, 1:]
+                no_labels = torch.zeros_like(tokens[:, :-2], device=device, dtype=torch.long) - 100
+                labels = torch.cat([no_labels, labels[:, None].to(device)], dim=1)
             else:
                 # Handle raw text data case
                 batch_idxs = random.sample(range(len(train_ds)), k=num_expert_datapoints)
@@ -243,6 +286,7 @@ def _train_expert_model_uncached(
                 # Track token counts
                 all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
             
+
             logits = outputs.logits[:, :-1]
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), 
@@ -327,6 +371,8 @@ def _train_expert_model_uncached(
         best_eval_perplexity = min({ v for k,v in evaluation_metrics.items() if "perplexity" in k } | { float("inf") })
         print0(f"Best eval loss: {best_eval_loss:.3f} | Best eval perplexity: {best_eval_perplexity:.3f}")
 
+    if all_token_counts.sum() == 0:
+        print0("WARNING: no tokens were counted")
     return expert_state_dicts, all_token_counts, evaluation_metrics
 
 
@@ -361,13 +407,16 @@ def train_expert_model(
         "text_column_name": text_column_name,
         "label_column_name": label_column_name,
         "num_evaluation_batches": num_evaluation_batches,
+        "ds_fingerprint": "_".join(str(ds[k]._fingerprint) for k in sorted(ds.keys())),
         **kwargs  # Include any additional kwargs in cache key generation
     }
     cache_key = _get_cache_key(**cache_kwargs)
     cache_path = os.path.join(cache_dir, f"expert_model_{cache_key}.pkl")
+
+    uncachable_args_provided = (ds_tokens is not None) or (ds_labels is not None)
     
     # Check if cached result exists
-    if os.path.exists(cache_path):
+    if os.path.exists(cache_path) and not uncachable_args_provided:
         print0(f"Loading cached expert model results from {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
@@ -390,8 +439,9 @@ def train_expert_model(
     )
     
     # Cache results
-    with open(cache_path, "wb") as f:
-        pickle.dump(results, f)
+    if not uncachable_args_provided:
+        with open(cache_path, "wb") as f:
+            pickle.dump(results, f)
     
     return results
 
@@ -428,6 +478,13 @@ def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, st
         ds = datasets.load_dataset("fancyzhx/ag_news")
         text_column_name = "text"        
         label_column_name = "label"
+    elif dataset_name.startswith("ag_news_") and dataset_name[8:].isdigit():
+        num_samples = int(dataset_name[8:])
+        ds = datasets.load_dataset("fancyzhx/ag_news")
+        ds = ds.train_test_split(test_size=0.1, seed=42)
+        ds["train"] = ds["train"].select(range(num_samples))
+        text_column_name = "text"
+        label_column_name = "label"
     elif dataset_name == "nq":
         ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
         ds = ds.train_test_split(test_size=0.1, seed=42)
@@ -436,7 +493,8 @@ def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, st
     elif dataset_name.startswith("nq_") and dataset_name[3:].isdigit():
         # Handle nq_BBB where BBB is any integer
         num_samples = int(dataset_name[3:])
-        ds = datasets.load_dataset("jxm/nq_corpus_dpr")
+        ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
+        ds = ds.train_test_split(test_size=0.1, seed=42)
         ds["train"] = ds["train"].select(range(num_samples))
         text_column_name = "text"
         label_column_name = None

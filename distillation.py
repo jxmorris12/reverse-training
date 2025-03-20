@@ -20,14 +20,6 @@ from utils import (
 )
 
 
-LABEL_MAP = {
-    "0": "World",
-    "1": "Sports",
-    "2": "Business",
-    "3": "Sci/Tech",
-}
-
-
 class DatasetDistiller:
     def __init__(self, args):
         # train model for a couple steps
@@ -129,12 +121,16 @@ class DatasetDistiller:
             )
         else:
             raise NotImplementedError(f"Optimizer {self.args.discrete_optimizer} not implemented")
+        self.dataset_label_map = optimizer.dataset_label_map
         return optimizer
     
     def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
         tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
-        labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
-        labels = list(map(lambda x: LABEL_MAP[x.strip()], labels))
+        if labels is not None:
+            labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
+            labels = list(map(lambda x: self.dataset_label_map.get(x.strip(), "[?]"), labels))
+        else:
+            labels = [""] * len(tokens)
         table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)
@@ -142,7 +138,7 @@ class DatasetDistiller:
     def _evaluate_and_log(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
         self._log_table(tokens, labels, step=step)
         tokens = tokens.cpu()
-        labels = labels.cpu()
+        labels = labels.cpu() if labels is not None else None
 
         # TODO: Recheck the below logic!
         # compare tokens to dataset_token_counts
@@ -152,7 +148,7 @@ class DatasetDistiller:
         # compute precision & recall
         precision = (dataset_token_counts & token_counts).sum() / token_counts.sum()
         recall = (dataset_token_counts & token_counts).sum() / dataset_token_counts.sum()
-        f1 = 2 * (precision * recall) / (precision + recall)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
         dataset_metrics = {
             "dataset_token_precision": precision.detach().cpu().item(),
             "dataset_token_recall": recall.detach().cpu().item(),
@@ -162,7 +158,7 @@ class DatasetDistiller:
         # run full evaluation
         _, __, evaluation_metrics = train_expert_model(
             num_experts=self.args.num_experts,
-            num_steps_per_expert=self.args.num_steps_per_expert,
+            num_steps_per_expert=max(1, len(tokens) // self.args.minibatch_size),
             num_expert_datapoints=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
@@ -188,6 +184,9 @@ class DatasetDistiller:
         torch.distributed.broadcast(dataset_token_counts, src=0)
 
     def run_distillation(self):
+        # initialize parameters & optimizers
+        discrete_optimizer = self._init_discrete_optimizer()
+
         # load/generate expert trajectories
         expert_buffer, dataset_token_counts, _ = train_expert_model(
             num_experts=self.args.num_experts,
@@ -200,9 +199,6 @@ class DatasetDistiller:
             label_column_name=self.ds_label_column_name,
         )
         self.dataset_token_counts = dataset_token_counts.cpu()
-
-        # initialize parameters & optimizers
-        discrete_optimizer = self._init_discrete_optimizer()
 
         # handle distributed
         self._distributed_broadcast_everything(expert_buffer, dataset_token_counts)
