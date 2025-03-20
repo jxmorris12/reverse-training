@@ -199,6 +199,88 @@ def _get_cache_key(**kwargs) -> str:
     return '_'.join(f"{k}:{value_to_str(v)}" for k, v in sorted_items)
 
 
+def _eval_expert_model(
+    student_net: transformers.PreTrainedModel,
+    tokenizer: transformers.PreTrainedTokenizer,
+    eval_ds: datasets.Dataset,
+    text_column_name: str,
+    label_column_name: Optional[str],
+    num_expert_datapoints: int,
+    sequence_length: int,
+    num_evaluation_batches: int
+) -> tuple[float, Optional[float], Optional[float]]:
+    """Evaluate expert model on evaluation dataset.
+    
+    Args:
+        student_net: Model to evaluate
+        tokenizer: Tokenizer to use
+        eval_ds: Evaluation dataset
+        text_column_name: Name of text column in dataset
+        label_column_name: Name of label column in dataset (if doing classification)
+        num_expert_datapoints: Number of datapoints to evaluate on per batch
+        sequence_length: Maximum sequence length for tokenization
+        num_evaluation_batches: Number of evaluation batches to run
+        
+    Returns:
+        Tuple of (eval_loss, eval_accuracy)
+    """
+    eval_metrics = []
+    eval_accuracies = []
+    
+    for _ in range(num_evaluation_batches):
+        batch_idxs = random.sample(range(len(eval_ds)), k=num_expert_datapoints)
+        examples = eval_ds.select(batch_idxs)
+        
+        if label_column_name is not None:
+            # Classification mode
+            examples = [
+                f"{text} {label}" 
+                for text, label in zip(examples[text_column_name], examples[label_column_name])
+            ]
+        else:
+            # Language modeling mode
+            examples = examples[text_column_name]
+        
+        tokens = tokenizer(
+            examples,
+            return_tensors="pt", 
+            padding="max_length", 
+            truncation=True, 
+            max_length=sequence_length, 
+        ).to(device)
+        
+        if label_column_name is not None:
+            # For classification, only predict the last token
+            labels = tokens.input_ids[:, 1:].detach().clone() 
+            labels[:, :-1] = -100
+        else:
+            # For language modeling, predict all next tokens
+            labels = tokens.input_ids[:, 1:].detach().clone()
+        
+        outputs = student_net(
+            input_ids=tokens.input_ids,
+            attention_mask=tokens.attention_mask,
+        )
+        logits = outputs.logits[:, :-1]
+        
+        eval_loss = torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), 
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="mean"
+        )
+        eval_metrics.append(eval_loss.item())
+
+        token_mask = (labels != -100)
+        eval_accuracy = (logits.argmax(dim=-1)[token_mask] == labels[token_mask]).float().mean()
+        eval_accuracies.append(eval_accuracy.item())
+
+    eval_loss = sum(eval_metrics) / len(eval_metrics)
+    eval_accuracy = sum(eval_accuracies) / len(eval_accuracies) if eval_accuracies else None
+    
+    return eval_loss, eval_accuracy
+
+
 def _train_expert_model_uncached(
         num_experts: int, 
         num_steps_per_expert: int, 
@@ -251,6 +333,7 @@ def _train_expert_model_uncached(
                 labels = ds_labels[batch_idxs] if ds_labels is not None else tokens[:, 1:]
                 no_labels = torch.zeros_like(tokens[:, :-2], device=device, dtype=torch.long) - 100
                 labels = torch.cat([no_labels, labels[:, None].to(device)], dim=1)
+                all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
             else:
                 # Handle raw text data case
                 batch_idxs = random.sample(range(len(train_ds)), k=num_expert_datapoints)
@@ -304,62 +387,38 @@ def _train_expert_model_uncached(
             
             if (step + 1) in evaluation_steps:
                 # evaluation loop
-                for _ in range(num_evaluation_batches):
-                    batch_idxs = random.sample(range(len(eval_ds)), k=num_expert_datapoints)
-                    examples = eval_ds.select(batch_idxs)
-                    
-                    if label_column_name is not None:
-                        # Classification mode
-                        examples = [
-                            f"{text} {label}" 
-                            for text, label in zip(examples[text_column_name], examples[label_column_name])
-                        ]
-                    else:
-                        # Language modeling mode
-                        examples = examples[text_column_name]
-                    
-                    tokens = tokenizer(
-                        examples,
-                        return_tensors="pt", 
-                        padding="max_length", 
-                        truncation=True, 
-                        max_length=sequence_length, 
-                    ).to(device)
-                    
-                    if label_column_name is not None:
-                        # For classification, only predict the last token
-                        labels = tokens.input_ids[:, 1:].detach().clone() 
-                        labels[:, :-1] = -100
-                    else:
-                        # For language modeling, predict all next tokens
-                        labels = tokens.input_ids[:, 1:].detach().clone()
-                    
-                    outputs = student_net(
-                        input_ids=tokens.input_ids,
-                        attention_mask=tokens.attention_mask,
-                    )
-                    logits = outputs.logits[:, :-1]
-                    
-                    eval_loss = torch.nn.functional.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)), 
-                        labels.reshape(-1),
-                        ignore_index=-100,
-                        reduction="mean"
-                    )
-                    evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss.item())
-
-                    if label_column_name is not None:
-                        # Only compute accuracy for classification
-                        token_mask = (labels != -100)
-                        eval_accuracy = (logits.argmax(dim=-1)[token_mask] == labels[token_mask]).float().mean()
-                        evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy.item())
-                    else:
-                        # For language modeling, compute perplexity
-                        eval_perplexity = torch.exp(eval_loss)
-                        evaluation_metrics[f"eval_step{step}_perplexity"].append(eval_perplexity.item())
+                eval_loss, eval_accuracy = _eval_expert_model(
+                    student_net=student_net,
+                    tokenizer=tokenizer,
+                    eval_ds=eval_ds,
+                    text_column_name=text_column_name,
+                    label_column_name=label_column_name,
+                    num_expert_datapoints=num_expert_datapoints,
+                    sequence_length=sequence_length,
+                    num_evaluation_batches=num_evaluation_batches
+                )
+                
+                evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
+                evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
         
         expert_state_dicts.append(_get_state_dict(student_net))
-    
+
+    # Run one more evaluation
+    eval_loss, eval_accuracy = _eval_expert_model(
+        student_net=student_net,
+        tokenizer=tokenizer,
+        eval_ds=eval_ds,
+        text_column_name=text_column_name,
+        label_column_name=label_column_name,
+        num_expert_datapoints=num_expert_datapoints,
+        sequence_length=sequence_length,
+        num_evaluation_batches=num_evaluation_batches
+    )
+    evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
+    evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
+
+    # filter None values
+    for k in evaluation_metrics.keys(): evaluation_metrics[k] = [v for v in evaluation_metrics[k] if v is not None]
     evaluation_metrics = { k: torch.tensor(v).mean().item() for k, v in evaluation_metrics.items() }
     pbar.close()
     best_eval_loss = min({ v for k,v in evaluation_metrics.items() if "loss" in k } | { float("inf") })
@@ -367,9 +426,6 @@ def _train_expert_model_uncached(
     if label_column_name is not None:
         best_eval_accuracy = max({ v for k,v in evaluation_metrics.items() if "accuracy" in k } | { float("0") })
         print0(f"Best eval loss: {best_eval_loss:.3f} | Best eval accuracy: {best_eval_accuracy:.3f}")
-    else:
-        best_eval_perplexity = min({ v for k,v in evaluation_metrics.items() if "perplexity" in k } | { float("inf") })
-        print0(f"Best eval loss: {best_eval_loss:.3f} | Best eval perplexity: {best_eval_perplexity:.3f}")
 
     if all_token_counts.sum() == 0:
         print0("WARNING: no tokens were counted")

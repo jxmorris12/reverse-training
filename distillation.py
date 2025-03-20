@@ -158,7 +158,7 @@ class DatasetDistiller:
         # run full evaluation
         _, __, evaluation_metrics = train_expert_model(
             num_experts=self.args.num_experts,
-            num_steps_per_expert=max(1, len(tokens) // self.args.minibatch_size),
+            num_steps_per_expert=max(1, len(tokens) // self.args.select_minibatch_size),
             num_expert_datapoints=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
@@ -210,7 +210,7 @@ class DatasetDistiller:
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=it)
 
-            if it % 200 == 0:
+            if it % self.args.eval_every == 0:
                 self._evaluate_and_log(Z, discrete_optimizer.Y, step=it)
 
             # clear cache

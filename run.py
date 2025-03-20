@@ -47,7 +47,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset", type=str, default="ag_news", help="dataset to distill (optional)")
     parser.add_argument("--dataset_size", "--ds", type=int, default=100, help="size of distilled dataset")
     parser.add_argument("--minibatch_size", "--batch_size_synthetic", type=int, default=None, help='minibatch size for synthetic data (optional)')
-    
+    parser.add_argument("--eval_every", type=int, default=200, help="how many steps between evaluations")
 
     parser.add_argument('--max_iterations', type=int, default=5000, help='how many distillation steps to perform')
     parser.add_argument('--max_iterations_x', type=int, default=40, help='how many gradient steps per X update')
