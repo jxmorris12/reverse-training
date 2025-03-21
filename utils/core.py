@@ -1,5 +1,8 @@
 from typing import Iterable, Optional
 import collections
+import hashlib
+import json
+import numpy as np
 import random
 import time
 import os
@@ -14,6 +17,20 @@ import tqdm
 from utils.batch import find_executable_batch_size
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def hash_model_params(model):
+    """Generate a hash of model parameters."""
+    # TODO: This is a hack to get around the fact that the model state dict is not serializable.
+    # TODO: We should use a more robust method to hash the model parameters.
+    # Extract state dict
+    state_dict = model.state_dict()
+
+    # Convert to JSON string
+    json_str = json.dumps([n for n, _ in sorted(state_dict.items())], sort_keys=True)
+    
+    # Generate hash
+    return hashlib.sha256(json_str.encode()).hexdigest()
 
 
 def get_time():
@@ -73,8 +90,6 @@ def get_token_embeddings_from_dataset(dataset_size: int, sequence_length: int, d
     token_labels_syn = torch.randint(low=0, high=num_classes, size=[dataset_size], device=device)
     token_labels_syn = CLASS_MAP[token_labels_syn]
 
-    breakpoint() # TODO: Autogen CLASS_MAP!
-
     return (token_embeddings_syn, token_labels_syn)
 
 
@@ -111,7 +126,7 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
 
 
 @find_executable_batch_size
-def autolabel_dataset(
+def _autolabel_dataset_uncached(
         dataset: datasets.Dataset,
         model: transformers.PreTrainedModel,
         tokenizer: transformers.PreTrainedTokenizer,
@@ -153,9 +168,37 @@ def autolabel_dataset(
             outputs = model(**inputs)
             logits = outputs.logits[:, sequence_length-1, :] # Get logits for sequence_length-th token
             predictions = torch.argmax(logits, dim=-1)
-            all_labels.append(predictions)
+            all_labels.append(predictions.cpu())
     
     return torch.cat(all_labels)
+
+
+def autolabel_dataset(
+        dataset: datasets.Dataset,
+        model: transformers.PreTrainedModel,
+        tokenizer: transformers.PreTrainedTokenizer,
+        sequence_length: int,
+    ) -> torch.Tensor:
+    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    hash_kwargs = {
+        "dataset_hash": dataset._fingerprint,
+        "model_hash": hash_model_params(model),
+        "tokenizer_hash": tokenizer.name_or_path,
+        "sequence_length": sequence_length,
+    }
+    cache_key = _get_cache_key(**hash_kwargs)
+    print(f"Autolabeling dataset with cache key: {cache_key}")
+    cache_path = os.path.join(cache_dir, f"autolabel_dataset_{cache_key}.npz")
+
+    if not os.path.exists(cache_path):
+        labels = _autolabel_dataset_uncached(dataset, model, tokenizer, sequence_length)
+        np.savez(cache_path, labels=labels.numpy())
+    
+    labels = np.load(cache_path)["labels"]
+    return torch.from_numpy(labels)
+
 
 
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -394,21 +437,20 @@ def _train_expert_model_uncached(
             student_net.zero_grad()
             step += 1
             
-            if (step + 1) in evaluation_steps:
-                # evaluation loop
-                eval_loss, eval_accuracy = _eval_expert_model(
-                    student_net=student_net,
-                    tokenizer=tokenizer,
-                    eval_ds=eval_ds,
-                    text_column_name=text_column_name,
-                    label_column_name=label_column_name,
-                    num_expert_datapoints=num_expert_datapoints,
-                    sequence_length=sequence_length,
-                    num_evaluation_batches=num_evaluation_batches
-                )
-                
-                evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
-                evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
+        # evaluation loop every epoch
+        eval_loss, eval_accuracy = _eval_expert_model(
+            student_net=student_net,
+            tokenizer=tokenizer,
+            eval_ds=eval_ds,
+            text_column_name=text_column_name,
+            label_column_name=label_column_name,
+            num_expert_datapoints=num_expert_datapoints,
+            sequence_length=sequence_length,
+            num_evaluation_batches=num_evaluation_batches
+        )
+        
+        evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
+        evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
         
         expert_state_dicts.append(_get_state_dict(student_net))
 

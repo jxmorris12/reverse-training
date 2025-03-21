@@ -34,7 +34,7 @@ class GCGAOptimizer(GCGOptimizer):
         torch.distributed.broadcast(self.X_tokens, src=0)
         torch.distributed.broadcast(self.Y, src=0)
 
-    def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def step_x(self, step: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if it % self.it_per_x == 0:
             self.x_counter += 1
             new_X_tokens = gather(self.X_tokens_full[self.x_counter * get_world_size() + get_rank()].unsqueeze(0))

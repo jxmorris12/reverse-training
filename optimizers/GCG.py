@@ -22,7 +22,7 @@ class GCGOptimizer(DiscreteOptimizer):
         syn_lr = torch.tensor(self.args.lr_teacher).to(device)
         self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
-    def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def step_x(self, step: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         start_epoch = np.random.randint(0, len(buffer) - self.args.expert_epochs)
         starting_params = buffer[start_epoch]
         target_params = buffer[start_epoch + self.args.expert_epochs]
@@ -94,8 +94,8 @@ class GCGOptimizer(DiscreteOptimizer):
         }
         return metrics
 
-    def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        metrics = self.step_x(it, buffer)
+    def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        metrics = self.step_x(step, buffer)
 
         # if it % 100 == 0:
         #     self._log_table(self.X_tokens, self.Y, step=it)

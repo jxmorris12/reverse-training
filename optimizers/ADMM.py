@@ -40,7 +40,7 @@ class ADMMOptimizer(DiscreteOptimizer):
     def ρ(self):
         return self.args.admm_penalty_term
 
-    def step_x(self, it: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def step_x(self, step: int, buffer: list) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         X = self.X
         Y = self.Y
         Z = self.Z
@@ -88,7 +88,7 @@ class ADMMOptimizer(DiscreteOptimizer):
         return X, Y, metrics
     
     @torch.no_grad
-    def step_z(self, it: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    def step_z(self, step: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if not (it % self.args.max_iterations_x == 0):
             return self.Z, self.Λ, {}
         
@@ -104,16 +104,16 @@ class ADMMOptimizer(DiscreteOptimizer):
         # 
         # Log Z
         # 
-        self._log_table(Z_tokens, Y, step=it)
+        self._log_table(Z_tokens, Y, step=step)
         # 
         #  (3) Update Λ for ADMM
         # 
         Λ = Λ + self.ρ * (X - Z)
         return Z, Λ, {}
 
-    def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        self.X, self.Y, x_metrics = self.step_x(it, buffer)
-        self.Z, self.Λ, z_metrics = self.step_z(it)
+    def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        self.X, self.Y, x_metrics = self.step_x(step, buffer)
+        self.Z, self.Λ, z_metrics = self.step_z(step)
 
         self.optimizer_token_embeddings.step()
         self.optimizer_lr.step()

@@ -12,11 +12,13 @@ from utils import (
     get_model,
     load_dataset_from_name,
 )
-
 from utils.projection import (
     CudaProjector,
     ProjectionType,
     get_grads_final_layer
+)
+from utils.vector_search import (
+    BatchedExactVectorDatabase,
 )
 
 class SELECTOptimizer(DiscreteOptimizer):
@@ -107,10 +109,15 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.tokenizer, 
                 self.projector,
                 sequence_length=self.args.sequence_length, 
+                use_cache=True,
+                model_cache_key=self.base_model.config._name_or_path + f"_{i}_{self.args.select_num_pseudoexperts}",
             )
             grads.append(batch_grads)
         
         grads = torch.stack(grads, dim=0).double().sum(dim=0).float()
+        grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
+        grads_norm = grads_norm.to(device)
+        grads_db = BatchedExactVectorDatabase(grads_norm)
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
@@ -119,10 +126,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Greedily fill batch
         batch = []
-        grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
-        grads_norm = grads_norm.to(device)
         best_sim = float("-inf")
-        current_grad = torch.zeros_like(last_layer_base_params)
+        current_grad = torch.zeros_like(last_layer_base_params, device=device)
         student_lr = self.args.select_lr_student
         
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
@@ -136,26 +141,15 @@ class SELECTOptimizer(DiscreteOptimizer):
             # Use cosine similarity to find best gradient
             base_params_diff_norm = base_params_diff_projected / (base_params_diff_projected.norm(dim=1, p=2, keepdim=True) + 1e-10)
             base_params_diff_norm = base_params_diff_norm.to(device)
-            sims = grads_norm @ base_params_diff_norm.T
             
-            # Exclude already selected examples
-            batch_idxs = torch.tensor(batch, device=device, dtype=torch.long)
-            sims[batch_idxs] = torch.ones_like(sims[batch_idxs]) * float("-inf")
-
-            # Check for NaNs
-            if torch.isnan(sims).any():
-                print("NaNs in sims")
-                break
-
             # Get the best remaining gradient
-            best_idx = torch.argmax(sims)
+            best_sim, best_idx = grads_db.search(base_params_diff_norm, 1)
+            best_idx = best_idx.item()
+            best_sim = best_sim.item()
 
             # Add the selected gradient to our batch
-            batch.append(best_idx.item())
-            grads[best_idx] = torch.zeros_like(grads[best_idx])  # Zero out the selected gradient
-
-            # Update best similarity for logging purposes
-            best_sim = sims[best_idx].item()
+            batch.append(best_idx)
+            grads_db.remove_vectors(best_idx)
 
             # Compute full-resolution gradient
             batch_grad = get_grads_final_layer(
@@ -165,18 +159,19 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.tokenizer, 
                 self.projector, 
                 sequence_length=self.args.sequence_length, 
-                do_projection=False
-            )
+                do_projection=False,
+                use_cache=False,
+            ).to(device)
             current_grad += batch_grad.flatten()
             batch_pbar.update(1)
-            batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx.item()} | Batch size: {len(batch)}")
+            batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)}")
         
 
         print(f"Picked new batch of size {len(batch)}: {sorted(batch)}")
         
         return batch
 
-    def step_with_grad(self, it: int, buffer: list) -> dict[str, torch.Tensor]:
+    def step_with_grad(self, step: int, buffer: list) -> dict[str, torch.Tensor]:
         """Perform one step of SELECT optimization"""
         # Get current model parameters
         full_base_params = torch.cat([p.flatten().cpu().detach().requires_grad_(False) for p in self.base_model.parameters()]).double().to(device)
@@ -218,7 +213,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                 - 
                 100
             )
-            last_token_labels = self.dataset_labels[minibatch][:, None]
+            last_token_labels = self.dataset_labels[minibatch][:, None].to(device)
             inputs["labels"] = torch.cat([no_labels, last_token_labels], dim=1)
         else:
             inputs["labels"] = inputs["input_ids"].detach().clone()
@@ -252,9 +247,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         torch.cuda.empty_cache()
         
         self.best_idx_counter.update(minibatch)
-
         top_10_selected = self.best_idx_counter.most_common(10)
-        print(f"Top-10 most-selected indices: {top_10_selected}")
 
         if current_mse < self.best_mse:
             self.steps_since_last_improvement = 0
@@ -262,13 +255,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         else:
             self.steps_since_last_improvement += 1
 
-        # if self.steps_since_last_improvement > (2 * self.args.select_steps_per_grad):
-        #     print(f"Stopping distillation early since no improvement for {2 * self.args.select_steps_per_grad} steps")
-        #     self.should_stop = True
-
         return metrics
 
-    def step(self, it: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.args.select_do_classification and self.dataset_labels is None:
             # Get labels from expert model
             expert_state_dict = buffer[-1]
@@ -283,7 +272,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             )
             expert_state_dict.pop("lm_head.weight")
             
-        metrics = self.step_with_grad(it, buffer)
+        metrics = self.step_with_grad(step, buffer)
         X_tokens = torch.stack([
             self._tokenize_dataset_cached(i)
             for i in self.batch

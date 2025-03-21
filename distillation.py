@@ -1,4 +1,6 @@
 import gc
+import os
+import pickle
 
 import datasets
 import torch
@@ -135,7 +137,7 @@ class DatasetDistiller:
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)
 
-    def _evaluate_and_log(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
+    def _evaluate_and_log(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> dict[str, float]:
         self._log_table(tokens, labels, step=step)
         tokens = tokens.cpu()
         labels = labels.cpu() if labels is not None else None
@@ -171,7 +173,9 @@ class DatasetDistiller:
         )
 
         # log
-        wandb.log({ **dataset_metrics, **evaluation_metrics }, step=step)
+        metrics = { **dataset_metrics, **evaluation_metrics }
+        wandb.log(metrics, step=step)
+        return evaluation_metrics
     
     def _distributed_broadcast_everything(self, expert_buffer: list[dict[str, torch.Tensor]], dataset_token_counts: torch.Tensor) -> None:
         if get_world_size() <= 1:
@@ -188,7 +192,7 @@ class DatasetDistiller:
         discrete_optimizer = self._init_discrete_optimizer()
 
         # load/generate expert trajectories
-        expert_buffer, dataset_token_counts, _ = train_expert_model(
+        expert_buffer, dataset_token_counts, final_evaluation_metrics = train_expert_model(
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
             num_expert_datapoints=self.args.minibatch_size,
@@ -205,13 +209,16 @@ class DatasetDistiller:
 
         # run optimization
         pbar = trange_if_main_worker(0, self.args.max_iterations+1, desc="iterations")
-        for it in pbar:
-            Z, metrics = discrete_optimizer.step(it, expert_buffer)
+        all_evaluation_metrics = []
+        for step in pbar:
+            Z, metrics = discrete_optimizer.step(step, expert_buffer)
             pbar.set_postfix(**metrics)
-            wandb.log(metrics, step=it)
+            wandb.log(metrics, step=step)
 
-            if it % self.args.eval_every == 0:
-                self._evaluate_and_log(Z, discrete_optimizer.Y, step=it)
+            if step % self.args.eval_every == 0:
+                evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
+                evaluation_metrics["step"] = step
+                all_evaluation_metrics.append(evaluation_metrics)
 
             # clear cache
             gc.collect()
@@ -221,5 +228,18 @@ class DatasetDistiller:
                 break
 
         print("Stopping distillation...")
-        self._evaluate_and_log(Z, discrete_optimizer.Y, step=it)
+        self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
         wandb.finish()
+
+        data = {
+            "args": dict(vars(self.args)),
+            "expert_evaluation_metrics": all_evaluation_metrics,
+            "final_Z": Z,
+            "final_Y": discrete_optimizer.Y,
+        }
+        output_dir = os.path.join(os.path.dirname(__file__), "saves")
+        os.makedirs(output_dir, exist_ok=True)
+        pkl_path = os.path.join(output_dir, f"{self.args.exp_name}.pkl")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(data, f)
+        return data

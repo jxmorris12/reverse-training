@@ -1,8 +1,11 @@
+import hashlib
 import torch
-from enum import Enum
 import tqdm
+import os
+import numpy as np
+from enum import Enum
 
-from utils.core import device
+from utils.core import device, hash_model_params, _get_cache_key
 from utils.batch import find_executable_batch_size
 
 def vectorize(grads: dict, device=None) -> torch.Tensor:
@@ -12,6 +15,7 @@ def vectorize(grads: dict, device=None) -> torch.Tensor:
 class ProjectionType(str, Enum):
     rademacher = "rademacher"
     normal = "normal"
+
 
 class CudaProjector:
     """A performant implementation of the projection for CUDA."""
@@ -107,8 +111,28 @@ class CudaProjector:
         """A no-op method."""
         pass
 
+    def deterministic_hash(self) -> int:
+        """
+        Return a hash based on the essential properties of this CudaProjector.
+        
+        Returns:
+            int: A hash value uniquely identifying this projector configuration.
+        """
+        # Use a tuple of the key properties that uniquely define a projector
+        key_tuple = (
+            self.grad_dim,
+            self.proj_dim,
+            self.seed,
+            self.proj_type,
+        )
+        
+        # Return the hash of this tuple
+        return int(hashlib.md5(str(key_tuple).encode()).hexdigest(), 16)
+        
+
+
 @find_executable_batch_size
-def get_grads_final_layer(
+def _get_grads_final_layer_uncached(
         student_net, 
         dataset, 
         labels,
@@ -181,8 +205,8 @@ def get_grads_final_layer(
                 logits.reshape(-1, logits.size(-1)), 
                 labels = labels[1:]
             loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), 
-                labels.reshape(-1),
+                logits.reshape(-1, logits.size(-1)).to(device), 
+                labels.reshape(-1).to(device),
                 ignore_index=-100,
                 reduction="mean"
             )
@@ -198,8 +222,74 @@ def get_grads_final_layer(
 
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
-            all_grads.extend(projected_grads)
+            all_grads.extend(projected_grads.cpu())
         else:
-            all_grads.extend(grads_batch)
+            all_grads.extend(grads_batch.cpu())
         
     return torch.stack(all_grads) 
+
+
+def get_grads_final_layer(
+        student_net, 
+        dataset, 
+        labels,
+        tokenizer, 
+        projector, 
+        sequence_length: int, 
+        do_projection: bool = True,
+        use_cache: bool = True,
+        model_cache_key: str = "",
+    ) -> torch.Tensor:
+    """Get model predictions for the sequence_length-th token for each example in the dataset.
+    
+    Args:
+        dataset: Dataset to label
+        model: Model to use for labeling
+        tokenizer: Tokenizer for processing text
+        sequence_length: Maximum sequence length for tokenization
+        batch_size: Batch size for processing
+        
+    Returns:
+        Tensor of shape (len(dataset),) containing the predicted token ids
+    """
+    if not use_cache:
+        return _get_grads_final_layer_uncached(
+            student_net, 
+            dataset, 
+            labels, 
+            tokenizer, 
+            projector, 
+            sequence_length, 
+            do_projection
+        )
+    hash_kwargs = {
+        "student_net_hash": hash_model_params(student_net),
+        "dataset_hash": dataset._fingerprint,
+        # TODO: hash labels...
+        "tokenizer_hash": tokenizer.name_or_path,
+        "projector_hash": projector.deterministic_hash(),
+        "sequence_length": sequence_length,
+        "do_projection": do_projection,
+        "model_cache_key": model_cache_key,
+    }
+    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    full_cache_key = _get_cache_key(**hash_kwargs)
+    cache_key = hashlib.sha256(full_cache_key.encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, f"get_grads_final_layer_{cache_key}.npz")
+
+    if not os.path.exists(cache_path):
+        print(f"Getting grads for final layer with cache key: {full_cache_key} => {cache_key}")
+        grads = _get_grads_final_layer_uncached(
+            student_net, 
+            dataset,
+            labels, 
+            tokenizer, 
+            projector, 
+            sequence_length, 
+            do_projection
+        )
+        np.savez(cache_path, grads=grads.numpy())
+
+    grads = np.load(cache_path)["grads"]
+    return torch.from_numpy(grads)
