@@ -3,7 +3,7 @@ from .optimizer import DiscreteOptimizer
 import numpy as np
 import torch
 
-from utils import device, project_x_to_embedding_space, state_dict_to_tensor, trange_if_main_worker
+from utils.core import device, project_x_to_embedding_space, state_dict_to_tensor, trange_if_main_worker
 
 class GCGOptimizer(DiscreteOptimizer):
     X: torch.Tensor

@@ -333,7 +333,7 @@ def _train_expert_model_uncached(
                 labels = ds_labels[batch_idxs] if ds_labels is not None else tokens[:, 1:]
                 no_labels = torch.zeros_like(tokens[:, :-2], device=device, dtype=torch.long) - 100
                 labels = torch.cat([no_labels, labels[:, None].to(device)], dim=1)
-                all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
+                all_token_counts += torch.bincount(tokens.flatten(), minlength=tokenizer.vocab_size)
             else:
                 # Handle raw text data case
                 batch_idxs = random.sample(range(len(train_ds)), k=num_expert_datapoints)
@@ -361,7 +361,7 @@ def _train_expert_model_uncached(
                 if label_column_name is not None:
                     # For classification, only predict the last token
                     labels[:, :-1] = -100
-                
+
                 outputs = student_net(
                     input_ids=tokens.input_ids,
                     attention_mask=tokens.attention_mask,
@@ -422,14 +422,15 @@ def _train_expert_model_uncached(
     evaluation_metrics = { k: torch.tensor(v).mean().item() for k, v in evaluation_metrics.items() }
     pbar.close()
     best_eval_loss = min({ v for k,v in evaluation_metrics.items() if "loss" in k } | { float("inf") })
-    
+    final_evaluation_metrics = { "best_eval_loss": best_eval_loss  }
     if label_column_name is not None:
         best_eval_accuracy = max({ v for k,v in evaluation_metrics.items() if "accuracy" in k } | { float("0") })
         print0(f"Best eval loss: {best_eval_loss:.3f} | Best eval accuracy: {best_eval_accuracy:.3f}")
+        final_evaluation_metrics["best_eval_accuracy"] = best_eval_accuracy
 
     if all_token_counts.sum() == 0:
         print0("WARNING: no tokens were counted")
-    return expert_state_dicts, all_token_counts, evaluation_metrics
+    return expert_state_dicts, all_token_counts, final_evaluation_metrics
 
 
 def train_expert_model(
@@ -478,7 +479,12 @@ def train_expert_model(
             return pickle.load(f)
     
     # If not cached, run training and cache results
-    print0(f"Training expert model and caching results to {cache_path}")
+    num_datapoints = len(ds_tokens) if ds_tokens is not None else len(ds["train"])
+    if not uncachable_args_provided:
+        print0(f"Training expert model with {num_datapoints} datapoints and caching results to {cache_path}")
+    else:
+        print0(f"Training expert model with {num_datapoints} datapoints")
+    
     results = _train_expert_model_uncached(
         num_experts=num_experts,
         num_steps_per_expert=num_steps_per_expert,

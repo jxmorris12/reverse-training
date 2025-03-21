@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from utils import trange_if_main_worker
+from utils.core import trange_if_main_worker
 
 
 class DiscreteOptimizer(ABC):

@@ -5,7 +5,7 @@ import random
 import numpy as np
 import torch
 
-from utils import gather, get_rank, get_world_size, device, state_dict_to_tensor, trange_if_main_worker
+from utils.core import gather, get_rank, get_world_size, device, state_dict_to_tensor, trange_if_main_worker
 
 class GCGAOptimizer(GCGOptimizer):
     X: torch.Tensor

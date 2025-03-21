@@ -13,7 +13,7 @@ from utils import (
     load_dataset_from_name,
 )
 
-from projection_utils import (
+from utils.projection import (
     CudaProjector,
     ProjectionType,
     get_grads_final_layer
@@ -80,8 +80,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             last_layer_base_params, last_layer_expert_model_params
         ) -> list:
         """Rank dataset examples by influence on optimization direction"""
-        assert self.args.select_max_batch_size <= len(self.dataset), \
-            f"select_max_batch_size: {self.args.select_max_batch_size} must be less than dataset size: {len(self.dataset)}"
+        assert self.args.select_full_dataset_size <= len(self.dataset), \
+            f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.dataset)}"
 
         # Get all gradients
         # TODO: Control randomness to get same results each time
@@ -126,8 +126,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         current_grad = torch.zeros_like(last_layer_base_params)
         student_lr = self.args.select_lr_student
         
-        batch_pbar = tqdm.trange(0, self.args.select_max_batch_size, disable=(self.args.select_max_batch_size < 32))
-        while len(batch) < self.args.select_max_batch_size:
+        batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
+        while len(batch) < self.args.select_full_dataset_size:
             # Project parameter difference
             base_params_diff_projected = self.projector.project(
                 (last_layer_base_params - current_grad * student_lr) - last_layer_expert_model_params, 
@@ -140,8 +140,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             sims = grads_norm @ base_params_diff_norm.T
             
             # Exclude already selected examples
-            for idx in batch:
-                sims[idx] = float("-inf")
+            batch_idxs = torch.tensor(batch, device=device, dtype=torch.long)
+            sims[batch_idxs] = torch.ones_like(sims[batch_idxs]) * float("-inf")
 
             # Check for NaNs
             if torch.isnan(sims).any():
@@ -190,7 +190,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         last_layer_expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items() if "wte" in k]).double().to(device)
         
         # Update batch if needed
-        if it % self.args.select_steps_per_grad == 0:
+        should_update_batch = (self.args.select_steps_per_grad > 0) and (it % self.args.select_steps_per_grad == 0)
+        if (not len(self.batch)) or should_update_batch:
             self.batch = self._rank_dataset_by_influence(
                 full_base_params, full_expert_model_params,
                 last_layer_base_params, last_layer_expert_model_params
@@ -202,6 +203,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Select random minibatch from batch
         minibatch = random.sample(self.batch, min(self.args.select_minibatch_size, len(self.batch)))
+        assert len(minibatch) > 0, f"Minibatch is empty"
 
         # Take step on batch
         inputs = self.tokenizer(
@@ -226,6 +228,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         loss = outputs.loss
         loss.backward()
 
+        base_model_grad_norm = torch.cat([p.grad.flatten().detach().norm(dim=0, p=2, keepdim=True) for p in self.base_model.parameters()], dim=0).norm(dim=0, p=2, keepdim=True)
+        base_model_grad_norm = base_model_grad_norm.detach().cpu().item()
+
         # Calculate gradient direction and step size
         with torch.no_grad():
             grad = torch.cat([p.grad.flatten().detach() for p in self.base_model.parameters()], dim=0)
@@ -243,6 +248,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             "ce_loss": loss.detach().item(),
             "grad_step_size": grad_step_size.item() if not torch.isnan(grad_step_size) else 0.0,
             "synth_lr": self.syn_lr.detach().item(),
+            "base_model_grad_norm": base_model_grad_norm,
         }
         
         torch.cuda.empty_cache()
@@ -276,7 +282,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             expert_state_dict.pop("lm_head.weight")
             
         metrics = self.step_with_grad(it, buffer)
-        best_idxs = self.best_idx_counter.most_common(self.args.dataset_size)
+        best_idxs = self.best_idx_counter.most_common(self.args.select_minibatch_size)
         best_idxs = [i for i, _ in best_idxs]
         X_tokens = torch.stack([
             self._tokenize_dataset_cached(i)
