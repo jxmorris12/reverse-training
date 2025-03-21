@@ -107,7 +107,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.tokenizer, 
                 self.projector,
                 sequence_length=self.args.sequence_length, 
-                batch_size=self.args.select_grad_batch_size
             )
             grads.append(batch_grads)
         
@@ -166,7 +165,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.tokenizer, 
                 self.projector, 
                 sequence_length=self.args.sequence_length, 
-                batch_size=1, 
                 do_projection=False
             )
             current_grad += batch_grad.flatten()
@@ -278,11 +276,15 @@ class SELECTOptimizer(DiscreteOptimizer):
             expert_model = copy.deepcopy(self.base_model)
             expert_model.load_state_dict(expert_state_dict)
             self.dataset_labels = autolabel_dataset(
-                self.dataset, expert_model, self.tokenizer, self.args.sequence_length)
+                dataset=self.dataset, 
+                model=expert_model, 
+                tokenizer=self.tokenizer, 
+                sequence_length=self.args.sequence_length,
+            )
             expert_state_dict.pop("lm_head.weight")
             
         metrics = self.step_with_grad(it, buffer)
-        best_idxs = self.best_idx_counter.most_common(self.args.select_minibatch_size)
+        best_idxs = self.best_idx_counter.most_common(len(self.batch))
         best_idxs = [i for i, _ in best_idxs]
         X_tokens = torch.stack([
             self._tokenize_dataset_cached(i)

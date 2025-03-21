@@ -3,6 +3,7 @@ from enum import Enum
 import tqdm
 
 from utils.core import device
+from utils.batch import find_executable_batch_size
 
 def vectorize(grads: dict, device=None) -> torch.Tensor:
     """Convert a dictionary of gradients to a flat tensor."""
@@ -106,7 +107,7 @@ class CudaProjector:
         """A no-op method."""
         pass
 
-
+@find_executable_batch_size
 def get_grads_final_layer(
         student_net, 
         dataset, 
@@ -114,8 +115,8 @@ def get_grads_final_layer(
         tokenizer, 
         projector, 
         sequence_length: int, 
-        batch_size: int, 
-        do_projection: bool = True
+        do_projection: bool = True,
+        batch_size: int = 32,
     ) -> torch.Tensor:
     """
     Computes gradients for each example in the dataset with respect to the model parameters.
@@ -134,7 +135,7 @@ def get_grads_final_layer(
     """
     do_classification = (labels is not None)
     all_grads = []
-    pbar = tqdm.trange(0, len(dataset), batch_size, disable=(batch_size < 32))
+    pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) < 32))
 
     # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
     params = {k: v.detach() for k, v in student_net.lm_head.named_parameters()}

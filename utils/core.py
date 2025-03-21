@@ -11,6 +11,8 @@ import torch.nn.functional as F
 import transformers
 import tqdm
 
+from utils.batch import find_executable_batch_size
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -108,7 +110,14 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
     return limit_layers(model, 6)
 
 
-def autolabel_dataset(dataset: datasets.Dataset, model: transformers.PreTrainedModel, tokenizer: transformers.PreTrainedTokenizer, sequence_length: int, batch_size: int = 32) -> torch.Tensor:
+@find_executable_batch_size
+def autolabel_dataset(
+        dataset: datasets.Dataset,
+        model: transformers.PreTrainedModel,
+        tokenizer: transformers.PreTrainedTokenizer,
+        sequence_length: int,
+        batch_size: int = 32,
+    ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
     
     Args:
