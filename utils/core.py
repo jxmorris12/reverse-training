@@ -134,7 +134,7 @@ def autolabel_dataset(
     model.to(device)
     all_labels = []
     
-    for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset"):
+    for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset", colour="RED"):
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
         

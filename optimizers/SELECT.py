@@ -200,7 +200,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         current_mse = (base_params_diff).double().pow(2).sum().item()
         
         # Select random minibatch from batch
-        minibatch = random.sample(self.batch, min(self.args.select_minibatch_size, len(self.batch)))
+        minibatch = random.sample(self.batch, min(self.args.minibatch_size, len(self.batch)))
         assert len(minibatch) > 0, f"Minibatch is empty"
 
         # Take step on batch
@@ -284,13 +284,11 @@ class SELECTOptimizer(DiscreteOptimizer):
             expert_state_dict.pop("lm_head.weight")
             
         metrics = self.step_with_grad(it, buffer)
-        best_idxs = self.best_idx_counter.most_common(len(self.batch))
-        best_idxs = [i for i, _ in best_idxs]
         X_tokens = torch.stack([
             self._tokenize_dataset_cached(i)
-            for i in best_idxs
+            for i in self.batch
         ])
-        self.Y = self.dataset_labels[best_idxs]
+        self.Y = self.dataset_labels[self.batch]
         return X_tokens, metrics
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:

@@ -158,7 +158,7 @@ class DatasetDistiller:
         # run full evaluation
         _, __, evaluation_metrics = train_expert_model(
             num_experts=self.args.num_eval_epochs,
-            num_steps_per_expert=max(1, len(tokens) // self.args.select_minibatch_size),
+            num_steps_per_expert=max(1, len(tokens) // self.args.minibatch_size),
             num_expert_datapoints=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
