@@ -169,7 +169,6 @@ class DatasetDistiller:
             label_column_name=self.ds_label_column_name,
             ds_tokens=tokens,
             ds_labels=labels,
-            num_evaluation_batches=10, # TODO: Argparse!
         )
 
         # log

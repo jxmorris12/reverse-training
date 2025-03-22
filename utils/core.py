@@ -37,23 +37,6 @@ def get_time():
     return str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))
 
 
-def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> transformers.PreTrainedModel:
-    if hasattr(model, 'transformer'):
-        if hasattr(model.transformer, 'h'):
-            # gpt2
-            model.transformer.h = model.transformer.h[:n_layers]
-        else:
-            model.transformer.layer = model.transformer.layer[:n_layers]
-    elif hasattr(model, 'encoder'):
-        if hasattr(model.encoder, 'layers'):
-            model.encoder.layers = model.encoder.layers[:n_layers]
-        else:
-            model.encoder.layer = model.encoder.layer[:n_layers]
-    else:
-        raise RuntimeError(f"unknown how to limit layers of model {type(model)}")
-    return model
-
-
 def state_dict_to_tensor(ordered_dict: dict[str, torch.Tensor]) -> torch.Tensor:
     return torch.cat([p.data.to(device).reshape(-1) for n, p in ordered_dict.items()], 0)
 
@@ -122,7 +105,7 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
         model_path, 
         attn_implementation="eager"
     )
-    return limit_layers(model, 6)
+    return model
 
 
 @find_executable_batch_size
@@ -164,7 +147,7 @@ def _autolabel_dataset_uncached(
         inputs = { k: v.to(device) for k, v in inputs.items() }
         
         # Get model predictions
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(**inputs)
             logits = outputs.logits[:, sequence_length-1, :] # Get logits for sequence_length-th token
             predictions = torch.argmax(logits, dim=-1)
@@ -259,7 +242,6 @@ def _eval_expert_model(
     label_column_name: Optional[str],
     num_expert_datapoints: int,
     sequence_length: int,
-    num_evaluation_batches: int
 ) -> tuple[float, Optional[float], Optional[float]]:
     """Evaluate expert model on evaluation dataset.
     
@@ -278,9 +260,13 @@ def _eval_expert_model(
     """
     eval_metrics = []
     eval_accuracies = []
-    
-    for _ in range(num_evaluation_batches):
-        batch_idxs = random.sample(range(len(eval_ds)), k=num_expert_datapoints)
+
+    all_idxs = list(range(len(eval_ds)))
+    i = 0
+    while i < len(all_idxs):
+        batch_idxs = all_idxs[i:i+num_expert_datapoints]
+        i += num_expert_datapoints
+        
         examples = eval_ds.select(batch_idxs)
         
         if label_column_name is not None:
@@ -344,8 +330,7 @@ def _train_expert_model_uncached(
         label_column_name: Optional[str] = None,
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
-        num_evaluation_batches: int = 16,
-        early_stopping_patience: int = 3,
+        early_stopping_patience: int = 10,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
@@ -354,7 +339,7 @@ def _train_expert_model_uncached(
     tokenizer.padding_side = "left" 
 
     train_ds = ds["train"]
-    eval_ds = ds["test"]
+    eval_ds = ds["test"].select(range(1000))
 
     # optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
     optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
@@ -418,10 +403,11 @@ def _train_expert_model_uncached(
                     # For classification, only predict the last token
                     labels[:, :-1] = -100
 
-                outputs = student_net(
-                    input_ids=tokens.input_ids,
-                    attention_mask=tokens.attention_mask,
-                )
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = student_net(
+                        input_ids=tokens.input_ids,
+                        attention_mask=tokens.attention_mask,
+                    )
                 # Track token counts
                 all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
             
@@ -450,7 +436,6 @@ def _train_expert_model_uncached(
             label_column_name=label_column_name,
             num_expert_datapoints=num_expert_datapoints,
             sequence_length=sequence_length,
-            num_evaluation_batches=num_evaluation_batches
         )
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
@@ -483,7 +468,6 @@ def _train_expert_model_uncached(
         label_column_name=label_column_name,
         num_expert_datapoints=num_expert_datapoints,
         sequence_length=sequence_length,
-        num_evaluation_batches=num_evaluation_batches
     )
     evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
     evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
@@ -515,7 +499,6 @@ def train_expert_model(
         label_column_name: str,
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
-        num_evaluation_batches: int = 10,
         **kwargs
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     """Train expert models with caching based on input parameters."""
@@ -534,7 +517,6 @@ def train_expert_model(
         "ds_name": ds.config_name if hasattr(ds, "config_name") else "custom",
         "text_column_name": text_column_name,
         "label_column_name": label_column_name,
-        "num_evaluation_batches": num_evaluation_batches,
         "ds_fingerprint": "_".join(str(ds[k]._fingerprint) for k in sorted(ds.keys())),
         **kwargs  # Include any additional kwargs in cache key generation
     }
@@ -549,7 +531,7 @@ def train_expert_model(
         with open(cache_path, "rb") as f:
             expert_state_dicts, all_token_counts, final_evaluation_metrics = pickle.load(f)
         print0(f"Loaded cached expert model results from {cache_path} - "
-               f"best eval loss: {final_evaluation_metrics['best_eval_loss']:.3f} /" 
+               f"best eval loss: {final_evaluation_metrics['best_eval_loss']:.3f} / " 
                f"best eval accuracy: {final_evaluation_metrics['best_eval_accuracy']:.3f}")
         return expert_state_dicts, all_token_counts, final_evaluation_metrics
     
@@ -571,7 +553,6 @@ def train_expert_model(
         label_column_name=label_column_name,
         ds_tokens=ds_tokens,
         ds_labels=ds_labels,
-        num_evaluation_batches=num_evaluation_batches,
         **kwargs
     )
     

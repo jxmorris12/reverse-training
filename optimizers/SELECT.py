@@ -84,17 +84,20 @@ class SELECTOptimizer(DiscreteOptimizer):
         """Rank dataset examples by influence on optimization direction"""
         assert self.args.select_full_dataset_size <= len(self.dataset), \
             f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.dataset)}"
+    
+
+        # If we're using random batch fill strategy, we can already return the random batch
+        if self.args.select_batch_fill_strategy == "random":
+            return random.sample(range(len(self.dataset)), k=self.args.select_full_dataset_size)
 
         # Get all gradients
-        # TODO: Control randomness to get same results each time
-        self.base_model.to(device)
-
         base_model = copy.deepcopy(self.base_model)
         grads = []
         for i in range(self.args.select_num_pseudoexperts):
             step_frac = i / self.args.select_num_pseudoexperts
+            print(f"pseudoexpert {i}/{self.args.select_num_pseudoexperts} -> step_frac = {step_frac}")
             pseudoexpert_params = (
-                step_frac * full_base_params + (1 - step_frac) * full_expert_model_params
+                (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
             )
             # Set params
             counter = 0
@@ -116,8 +119,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         grads = torch.stack(grads, dim=0).double().sum(dim=0).float()
         grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
-        grads_norm = grads_norm.to(device)
-        grads_db = BatchedExactVectorDatabase(grads_norm)
+        grads_db = BatchedExactVectorDatabase(grads_norm.cpu())
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
@@ -137,6 +139,15 @@ class SELECTOptimizer(DiscreteOptimizer):
                 last_layer_base_params=last_layer_base_params,
                 last_layer_expert_model_params=last_layer_expert_model_params
             )
+        elif self.args.select_batch_fill_strategy == "bottomk":
+            batch = self._fill_batch_topk(
+                grads_db=grads_db,
+                last_layer_base_params=last_layer_base_params,
+                last_layer_expert_model_params=last_layer_expert_model_params,
+                reverse=True,
+            )
+        elif self.args.select_batch_fill_strategy == "random":
+            batch = random.choices(range(len(self.dataset)), k=self.args.select_full_dataset_size)
         else:
             raise ValueError(f"Invalid batch fill strategy: {self.args.select_batch_fill_strategy}")
         
@@ -148,7 +159,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             self, 
             grads_db: BatchedExactVectorDatabase,
             last_layer_base_params: torch.Tensor,
-            last_layer_expert_model_params: torch.Tensor
+            last_layer_expert_model_params: torch.Tensor,
+            reverse: bool = False,
         ) -> list:
         """Fill a batch with the top k examples that have the most influence on optimization direction."""
         base_params_diff_projected = self.projector.project(
@@ -162,6 +174,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Get the best remaining gradient
         best_sims, best_idxs = grads_db.search(base_params_diff_norm, self.args.select_full_dataset_size)
+        if reverse:
+            best_sims = best_sims.flip(dims=[0])
+            best_idxs = best_idxs.flip(dims=[0])
         return best_idxs.tolist()
 
 
@@ -238,6 +253,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Update batch if needed
         should_update_batch = (self.args.select_steps_per_grad > 0) and (it % self.args.select_steps_per_grad == 0)
         if (not len(self.batch)) or should_update_batch:
+            self.base_model.to(device)
             self.batch = self._rank_dataset_by_influence(
                 full_base_params, full_expert_model_params,
                 last_layer_base_params, last_layer_expert_model_params

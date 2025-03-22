@@ -14,23 +14,6 @@ from enum import Enum
 
 from torch.utils.data import Dataset
 
-# from utils import train_expert_model
-
-def limit_layers(model: transformers.PreTrainedModel, n_layers: int) -> transformers.PreTrainedModel:
-    if hasattr(model, 'transformer'):
-        if hasattr(model.transformer, 'h'):
-            model.transformer.h = model.transformer.h[:n_layers]
-        else:
-            model.transformer.layer = model.transformer.layer[:n_layers]
-    elif hasattr(model, 'encoder'):
-        if hasattr(model.encoder, 'layers'):
-            model.encoder.layers = model.encoder.layers[:n_layers]
-        else:
-            model.encoder.layer = model.encoder.layer[:n_layers]
-    else:
-        raise RuntimeError(f"unknown how to limit layers of model {type(model)}")
-    return model
-
 
 class ProjectionType(str, Enum):
     rademacher = "rademacher"
@@ -229,7 +212,7 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
     for m in dropout_modules:
         m.p = 0.0
 
-    return limit_layers(model, 6)
+    return model
 
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     state_dict = model.state_dict()

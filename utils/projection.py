@@ -184,7 +184,7 @@ def _get_grads_final_layer_uncached(
             inputs["labels"] = inputs["input_ids"].detach().clone()
 
         # get last hidden state for inputs
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = student_net(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -192,6 +192,7 @@ def _get_grads_final_layer_uncached(
             )
             last_hidden_state = outputs.hidden_states[-1]
         
+        @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         def compute_loss(params, buffers, last_hidden_states, labels):
             logits = torch.func.functional_call(
                 module=student_net.lm_head,
