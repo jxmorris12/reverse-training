@@ -344,15 +344,14 @@ def _train_expert_model_uncached(
         label_column_name: Optional[str] = None,
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
-        num_evaluation_batches: int = 10
+        num_evaluation_batches: int = 16,
+        early_stopping_patience: int = 3,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left" # important for correct truncation
     tokenizer.padding_side = "left" 
-
-    evaluation_steps: list[int] = [10, 100, 500, 1000]
 
     train_ds = ds["train"]
     eval_ds = ds["test"]
@@ -369,8 +368,13 @@ def _train_expert_model_uncached(
     evaluation_metrics = collections.defaultdict(list)
     eval_loss = -1 
     eval_accuracy = -1
-    for _i in range(num_experts):
-        for _j in range(num_steps_per_expert):
+    
+    # Early stopping variables
+    best_eval_accuracy = float('-inf')
+    epochs_without_improvement = 0
+    
+    for epoch in range(num_experts):
+        for _i in range(num_steps_per_expert):
             if ds_tokens is not None:
                 # Handle pre-tokenized data case
                 if len(ds_tokens) < num_expert_datapoints:
@@ -429,7 +433,7 @@ def _train_expert_model_uncached(
                 ignore_index=-100,
                 reduction="mean"
             )
-            pbar.set_description(f"Expert training step {step+1} | Loss = {loss:.3f}")
+            pbar.set_description(f"Epoch {epoch} | Step {step+1} | Loss = {loss:.3f}")
             pbar.update(1)
             loss.backward()
             optim.step()
@@ -451,8 +455,24 @@ def _train_expert_model_uncached(
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
         evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
+
+        # print(f"[Epoch {epoch} | Step {step}] | Eval loss: {eval_loss:.3f} | Eval accuracy: {eval_accuracy:.3f}")
+        tqdm.tqdm.write(f"[Epoch {epoch} | Step {step}] | Eval loss: {eval_loss:.3f} | Eval accuracy: {eval_accuracy:.3f}")
         
         expert_state_dicts.append(_get_state_dict(student_net))
+        
+        # Check for early stopping
+        if eval_accuracy is not None:
+            if eval_accuracy > best_eval_accuracy:
+                best_eval_accuracy = eval_accuracy
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                
+                if epochs_without_improvement >= early_stopping_patience:
+                    pbar.close()
+                    print(f"Early stopping triggered after {epoch+1} epochs")
+                    break
 
     # Run one more evaluation
     eval_loss, eval_accuracy = _eval_expert_model(
@@ -527,7 +547,11 @@ def train_expert_model(
     if os.path.exists(cache_path) and not uncachable_args_provided:
         print0(f"Loading cached expert model results from {cache_path}")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            expert_state_dicts, all_token_counts, final_evaluation_metrics = pickle.load(f)
+        print0(f"Loaded cached expert model results from {cache_path} - "
+               f"best eval loss: {final_evaluation_metrics['best_eval_loss']:.3f} /" 
+               f"best eval accuracy: {final_evaluation_metrics['best_eval_accuracy']:.3f}")
+        return expert_state_dicts, all_token_counts, final_evaluation_metrics
     
     # If not cached, run training and cache results
     num_datapoints = len(ds_tokens) if ds_tokens is not None else len(ds["train"])

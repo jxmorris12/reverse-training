@@ -124,7 +124,63 @@ class SELECTOptimizer(DiscreteOptimizer):
         assert grads.shape == (len(self.dataset), projection_dim), \
             f"grads.shape: {grads.shape} != (len(self.dataset), projection_dim): {(len(self.dataset), projection_dim)}"
         
-        # Greedily fill batch
+        # Fill batch using greedy algorithm
+        if self.args.select_batch_fill_strategy == "greedy":
+            batch = self._fill_batch_greedy(
+                grads_db=grads_db,
+                last_layer_base_params=last_layer_base_params,
+                last_layer_expert_model_params=last_layer_expert_model_params
+            )
+        elif self.args.select_batch_fill_strategy == "topk":
+            batch = self._fill_batch_topk(
+                grads_db=grads_db,
+                last_layer_base_params=last_layer_base_params,
+                last_layer_expert_model_params=last_layer_expert_model_params
+            )
+        else:
+            raise ValueError(f"Invalid batch fill strategy: {self.args.select_batch_fill_strategy}")
+        
+        print(f"Picked new batch of size {len(batch)}: {sorted(batch)}")
+        
+        return batch
+
+    def _fill_batch_topk(
+            self, 
+            grads_db: BatchedExactVectorDatabase,
+            last_layer_base_params: torch.Tensor,
+            last_layer_expert_model_params: torch.Tensor
+        ) -> list:
+        """Fill a batch with the top k examples that have the most influence on optimization direction."""
+        base_params_diff_projected = self.projector.project(
+            (last_layer_base_params - last_layer_expert_model_params), 
+            model_id=0
+        )
+        
+        # Use cosine similarity to find best gradient
+        base_params_diff_norm = base_params_diff_projected / (base_params_diff_projected.norm(dim=1, p=2, keepdim=True) + 1e-10)
+        base_params_diff_norm = base_params_diff_norm.to(device)
+        
+        # Get the best remaining gradient
+        best_sims, best_idxs = grads_db.search(base_params_diff_norm, self.args.select_full_dataset_size)
+        return best_idxs.tolist()
+
+
+    def _fill_batch_greedy(
+            self, 
+            grads_db: BatchedExactVectorDatabase,
+            last_layer_base_params: torch.Tensor,
+            last_layer_expert_model_params: torch.Tensor
+        ) -> list:
+        """Greedily fill a batch with examples that have the most influence on optimization direction.
+        
+        Args:
+            grads_db: Database of projected gradients for all examples
+            last_layer_base_params: Parameters of the last layer of the base model
+            last_layer_expert_model_params: Parameters of the last layer of the expert model
+            
+        Returns:
+            List of indices of selected examples
+        """
         batch = []
         best_sim = float("-inf")
         current_grad = torch.zeros_like(last_layer_base_params, device=device)
@@ -165,9 +221,6 @@ class SELECTOptimizer(DiscreteOptimizer):
             current_grad += batch_grad.flatten()
             batch_pbar.update(1)
             batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)}")
-        
-
-        print(f"Picked new batch of size {len(batch)}: {sorted(batch)}")
         
         return batch
 
