@@ -161,7 +161,7 @@ def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer
     """
     emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
-    
+
     m = emb_A.shape[0]
     n = emb_B.shape[0]
     wA = np.ones(m) / m
@@ -184,6 +184,8 @@ def evaluate_datasets(reference_dataset, recovered_dataset, output_filename):
     Returns:
       - results (dict): A dictionary containing the computed metrics.
     """
+    
+
     full_ot_distance = dataset_level_full_ot(
         reference_dataset, recovered_dataset,
         tokenizer=tokenizer, model=model, device=device
@@ -194,10 +196,17 @@ def evaluate_datasets(reference_dataset, recovered_dataset, output_filename):
     )
 
     
+    # Lexical-Based Metrics
+    jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
+    jaccard_overlap_vocabulary_score = jaccard_overlap_vocabulary(reference_dataset, recovered_dataset)
+    levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
     
     results = {
         "full_ot_distance": full_ot_distance,
-        "sinkhorn_distance": sinkhorn_distance
+        "sinkhorn_distance": sinkhorn_distance,
+        "jaccard_overlap_examples": jaccard_overlap_examples_score,
+        "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_score,
+        "levenshtein_stats": levenshtein_stats
     }
     
     with open(output_filename, "w") as f:
