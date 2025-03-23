@@ -115,6 +115,7 @@ class DatasetDistiller:
                 tokenizer=self.tokenizer,
                 student_net=self.student_net,
                 initial_student_net=self.initial_student_net,
+                true_classification_dataset=self.classification_dataset,
             )
         else:
             raise NotImplementedError(f"Optimizer {self.args.discrete_optimizer} not implemented")
@@ -158,7 +159,7 @@ class DatasetDistiller:
         _, __, evaluation_metrics = train_expert_model(
             num_experts=self.args.num_eval_epochs,
             num_steps_per_expert=max(1, len(tokens) // self.args.minibatch_size),
-            num_expert_datapoints=self.args.minibatch_size,
+            expert_batch_size=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
             ds=self.classification_dataset.dataset,
@@ -188,10 +189,10 @@ class DatasetDistiller:
         discrete_optimizer = self._init_discrete_optimizer()
 
         # load/generate expert trajectories
-        expert_buffer, dataset_token_counts, final_evaluation_metrics = train_expert_model(
+        expert_buffer, dataset_token_counts, original_evaluation_metrics = train_expert_model(
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
-            num_expert_datapoints=self.args.minibatch_size,
+            expert_batch_size=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
             ds=self.classification_dataset.dataset,
@@ -229,6 +230,7 @@ class DatasetDistiller:
 
         data = {
             "args": dict(vars(self.args)),
+            "original_evaluation_metrics": original_evaluation_metrics,
             "expert_evaluation_metrics": all_evaluation_metrics,
             "final_Z": Z,
             "final_Y": discrete_optimizer.Y,

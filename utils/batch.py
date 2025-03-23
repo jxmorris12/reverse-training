@@ -1,6 +1,5 @@
 import functools
 import gc
-import inspect
 import torch
 
 
@@ -22,7 +21,7 @@ def should_reduce_batch_size(exception: Exception) -> bool:
     return False
 
 # modified from https://github.com/huggingface/accelerate/blob/85a75d4c3d0deffde2fc8b917d9b1ae1cb580eb2/src/accelerate/utils/memory.py#L87
-def find_executable_batch_size(function: callable = None, starting_batch_size: int = 256):
+def find_executable_batch_size(function: callable = None, starting_batch_size: int = 512):
     """
     A basic decorator that will try to execute `function`. If it fails from exceptions related to out-of-memory or
     CUDNN, the batch size is cut in half and passed to `function`

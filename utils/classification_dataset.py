@@ -1,6 +1,10 @@
 import datasets
 
 
+def _make_dbpedia_text(ex: dict[str, str]) -> dict[str, str]:
+    ex["text"] = ex["title"] + " " + ex["content"]
+    return ex
+
 class ClassificationDataset:
     """
     A wrapper class for datasets.Dataset that includes metadata specific to classification tasks.
@@ -112,6 +116,29 @@ class ClassificationDataset:
                 "1": "Sports",
                 "2": "Business",
                 "3": "Sci/Tech",
+            }
+        elif dataset_name == "dbpedia":
+            ds = datasets.load_dataset("fancyzhx/dbpedia_14")
+            ds = ds.train_test_split(test_size=0.1, seed=42)
+            ds["train"] = ds["train"].map(_make_dbpedia_text)
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = {
+                "0": "Company",
+                "1": "Organization",
+                "2": "Location",
+            }
+        elif dataset_name.startswith("dbpedia_") and dataset_name[8:].isdigit():
+            num_samples = int(dataset_name[8:])
+            ds = datasets.load_dataset("fancyzhx/dbpedia_14")
+            ds = ds.train_test_split(test_size=0.1, seed=42)
+            ds["train"] = ds["train"].select(range(num_samples))
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = {
+                "0": "Company",
+                "1": "Organization",
+                "2": "Location",
             }
         elif dataset_name == "nq":
             ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]

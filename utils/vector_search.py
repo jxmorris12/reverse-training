@@ -17,21 +17,28 @@ class VectorDatabase(abc.ABC):
     def search(self, query_vector: torch.Tensor, k: int) -> torch.Tensor:
         pass
 
+    @abc.abstractmethod
+    def reset_removed_vectors(self):
+        pass
+
 
 class ExactVectorDatabase(VectorDatabase):
     def search(self, query_vector: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         sims = torch.nn.functional.cosine_similarity(self.vectors, query_vector, dim=1)
+        sims[self.ignore_mask] = -float("inf")
         idxs = torch.argsort(sims, descending=True)[:k]
         return sims[idxs], idxs
     
     def remove_vectors(self, idxs: torch.Tensor):
-        non_removed_idxs = torch.ones_like(self.vectors, dtype=bool)
-        non_removed_idxs[idxs] = False
-        self.vectors = self.vectors[non_removed_idxs]
+        # Zero out vectors at the given indices
+        self.ignore_mask[idxs] = True
+    
+    def reset_removed_vectors(self):
+        self.ignore_mask = torch.zeros(self.vectors.shape[0], dtype=bool)
 
 
 class BatchedExactVectorDatabase(VectorDatabase):
-    def __init__(self, vectors: torch.Tensor, batch_size: int = 32000):
+    def __init__(self, vectors: torch.Tensor, batch_size: int = 100_000):
         super().__init__(vectors.to(torch.float16))
         self.batch_size = batch_size
         self.ignore_mask = torch.zeros(vectors.shape[0], dtype=bool)
@@ -50,9 +57,7 @@ class BatchedExactVectorDatabase(VectorDatabase):
             # Get current batch
             end_idx = min(i + self.batch_size, num_vectors)
             batch_vectors = self.vectors[i:end_idx].to(device)
-            
             batch_sims = torch.nn.functional.cosine_similarity(batch_vectors, query_vector, dim=1)
-            
             all_sims.append(batch_sims.flatten())
         
         # Combine all batches
@@ -63,8 +68,10 @@ class BatchedExactVectorDatabase(VectorDatabase):
     
     def remove_vectors(self, idxs: torch.Tensor):
         # Zero out vectors at the given indices
-        self.vectors[idxs] = torch.zeros_like(self.vectors[idxs])
         self.ignore_mask[idxs] = True
+    
+    def reset_removed_vectors(self):
+        self.ignore_mask = torch.zeros(self.vectors.shape[0], dtype=bool)
 
 
 class FaissVectorDatabase(VectorDatabase):

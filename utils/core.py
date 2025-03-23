@@ -167,18 +167,14 @@ def _autolabel_dataset_uncached(
     model.to(device)
     all_labels = []
 
-    valid_tokens = tokenizer.batch_encode_plus(
-        label_map.values(),
-        return_tensors="pt",
-        padding="max_length",
-        truncation=True,
-        max_length=sequence_length,
-    )["input_ids"].to(device)
-    print(f"[autolabel_dataset] valid_tokens: {valid_tokens}")
-    breakpoint()
+    # Valid tokens are all tokens that are in the label map, prepended with a space
+    # e.g. "1" -> " 1" -> [352]
+    valid_token_keys = [f" {s}" for s in list(label_map.keys())]
+    valid_tokens = torch.tensor([tokenizer.encode(s) for s in valid_token_keys]).flatten()
+    print(f"[autolabel_dataset] valid_tokens: {valid_token_keys} -> {valid_tokens}")
 
-    invalid_tokens_mask = torch.ones_like(valid_tokens, dtype=torch.bool)
-    invalid_tokens_mask[:, valid_tokens] = False
+    invalid_tokens_mask = torch.ones(tokenizer.vocab_size, dtype=torch.bool)
+    invalid_tokens_mask[valid_tokens] = False
 
     for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset", colour="RED"):
         batch_end = min(batch_start + batch_size, len(dataset))
@@ -201,7 +197,6 @@ def _autolabel_dataset_uncached(
 
             # Set logits of invalid tokens to -float("inf")
             logits[:, invalid_tokens_mask] = -float("inf")
-            breakpoint()
             
             predictions = torch.argmax(logits, dim=-1)
             all_labels.append(predictions.cpu())
@@ -219,12 +214,14 @@ def autolabel_dataset(
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
 
+    label_map_str = "_".join(map(str, sorted(label_map.items())))
+    label_map_hash = hashlib.sha256(label_map_str.encode()).hexdigest()
     hash_kwargs = {
         "dataset_hash": dataset._fingerprint,
         "model_hash": hash_model_params(model),
         "tokenizer_hash": tokenizer.name_or_path,
         "sequence_length": sequence_length,
-        "label_map": "_".join(sorted(label_map.items())),
+        "label_map_hash": label_map_hash,
     }
     cache_key = _get_cache_key(**hash_kwargs)
     print(f"Autolabeling dataset with cache key: {cache_key}")
@@ -295,14 +292,15 @@ def _get_cache_key(**kwargs) -> str:
     return '_'.join(f"{k}:{value_to_str(v)}" for k, v in sorted_items)
 
 
+@find_executable_batch_size
 def _eval_expert_model(
     student_net: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     eval_ds: datasets.Dataset,
     text_column_name: str,
     label_column_name: Optional[str],
-    num_expert_datapoints: int,
     sequence_length: int,
+    batch_size: int = 32,
 ) -> tuple[float, Optional[float], Optional[float]]:
     """Evaluate expert model on evaluation dataset.
     
@@ -312,9 +310,8 @@ def _eval_expert_model(
         eval_ds: Evaluation dataset
         text_column_name: Name of text column in dataset
         label_column_name: Name of label column in dataset (if doing classification)
-        num_expert_datapoints: Number of datapoints to evaluate on per batch
         sequence_length: Maximum sequence length for tokenization
-        num_evaluation_batches: Number of evaluation batches to run
+        batch_size: Number of datapoints to evaluate on per batch
         
     Returns:
         Tuple of (eval_loss, eval_accuracy)
@@ -325,8 +322,8 @@ def _eval_expert_model(
     all_idxs = list(range(len(eval_ds)))
     i = 0
     while i < len(all_idxs):
-        batch_idxs = all_idxs[i:i+num_expert_datapoints]
-        i += num_expert_datapoints
+        batch_idxs = all_idxs[i:i+batch_size]
+        i += batch_size
         
         examples = eval_ds.select(batch_idxs)
         
@@ -383,7 +380,7 @@ def _eval_expert_model(
 def _train_expert_model_uncached(
         num_experts: int, 
         num_steps_per_expert: int, 
-        num_expert_datapoints: int, 
+        expert_batch_size: int, 
         expert_lr: float, 
         sequence_length: int,
         ds: datasets.DatasetDict, 
@@ -413,19 +410,28 @@ def _train_expert_model_uncached(
     evaluation_metrics = collections.defaultdict(list)
     eval_loss = -1 
     eval_accuracy = -1
-    
+
     # Early stopping variables
     best_eval_accuracy = float('-inf')
     epochs_without_improvement = 0
-    
+
+    # Print first datapoint
+    if ds_tokens is not None:
+        print(f"First datapoint: {ds_tokens[0]}")
+        print(f"First datapoint label: {ds_labels[0]}")
+        print(f"Label distribution: {ds_labels.unique(return_counts=True)}")
+    else:
+        print(f"First datapoint: {train_ds[0][text_column_name]}")
+        print(f"First datapoint label: {train_ds[0][label_column_name]}")
+
     for epoch in range(num_experts):
         for _i in range(num_steps_per_expert):
             if ds_tokens is not None:
                 # Handle pre-tokenized data case
-                if len(ds_tokens) < num_expert_datapoints:
-                    batch_idxs = torch.randint(0, len(ds_tokens), (num_expert_datapoints,)).tolist()
+                if len(ds_tokens) < expert_batch_size:
+                    batch_idxs = torch.randint(0, len(ds_tokens), (expert_batch_size,)).tolist()
                 else:
-                    batch_idxs = random.sample(range(len(ds_tokens)), k=num_expert_datapoints)
+                    batch_idxs = random.sample(range(len(ds_tokens)), k=expert_batch_size)
                 tokens = ds_tokens[batch_idxs].to(device)
                 outputs = student_net(
                     input_ids=tokens,
@@ -437,11 +443,11 @@ def _train_expert_model_uncached(
                 all_token_counts += torch.bincount(tokens.flatten(), minlength=tokenizer.vocab_size)
             else:
                 # Handle raw text data case
-                batch_idxs = random.sample(range(len(train_ds)), k=num_expert_datapoints)
+                batch_idxs = random.sample(range(len(train_ds)), k=expert_batch_size)
                 examples = train_ds.select(batch_idxs)
                 
                 if label_column_name is not None:
-                    # Classification mode - append label to text
+                    # Classification mode - append label to text w/ space
                     examples = [
                         f"{text} {label}" 
                         for text, label in zip(examples[text_column_name], examples[label_column_name])
@@ -471,7 +477,6 @@ def _train_expert_model_uncached(
                 # Track token counts
                 all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
             
-
             logits = outputs.logits[:, :-1]
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), 
@@ -494,7 +499,6 @@ def _train_expert_model_uncached(
             eval_ds=eval_ds,
             text_column_name=text_column_name,
             label_column_name=label_column_name,
-            num_expert_datapoints=num_expert_datapoints,
             sequence_length=sequence_length,
         )
         
@@ -526,7 +530,6 @@ def _train_expert_model_uncached(
         eval_ds=eval_ds,
         text_column_name=text_column_name,
         label_column_name=label_column_name,
-        num_expert_datapoints=num_expert_datapoints,
         sequence_length=sequence_length,
     )
     evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
@@ -551,7 +554,7 @@ def _train_expert_model_uncached(
 def train_expert_model(
         num_experts: int, 
         num_steps_per_expert: int, 
-        num_expert_datapoints: int, 
+        expert_batch_size: int, 
         expert_lr: float, 
         sequence_length: int,
         ds: datasets.DatasetDict, 
@@ -571,7 +574,7 @@ def train_expert_model(
     cache_kwargs = {
         "num_experts": num_experts,
         "num_steps_per_expert": num_steps_per_expert,
-        "num_expert_datapoints": num_expert_datapoints,
+        "expert_batch_size": expert_batch_size,
         "expert_lr": expert_lr,
         "sequence_length": sequence_length,
         "ds_name": ds.config_name if hasattr(ds, "config_name") else "custom",
@@ -605,7 +608,7 @@ def train_expert_model(
     results = _train_expert_model_uncached(
         num_experts=num_experts,
         num_steps_per_expert=num_steps_per_expert,
-        num_expert_datapoints=num_expert_datapoints,
+        expert_batch_size=expert_batch_size,
         expert_lr=expert_lr,
         sequence_length=sequence_length,
         ds=ds,

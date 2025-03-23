@@ -24,7 +24,7 @@ def main(args):
 
     wandb.init(
         sync_tensorboard=False,
-        project="dataset-distillation",
+        project="weight-reversal-1",
         config=args,
         # mode="disabled" if get_rank() > 0 else os.getenv("WANDB_MODE", "online"),
     )
@@ -54,7 +54,7 @@ if __name__ == '__main__':
     parser.add_argument('--pretrain_iterations_x', type=int, default=100, help='how many gradient steps in initial X training phase')
 
     parser.add_argument('--lr_tokens', type=float, default=0.001, help='learning rate for updating synthetic tokens')
-    parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
+    parser.add_argument('--lr_lr', type=float, default=0.0, help='learning rate for updating... learning rate')
     parser.add_argument('--lr_teacher', type=float, default=0.001, help='initialization for synthetic learning rate')
     parser.add_argument('--syn_steps', type=int, default=8, help='how many steps to take on synthetic data')
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
@@ -62,9 +62,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--expert_epochs', type=int, default=1, help='how many expert epochs the target params are')
     parser.add_argument("--sequence_length", default=32, type=int, help="sequence length for the model")
-    parser.add_argument("--num_experts", default=20, type=int, help="number of experts to read")
-    parser.add_argument("--num_steps_per_expert", default=50, type=int, help="number of steps per expert")
-    parser.add_argument("--num_expert_datapoints", default=256, type=int, help="number of datapoints per expert")
+    parser.add_argument("--num_experts", default=1, type=int, help="number of experts to read")
+    parser.add_argument("--num_steps_per_expert", default=1000, type=int, help="number of steps per expert")
+    parser.add_argument("--expert_batch_size", default=256, type=int, help="number of datapoints per expert")
     parser.add_argument("--expert_lr", default=1e-4, type=float, help="learning rate for expert")
 
     parser.add_argument("--discrete_optimizer", "--opt", default="ADMM", type=str, help="discrete optimizer to use", choices=["ADMM", "GCG", "GCGA", "SELECT"])
@@ -75,12 +75,12 @@ if __name__ == '__main__':
 
     parser.add_argument("--select_seed_dataset", type=str, default="nq", help="dataset to use for SELECT")
     parser.add_argument("--select_projection_dim", type=int, default=1024, help="projection dimension for SELECT")
-    parser.add_argument("--select_steps_per_grad", type=int, default=256, help="how many steps between gradient rerankings in SELECT")
+    parser.add_argument("--select_steps_per_grad", type=int, default=-1, help="how many steps between gradient rerankings in SELECT")
     parser.add_argument("--select_full_dataset_size", type=int, default=2048, help="how many examples to select per gradient reranking in SELECT")
-    parser.add_argument("--select_lr_student", type=float, default=0.001, help="learning rate for SELECT")  
+    parser.add_argument("--select_lr_student", type=float, default=1e-4, help="learning rate for SELECT")  
     parser.add_argument("--select_num_pseudoexperts", type=int, default=1, help="number of pseudoexperts to use in SELECT")
     parser.add_argument("--select_do_classification", type=bool, default=True, help="whether to do classification in SELECT")
-    parser.add_argument("--select_batch_fill_strategy", type=str, default="greedy", help="strategy to fill the batch in SELECT", choices=["topk", "greedy", "random", "bottomk"])
+    parser.add_argument("--select_batch_fill_strategy", type=str, default="greedy", help="strategy to fill the batch in SELECT", choices=["topk", "topk_balanced", "greedy", "random", "bottomk"])
     parser.add_argument("--num_eval_epochs", type=int, default=50, help="number of evaluation epochs")
 
 

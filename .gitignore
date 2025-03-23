@@ -1,4 +1,6 @@
 .cache/
 __pycache__/
+exp_scripts/
+log_submitit/
 saves/
 wandb/

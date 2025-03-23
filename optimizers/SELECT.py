@@ -3,14 +3,13 @@ from .optimizer import DiscreteOptimizer
 import collections
 import copy
 import random
-
+import math
 import torch
 import tqdm
 from utils import (
     autolabel_dataset,
     device, 
     get_model,
-    load_dataset_from_name,
     ClassificationDataset,
 )
 from utils.projection import (
@@ -27,7 +26,15 @@ class SELECTOptimizer(DiscreteOptimizer):
     Y: torch.Tensor
     syn_lr: torch.Tensor
 
-    def __init__(self, args, X: torch.Tensor, Y: torch.Tensor, tokenizer, student_net, initial_student_net):
+    def __init__(
+            self, 
+            args, 
+            X: torch.Tensor, 
+            Y: torch.Tensor, 
+            tokenizer, 
+            student_net, 
+            initial_student_net,
+            true_classification_dataset: ClassificationDataset):
         super().__init__(args)
         self.tokenizer = tokenizer
         self.student_net = student_net
@@ -38,7 +45,6 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         syn_lr = torch.tensor(self.args.lr_teacher).to(device)
         self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
-
 
         # Setup projector
         param_count = sum(p.numel() for p in self.base_model.lm_head.parameters())
@@ -61,9 +67,10 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.Y = None
 
         # Load search dataset
+        self.true_classification_dataset = true_classification_dataset
         self.seed_dataset = ClassificationDataset.from_dataset_name(self.args.select_seed_dataset)
-        self.seed_dataset_train = self.seed_dataset.dataset["train"]
-        print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train)}")
+        self.seed_dataset_train_split = self.seed_dataset.dataset["train"]
+        print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None
     
     def _rank_dataset_by_influence(
@@ -72,20 +79,21 @@ class SELECTOptimizer(DiscreteOptimizer):
             last_layer_base_params, last_layer_expert_model_params
         ) -> list:
         """Rank dataset examples by influence on optimization direction"""
-        assert self.args.select_full_dataset_size <= len(self.seed_dataset_train), \
-            f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.seed_dataset_train)}"
+        assert self.args.select_full_dataset_size <= len(self.seed_dataset_train_split), \
+            f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.seed_dataset_train_split)}"
     
 
         # If we're using random batch fill strategy, we can already return the random batch
         if self.args.select_batch_fill_strategy == "random":
-            return random.sample(range(len(self.seed_dataset_train)), k=self.args.select_full_dataset_size)
+            return random.sample(range(len(self.seed_dataset_train_split)), k=self.args.select_full_dataset_size)
 
         # Get all gradients
         base_model = copy.deepcopy(self.base_model)
         grads = []
         for i in range(self.args.select_num_pseudoexperts):
             step_frac = i / self.args.select_num_pseudoexperts
-            print(f"pseudoexpert {i}/{self.args.select_num_pseudoexperts} -> step_frac = {step_frac}")
+            print(f"[rank_dataset_by_influence] Pseudoexpert {i}/{self.args.select_num_pseudoexperts} -> step_frac = {step_frac}")
+            # Interpolate linearly from base model to expert model
             pseudoexpert_params = (
                 (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
             )
@@ -97,7 +105,7 @@ class SELECTOptimizer(DiscreteOptimizer):
 
             batch_grads = get_grads_final_layer(
                 base_model, 
-                self.seed_dataset_train, 
+                self.seed_dataset_train_split, 
                 self.dataset_autolabels,
                 self.tokenizer, 
                 self.projector,
@@ -113,8 +121,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
-        assert grads.shape == (len(self.seed_dataset_train), projection_dim), \
-            f"grads.shape: {grads.shape} != (len(self.seed_dataset_train), projection_dim): {(len(self.seed_dataset_train), projection_dim)}"
+        assert grads.shape == (len(self.seed_dataset_train_split), projection_dim), \
+            f"grads.shape: {grads.shape} != (len(self.seed_dataset_train_split), projection_dim): {(len(self.seed_dataset_train_split), projection_dim)}"
         
         # Fill batch using greedy algorithm
         if self.args.select_batch_fill_strategy == "greedy":
@@ -127,7 +135,14 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch = self._fill_batch_topk(
                 grads_db=grads_db,
                 last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params
+                last_layer_expert_model_params=last_layer_expert_model_params,
+            )
+        elif self.args.select_batch_fill_strategy == "topk_balanced":
+            batch = self._fill_batch_topk(
+                grads_db=grads_db,
+                last_layer_base_params=last_layer_base_params,
+                last_layer_expert_model_params=last_layer_expert_model_params,
+                balanced=True,
             )
         elif self.args.select_batch_fill_strategy == "bottomk":
             batch = self._fill_batch_topk(
@@ -137,11 +152,11 @@ class SELECTOptimizer(DiscreteOptimizer):
                 reverse=True,
             )
         elif self.args.select_batch_fill_strategy == "random":
-            batch = random.choices(range(len(self.seed_dataset_train)), k=self.args.select_full_dataset_size)
+            batch = random.choices(range(len(self.seed_dataset_train_split)), k=self.args.select_full_dataset_size)
         else:
             raise ValueError(f"Invalid batch fill strategy: {self.args.select_batch_fill_strategy}")
         
-        print(f"Picked new batch of size {len(batch)}: {sorted(batch)}")
+        print(f"Picked new batch of size {len(batch)}: {sorted(batch)[:5]}...{sorted(batch)[-5:]}")
         
         return batch
 
@@ -151,6 +166,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             last_layer_base_params: torch.Tensor,
             last_layer_expert_model_params: torch.Tensor,
             reverse: bool = False,
+            balanced: bool = False,
         ) -> list:
         """Fill a batch with the top k examples that have the most influence on optimization direction."""
         base_params_diff_projected = self.projector.project(
@@ -163,7 +179,43 @@ class SELECTOptimizer(DiscreteOptimizer):
         base_params_diff_norm = base_params_diff_norm.to(device)
         
         # Get the best remaining gradient
-        best_sims, best_idxs = grads_db.search(base_params_diff_norm, self.args.select_full_dataset_size)
+        if balanced:
+            # Optionally we balance by label to avoid over-representing any one label
+            default_label_map = self.true_classification_dataset.label_map
+            tokenized_labels = [self.tokenizer.encode(f" {x}")[0] for x in default_label_map]
+            best_idxs = []
+            label_counts = { label: 0 for label in tokenized_labels }
+            selected_data_by_label = { label: [] for label in tokenized_labels }
+            label_is_removed = { label: False for label in tokenized_labels }
+            pbar = tqdm.trange(self.args.select_full_dataset_size, desc="Filling and balancing batch")
+            max_per_label = math.ceil(self.args.select_full_dataset_size / len(tokenized_labels))
+            last_best_sim_length = 0
+            while len(best_idxs) < self.args.select_full_dataset_size:
+                num_to_fill = self.args.select_full_dataset_size - len(best_idxs)
+                tqdm.tqdm.write(f"Searching for {num_to_fill} examples (len(best_idxs): {len(best_idxs)} / label_counts: {label_counts} / label_is_removed: {label_is_removed})")
+                _, best_idxs_full = grads_db.search(base_params_diff_norm, num_to_fill)
+                for best_idx in best_idxs_full.cpu().tolist():
+                    label = self.dataset_autolabels[best_idx].item()
+                    if label_counts[label] < max_per_label:
+                        best_idxs.append(best_idx)
+                        label_counts[label] += 1
+                        selected_data_by_label[label].append(best_idx)
+
+                # remove vectors from search from all datapoints w/ labels that are over max_per_label
+                for label in tokenized_labels:
+                    if (label_counts[label] >= max_per_label) and (not label_is_removed[label]):
+                        label_is_removed[label] = True
+                        all_datapoints_within_label = (self.dataset_autolabels == label).nonzero().flatten() 
+                        grads_db.remove_vectors(all_datapoints_within_label)
+                        tqdm.tqdm.write(f"Filled quota for label {label}; Removed {len(all_datapoints_within_label)} datapoints")
+                
+                grads_db.remove_vectors(torch.tensor(best_idxs))
+                num_added = len(best_idxs) - last_best_sim_length
+                last_best_sim_length = len(best_idxs)
+                pbar.update(num_added)
+            best_idxs = torch.tensor(best_idxs)
+        else:
+            best_sims, best_idxs = grads_db.search(base_params_diff_norm, self.args.select_full_dataset_size)
         if reverse:
             best_sims = best_sims.flip(dims=[0])
             best_idxs = best_idxs.flip(dims=[0])
@@ -215,7 +267,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             # Compute full-resolution gradient
             batch_grad = get_grads_final_layer(
                 self.base_model, 
-                self.seed_dataset_train.select([best_idx]), 
+                self.seed_dataset_train_split.select([best_idx]), 
                 self.dataset_autolabels[None, best_idx],
                 self.tokenizer, 
                 self.projector, 
@@ -259,7 +311,7 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         # Take step on batch
         inputs = self.tokenizer(
-            self.seed_dataset_train.select(minibatch)["text"],
+            self.seed_dataset_train_split.select(minibatch)["text"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
@@ -306,7 +358,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         torch.cuda.empty_cache()
         
         self.best_idx_counter.update(minibatch)
-        top_10_selected = self.best_idx_counter.most_common(10)
+        # top_10_selected = self.best_idx_counter.most_common(10)
 
         if current_mse < self.best_mse:
             self.steps_since_last_improvement = 0
@@ -324,11 +376,11 @@ class SELECTOptimizer(DiscreteOptimizer):
             expert_model = copy.deepcopy(self.base_model)
             expert_model.load_state_dict(expert_state_dict)
             self.dataset_autolabels = autolabel_dataset(
-                dataset=self.seed_dataset_train,
+                dataset=self.seed_dataset_train_split,
                 model=expert_model, 
                 tokenizer=self.tokenizer, 
                 sequence_length=self.args.sequence_length,
-                label_map=self.seed_dataset.label_map,
+                label_map=self.true_classification_dataset.label_map,
             )
             expert_state_dict.pop("lm_head.weight")
             
@@ -350,7 +402,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             Tokenized text as tensor
         """
         if i not in self.tokenization_cache:
-            text = self.seed_dataset_train[i][
+            text = self.seed_dataset_train_split[i][
                 self.seed_dataset.text_column_name
             ]
             tokens = self.tokenizer(
