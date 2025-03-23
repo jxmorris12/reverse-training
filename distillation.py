@@ -2,7 +2,6 @@ import gc
 import os
 import pickle
 
-import datasets
 import torch
 import transformers
 import wandb
@@ -15,9 +14,7 @@ from utils import (
     get_model, 
     get_world_size,
     get_token_embeddings_random_soft,
-    get_token_embeddings_from_dataset,
     get_token_embeddings_from_classification_dataset, 
-    load_dataset_from_name, 
     train_expert_model,
     trange_if_main_worker,
     ClassificationDataset,
