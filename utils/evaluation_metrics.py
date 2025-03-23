@@ -122,7 +122,7 @@ def get_sentence_embeddings(texts, tokenizer, model, device):
     encoded_input = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
     encoded_input = {key: val.to(device) for key, val in encoded_input.items()}
     with torch.no_grad():
-        model_output = model(**encoded_input)
+        model_output = model.encoder(**encoded_input)
     embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
     embeddings = F.normalize(embeddings, p=2, dim=1)
     return embeddings.cpu().numpy()
