@@ -42,6 +42,7 @@ class BatchedExactVectorDatabase(VectorDatabase):
         super().__init__(vectors.to(torch.float16))
         self.batch_size = batch_size
         self.ignore_mask = torch.zeros(vectors.shape[0], dtype=bool)
+        self.vectors = self.vectors.to(device)
         
     def search(self, query_vector: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         # Make sure query vector is on GPU

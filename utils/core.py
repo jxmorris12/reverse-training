@@ -520,7 +520,7 @@ def _train_expert_model_uncached(
                 
                 if epochs_without_improvement >= early_stopping_patience:
                     pbar.close()
-                    print(f"Early stopping triggered after {epoch+1} epochs")
+                    print(f"Early stopping triggered after {epoch+1} epochs (patience = {early_stopping_patience})")
                     break
 
     # Run one more evaluation

@@ -116,8 +116,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             grads.append(batch_grads)
         
         grads = torch.stack(grads, dim=0).double().sum(dim=0).float()
-        grads_norm = grads / (grads.norm(dim=1, p=2, keepdim=True) + 1e-10)
-        grads_db = BatchedExactVectorDatabase(grads_norm.cpu())
+        grads_db = BatchedExactVectorDatabase(grads)
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
@@ -240,23 +239,20 @@ class SELECTOptimizer(DiscreteOptimizer):
         """
         batch = []
         best_sim = float("-inf")
-        current_grad = torch.zeros_like(last_layer_base_params, device=device)
-        student_lr = self.args.select_lr_student
+        # Project parameter difference
+        base_params_diff_projected = self.projector.project(
+            (last_layer_base_params - last_layer_expert_model_params), 
+            model_id=0
+        )
+
+        og_grads_db_vectors = grads_db.vectors.clone()
+        recalculate_steps = 32
         
+        full_resolution_batch_gradient = torch.zeros_like(last_layer_base_params)
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         while len(batch) < self.args.select_full_dataset_size:
-            # Project parameter difference
-            base_params_diff_projected = self.projector.project(
-                (last_layer_base_params - current_grad * student_lr) - last_layer_expert_model_params, 
-                model_id=0
-            )
-        
             # Use cosine similarity to find best gradient
-            base_params_diff_norm = base_params_diff_projected / (base_params_diff_projected.norm(dim=1, p=2, keepdim=True) + 1e-10)
-            base_params_diff_norm = base_params_diff_norm.to(device)
-            
-            # Get the best remaining gradient
-            best_sim, best_idx = grads_db.search(base_params_diff_norm, 1)
+            best_sim, best_idx = grads_db.search(base_params_diff_projected, 1)
             best_idx = best_idx.item()
             best_sim = best_sim.item()
 
@@ -275,7 +271,26 @@ class SELECTOptimizer(DiscreteOptimizer):
                 do_projection=False,
                 use_cache=False,
             ).to(device)
-            current_grad += batch_grad.flatten()
+            # add to everything
+            batch_grad_proj = self.projector.project(batch_grad, model_id=0)
+            grads_db.vectors += batch_grad_proj
+
+            if len(batch) % recalculate_steps == 0:
+                last_n_batch = batch[-recalculate_steps:]
+                full_grad = get_grads_final_layer(
+                    self.base_model, 
+                    self.seed_dataset_train_split.select(last_n_batch), 
+                    self.dataset_autolabels[last_n_batch],
+                    self.tokenizer, 
+                    self.projector, 
+                    sequence_length=self.args.sequence_length,
+                    do_projection=False,
+                    use_cache=False,
+                )
+                full_resolution_batch_gradient += full_grad.sum(dim=0).to(device)
+                full_resolution_batch_gradient_proj = self.projector.project(full_resolution_batch_gradient, model_id=0)
+                grads_db.vectors = og_grads_db_vectors + full_resolution_batch_gradient_proj
+
             batch_pbar.update(1)
             batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)}")
         
