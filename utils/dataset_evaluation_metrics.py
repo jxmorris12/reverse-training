@@ -6,6 +6,7 @@ import ot  # Optimal Transport library
 import Levenshtein # Token Edit
 import math
 import tqdm
+from scipy.optimize import linear_sum_assignment
 
 from utils.batch import find_executable_batch_size
 
@@ -180,6 +181,54 @@ def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer
     distance = ot.sinkhorn2(wA, wB, cost_matrix, reg)
     return distance
 
+def example_level_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
+    """
+    Compute a relaxed Word Mover's Distance (RWMD) between two documents.
+    For each token embedding in doc1, find the minimal Euclidean distance to any token in doc2,
+    and vice versa. The relaxed WMD is defined as the maximum of these two average distances.
+    """
+    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+
+    if emb_A.size == 0 or emb_B.size == 0:
+        return float('inf')
+
+    # For each embedding in doc1, compute minimal Euclidean distance to any embedding in doc2.
+    distances_1_to_2 = [np.min(np.linalg.norm(emb_B - e, axis=1)) for e in emb_A]
+    avg_1_to_2 = np.mean(distances_1_to_2)
+
+    # For each embedding in doc2, compute minimal Euclidean distance to any embedding in doc1.
+    distances_2_to_1 = [np.min(np.linalg.norm(emb_A - e, axis=1)) for e in emb_B]
+    avg_2_to_1 = np.mean(distances_2_to_1)
+
+    return max(avg_1_to_2, avg_2_to_1)
+
+def optimal_matching_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
+    """
+    Compute a cost matrix between every document in dataset_A and dataset_B using relaxed WMD.
+    Then, use the Hungarian algorithm to obtain an optimal one-to-one matching.
+    Returns summary statistics and the matched pairs.
+    """
+    m = len(dataset_A)
+    n = len(dataset_B)
+    cost_matrix = np.zeros((m, n))
+    print(cost_matrix.shape)
+
+    for i, docA in enumerate(dataset_A):
+        for j, docB in enumerate(dataset_B):
+            cost_matrix[i, j] = example_level_relaxed_wmd(docA, docB, tokenizer, model, device)
+
+    row_idx, col_idx = linear_sum_assignment(cost_matrix) # Hungarian algorithm for 1-1 matching
+    matched_costs = cost_matrix[row_idx, col_idx]
+
+    stats = {
+        "average_relaxed_wmd": float(np.mean(matched_costs)),
+        "min_relaxed_wmd": float(np.min(matched_costs)),
+        "max_relaxed_wmd": float(np.max(matched_costs)),
+        "matched_pairs": list(zip(row_idx.tolist(), col_idx.tolist(), matched_costs.tolist()))
+    }
+    return stats
+
 
 def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset: list[str]) -> dict[str, float]:
     """
@@ -202,6 +251,11 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
         reference_dataset, recovered_dataset,
         reg=0.1, tokenizer=tokenizer, model=model, device=device
     )
+    
+    optimal_matching_relaxed_wmd_stats = optimal_matching_relaxed_wmd(
+        reference_dataset, recovered_dataset,
+        tokenizer=tokenizer, model=model, device=device
+    )
 
     
     # Lexical-Based Metrics
@@ -212,6 +266,7 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
     results = {
         "full_ot_distance": full_ot_distance,
         "sinkhorn_distance": sinkhorn_distance,
+        "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
         "jaccard_overlap_examples": jaccard_overlap_examples_score,
         "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_score,
         "levenshtein_stats": levenshtein_stats
