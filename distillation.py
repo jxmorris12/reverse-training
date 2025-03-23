@@ -19,6 +19,7 @@ from utils import (
     trange_if_main_worker,
     ClassificationDataset,
 )
+from utils.dataset_evaluation_metrics import evaluate_dataset_similarity
 
 
 class DatasetDistiller:
@@ -184,12 +185,12 @@ class DatasetDistiller:
         # broadcast dataset_token_counts from rank 0 to all other ranks
         torch.distributed.broadcast(dataset_token_counts, src=0)
 
-    def run_distillation(self):
+    def _run_distillation(self) -> tuple:
         # initialize parameters & optimizers
         discrete_optimizer = self._init_discrete_optimizer()
 
         # load/generate expert trajectories
-        expert_buffer, dataset_token_counts, original_evaluation_metrics = train_expert_model(
+        expert_buffer, dataset_token_counts, expert_evaluation_metrics = train_expert_model(
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
             expert_batch_size=self.args.minibatch_size,
@@ -200,7 +201,7 @@ class DatasetDistiller:
             label_column_name=self.classification_dataset.label_column_name,
         )
         self.dataset_token_counts = dataset_token_counts.cpu()
-
+        
         # handle distributed
         self._distributed_broadcast_everything(expert_buffer, dataset_token_counts)
 
@@ -212,7 +213,7 @@ class DatasetDistiller:
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=step)
 
-            if step % self.args.eval_every == 0:
+            if (step + 1) % self.args.eval_every == 0:
                 evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
                 evaluation_metrics["step"] = step
                 all_evaluation_metrics.append(evaluation_metrics)
@@ -228,12 +229,37 @@ class DatasetDistiller:
         self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
         wandb.finish()
 
-        data = {
+        output = { 
             "args": dict(vars(self.args)),
-            "original_evaluation_metrics": original_evaluation_metrics,
-            "expert_evaluation_metrics": all_evaluation_metrics,
-            "final_Z": Z,
-            "final_Y": discrete_optimizer.Y,
+            "expert_evaluation_metrics": expert_evaluation_metrics,
+            "evaluation_metrics": all_evaluation_metrics,
+        }
+
+        # clear cache oncemore
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return (Z.cpu(), discrete_optimizer.Y.cpu(), output)
+
+    def run_distillation(self):
+        tokens, labels, output = self._run_distillation()
+
+        # Compute dataset-level metrics
+        input_dataset = self.classification_dataset.dataset["train"][self.classification_dataset.text_column_name]
+        output_dataset = self.tokenizer.batch_decode(
+            tokens, add_special_tokens=False
+        )
+        print(f"[run_distillation] Computing dataset-level metrics with {len(input_dataset)} examples and {len(output_dataset)} output examples")
+        dataset_evaluation_metrics = evaluate_dataset_similarity(input_dataset, output_dataset)
+        print(dataset_evaluation_metrics)
+
+        data = {
+            "data": {
+                "tokens": tokens,
+                "labels": labels,
+            },
+            **dataset_evaluation_metrics,
+            **output,
         }
         output_dir = os.path.join(os.path.dirname(__file__), "saves")
         os.makedirs(output_dir, exist_ok=True)

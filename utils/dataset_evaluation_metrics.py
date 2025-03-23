@@ -1,4 +1,3 @@
-import json
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -6,6 +5,9 @@ from transformers import AutoTokenizer, AutoModel
 import ot  # Optimal Transport library
 import Levenshtein # Token Edit
 import math
+import tqdm
+
+from utils.batch import find_executable_batch_size
 
 # Load Sentence T5 model and tokenizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,6 +60,7 @@ def compute_levenshtein_distance(s1, s2):
     """
     return Levenshtein.distance(s1, s2)
 
+
 def dataset_levenshtein_closest_pair_statistics(dataset_A, dataset_B):
     """
     For each example in dataset_A, compute the Levenshtein distance to every example in dataset_B.
@@ -91,7 +94,7 @@ def dataset_levenshtein_closest_pair_statistics(dataset_A, dataset_B):
         "average_distance": sum(min_distances) / len(min_distances),
         "min_distance": min(min_distances),
         "max_distance": max(min_distances),
-        "closest_pairs": closest_pairs
+        # "closest_pairs": closest_pairs
     }
     return stats
 
@@ -100,8 +103,6 @@ def dataset_levenshtein_closest_pair_statistics(dataset_A, dataset_B):
 ##############################
 # Embedding-Based OT Metrics
 ##############################
-
-
 def mean_pooling(model_output, attention_mask):
     """
     Perform mean pooling over token embeddings, accounting for the attention mask.
@@ -113,7 +114,9 @@ def mean_pooling(model_output, attention_mask):
     sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
     return sum_embeddings / sum_mask
 
-def get_sentence_embeddings(texts, tokenizer, model, device):
+
+@find_executable_batch_size
+def get_sentence_embeddings(texts, tokenizer, model, device, batch_size=128):
     """
     Compute sentence embeddings for a list of texts using the provided Sentence T5 model.
     Uses mean pooling over the token embeddings and then normalizes the embeddings.
@@ -121,11 +124,18 @@ def get_sentence_embeddings(texts, tokenizer, model, device):
     """
     encoded_input = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
     encoded_input = {key: val.to(device) for key, val in encoded_input.items()}
-    with torch.no_grad():
-        model_output = model.encoder(**encoded_input)
-    embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
-    embeddings = F.normalize(embeddings, p=2, dim=1)
-    return embeddings.cpu().numpy()
+    all_embeddings = []
+    pbar = tqdm.trange(0, len(texts), batch_size, desc="Computing sentence embeddings", colour="GREEN")
+    for i in pbar:
+        batch_texts = texts[i:i+batch_size]
+        encoded_input = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt")
+        encoded_input = {key: val.to(device) for key, val in encoded_input.items()}
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            model_output = model.encoder(**encoded_input)
+        embeddings = mean_pooling(model_output, encoded_input["attention_mask"])
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        all_embeddings.append(embeddings.cpu().numpy())
+    return np.concatenate(all_embeddings, axis=0)
 
 def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
     """
@@ -144,7 +154,7 @@ def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model
     n = emb_B.shape[0]
     wA = np.ones(m) / m
     wB = np.ones(n) / n
-    cost_matrix = ot.dist(emb_A, emb_B, metric='euclidean')
+    cost_matrix = ot.dist(emb_A, emb_B, metric='sqeuclidean')
     distance = ot.emd2(wA, wB, cost_matrix)
     return distance
 
@@ -166,12 +176,12 @@ def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer
     n = emb_B.shape[0]
     wA = np.ones(m) / m
     wB = np.ones(n) / n
-    cost_matrix = ot.dist(emb_A, emb_B, metric='euclidean')
+    cost_matrix = ot.dist(emb_A, emb_B, metric='sqeuclidean')
     distance = ot.sinkhorn2(wA, wB, cost_matrix, reg)
     return distance
 
 
-def evaluate_datasets(reference_dataset, recovered_dataset, output_filename):
+def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset: list[str]) -> dict[str, float]:
     """
     Evaluate two datasets (reference and recovered) using dataset-level OT metrics,
     and save the results to a JSON file.
@@ -184,8 +194,6 @@ def evaluate_datasets(reference_dataset, recovered_dataset, output_filename):
     Returns:
       - results (dict): A dictionary containing the computed metrics.
     """
-    
-
     full_ot_distance = dataset_level_full_ot(
         reference_dataset, recovered_dataset,
         tokenizer=tokenizer, model=model, device=device
@@ -208,11 +216,8 @@ def evaluate_datasets(reference_dataset, recovered_dataset, output_filename):
         "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_score,
         "levenshtein_stats": levenshtein_stats
     }
-    
-    with open(output_filename, "w") as f:
-        json.dump(results, f, indent=4)
-    
     return results
+
 
 def dummy_test():
     """
@@ -232,8 +237,7 @@ def dummy_test():
         "The quick brown fox leaps over the lazy dog."
     ]
     
-    results = evaluate_datasets(dataset_A, dataset_B, "dummy_evaluation_results.json")
-    print("Dummy evaluation results saved to dummy_evaluation_results.json")
+    results = evaluate_dataset_similarity(dataset_A, dataset_B)
     print("Evaluation Metrics:")
     print(results)
 

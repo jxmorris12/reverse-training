@@ -225,7 +225,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             self, 
             grads_db: BatchedExactVectorDatabase,
             last_layer_base_params: torch.Tensor,
-            last_layer_expert_model_params: torch.Tensor
+            last_layer_expert_model_params: torch.Tensor,
+            grad_recompute_steps: int = 32,
         ) -> list:
         """Greedily fill a batch with examples that have the most influence on optimization direction.
         
@@ -246,7 +247,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
         og_grads_db_vectors = grads_db.vectors.clone()
-        recalculate_steps = 32
         
         full_resolution_batch_gradient = torch.zeros_like(last_layer_base_params)
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
@@ -275,8 +275,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch_grad_proj = self.projector.project(batch_grad, model_id=0)
             grads_db.vectors += batch_grad_proj
 
-            if len(batch) % recalculate_steps == 0:
-                last_n_batch = batch[-recalculate_steps:]
+            if len(batch) % grad_recompute_steps == 0:
+                last_n_batch = batch[-grad_recompute_steps:]
                 full_grad = get_grads_final_layer(
                     self.base_model, 
                     self.seed_dataset_train_split.select(last_n_batch), 

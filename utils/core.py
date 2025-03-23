@@ -389,6 +389,7 @@ def _train_expert_model_uncached(
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
         early_stopping_patience: int = 10,
+        num_eval_datapoints: int = 1024,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
@@ -397,7 +398,7 @@ def _train_expert_model_uncached(
     tokenizer.padding_side = "left" 
 
     train_ds = ds["train"]
-    eval_ds = ds["test"].select(range(1000))
+    eval_ds = ds["test"].select(range(num_eval_datapoints))
 
     optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
 
@@ -507,7 +508,6 @@ def _train_expert_model_uncached(
 
         # print(f"[Epoch {epoch} | Step {step}] | Eval loss: {eval_loss:.3f} | Eval accuracy: {eval_accuracy:.3f}")
         tqdm.tqdm.write(f"[Epoch {epoch} | Step {step}] | Eval loss: {eval_loss:.3f} | Eval accuracy: {eval_accuracy:.3f}")
-        
         expert_state_dicts.append(_get_state_dict(student_net))
         
         # Check for early stopping
