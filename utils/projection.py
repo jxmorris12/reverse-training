@@ -273,7 +273,7 @@ def get_grads_final_layer(
         "do_projection": do_projection,
         "model_cache_key": model_cache_key,
     }
-    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     full_cache_key = _get_cache_key(**hash_kwargs)
     cache_key = hashlib.sha256(full_cache_key.encode()).hexdigest()

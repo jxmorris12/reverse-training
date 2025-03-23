@@ -7,6 +7,7 @@ import random
 import time
 import os
 import pickle
+import warnings
 
 import datasets
 import torch
@@ -76,6 +77,39 @@ def get_token_embeddings_from_dataset(dataset_size: int, sequence_length: int, d
     return (token_embeddings_syn, token_labels_syn)
 
 
+def get_token_embeddings_from_classification_dataset(dataset_size: int, sequence_length: int, classification_dataset) -> tuple[torch.Tensor, torch.Tensor]:
+    """ initialize the synthetic data from a ClassificationDataset """
+    ds = classification_dataset.dataset
+    text_column_name = classification_dataset.text_column_name
+    
+    student_net = get_model("gpt2")
+    student_net.train()
+    student_token_embeddings = student_net.get_input_embeddings().to(device)
+    hidden_size = student_token_embeddings.weight.shape[1]
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.truncation_side = "left" # important for correct truncation
+    tokenizer.padding_side = "left" 
+    tokens = tokenizer.batch_encode_plus(
+        ds[text_column_name][0:dataset_size],
+        return_tensors="pt", 
+        padding="max_length", 
+        truncation=True, 
+        max_length=sequence_length-1, 
+        return_attention_mask=False
+    )
+    token_embeddings_syn = student_token_embeddings(tokens["input_ids"].to(device))
+    assert token_embeddings_syn.shape == (dataset_size, sequence_length - 1, hidden_size), f"invalid shape: {token_embeddings_syn.shape}, need {(dataset_size, sequence_length - 1, hidden_size)}"
+
+    num_classes = 4
+    CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device)
+    token_labels_syn = torch.randint(low=0, high=num_classes, size=[dataset_size], device=device)
+    token_labels_syn = CLASS_MAP[token_labels_syn]
+
+    return (token_embeddings_syn, token_labels_syn)
+
+
 def get_token_embeddings_random_soft(student_net: transformers.AutoModel, dataset_size: int, sequence_length: int,) -> tuple[torch.Tensor, torch.Tensor]:
     """ initialize the synthetic data """
     student_token_embeddings = student_net.get_input_embeddings().to(device)
@@ -114,6 +148,7 @@ def _autolabel_dataset_uncached(
         model: transformers.PreTrainedModel,
         tokenizer: transformers.PreTrainedTokenizer,
         sequence_length: int,
+        label_map: dict[str, str],
         batch_size: int = 32,
     ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
@@ -131,7 +166,20 @@ def _autolabel_dataset_uncached(
     model.eval()
     model.to(device)
     all_labels = []
-    
+
+    valid_tokens = tokenizer.batch_encode_plus(
+        label_map.values(),
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=sequence_length,
+    )["input_ids"].to(device)
+    print(f"[autolabel_dataset] valid_tokens: {valid_tokens}")
+    breakpoint()
+
+    invalid_tokens_mask = torch.ones_like(valid_tokens, dtype=torch.bool)
+    invalid_tokens_mask[:, valid_tokens] = False
+
     for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset", colour="RED"):
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
@@ -150,6 +198,11 @@ def _autolabel_dataset_uncached(
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(**inputs)
             logits = outputs.logits[:, sequence_length-1, :] # Get logits for sequence_length-th token
+
+            # Set logits of invalid tokens to -float("inf")
+            logits[:, invalid_tokens_mask] = -float("inf")
+            breakpoint()
+            
             predictions = torch.argmax(logits, dim=-1)
             all_labels.append(predictions.cpu())
     
@@ -161,8 +214,9 @@ def autolabel_dataset(
         model: transformers.PreTrainedModel,
         tokenizer: transformers.PreTrainedTokenizer,
         sequence_length: int,
+        label_map: dict[str, str],
     ) -> torch.Tensor:
-    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
 
     hash_kwargs = {
@@ -170,13 +224,20 @@ def autolabel_dataset(
         "model_hash": hash_model_params(model),
         "tokenizer_hash": tokenizer.name_or_path,
         "sequence_length": sequence_length,
+        "label_map": "_".join(sorted(label_map.items())),
     }
     cache_key = _get_cache_key(**hash_kwargs)
     print(f"Autolabeling dataset with cache key: {cache_key}")
     cache_path = os.path.join(cache_dir, f"autolabel_dataset_{cache_key}.npz")
 
     if not os.path.exists(cache_path):
-        labels = _autolabel_dataset_uncached(dataset, model, tokenizer, sequence_length)
+        labels = _autolabel_dataset_uncached(
+            dataset=dataset, 
+            model=model, 
+            tokenizer=tokenizer, 
+            sequence_length=sequence_length,
+            label_map=label_map,
+        )
         np.savez(cache_path, labels=labels.numpy())
     
     labels = np.load(cache_path)["labels"]
@@ -341,8 +402,7 @@ def _train_expert_model_uncached(
     train_ds = ds["train"]
     eval_ds = ds["test"].select(range(1000))
 
-    # optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
-    optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
+    optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
 
     expert_state_dicts = [_get_state_dict(student_net)]
     step = 0
@@ -504,7 +564,7 @@ def train_expert_model(
     """Train expert models with caching based on input parameters."""
     
     # Create cache directory if it doesn't exist
-    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     
     # Generate cache key based on all parameters
@@ -592,6 +652,15 @@ def project_x_to_embedding_space(
 
 
 def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, str]:
+    """
+    DEPRECATED: Use ClassificationDataset.from_dataset_name(dataset_name) instead.
+    """
+    warnings.warn(
+        "load_dataset_from_name is deprecated. Use ClassificationDataset.from_dataset_name instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     if dataset_name == "ag_news":
         ds = datasets.load_dataset("fancyzhx/ag_news")
         text_column_name = "text"        

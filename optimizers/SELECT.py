@@ -11,6 +11,7 @@ from utils import (
     device, 
     get_model,
     load_dataset_from_name,
+    ClassificationDataset,
 )
 from utils.projection import (
     CudaProjector,
@@ -38,12 +39,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         syn_lr = torch.tensor(self.args.lr_teacher).to(device)
         self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
-        # Load search dataset
-        self.dataset, self.dataset_text_column_name, __ = (
-            load_dataset_from_name(self.args.select_seed_dataset)
-        )
-        self.dataset = self.dataset["train"]
-        print(f"SELECTOptimizer: dataset size: {len(self.dataset)}")
 
         # Setup projector
         param_count = sum(p.numel() for p in self.base_model.lm_head.parameters())
@@ -59,22 +54,17 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         self.best_idx_counter = collections.Counter()
         self.batch = []
-        self.optimizer = torch.optim.SGD(
-            self.base_model.parameters(), 
-            lr=self.args.select_lr_student
-        )
+        self.optimizer = torch.optim.Adam(self.base_model.parameters(), lr=self.args.select_lr_student)
         self.steps_since_last_improvement = 0
         self.best_mse = float("inf")
         self.tokenization_cache = {}
         self.Y = None
-        self.dataset_labels = None
-        # TODO: Make this dynamic
-        self.dataset_label_map = {
-            "0": "World",
-            "1": "Sports",
-            "2": "Business",
-            "3": "Sci/Tech",
-        }
+
+        # Load search dataset
+        self.seed_dataset = ClassificationDataset.from_dataset_name(self.args.select_seed_dataset)
+        self.seed_dataset_train = self.seed_dataset.dataset["train"]
+        print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train)}")
+        self.dataset_autolabels = None
     
     def _rank_dataset_by_influence(
             self, 
@@ -82,13 +72,13 @@ class SELECTOptimizer(DiscreteOptimizer):
             last_layer_base_params, last_layer_expert_model_params
         ) -> list:
         """Rank dataset examples by influence on optimization direction"""
-        assert self.args.select_full_dataset_size <= len(self.dataset), \
-            f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.dataset)}"
+        assert self.args.select_full_dataset_size <= len(self.seed_dataset_train), \
+            f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.seed_dataset_train)}"
     
 
         # If we're using random batch fill strategy, we can already return the random batch
         if self.args.select_batch_fill_strategy == "random":
-            return random.sample(range(len(self.dataset)), k=self.args.select_full_dataset_size)
+            return random.sample(range(len(self.seed_dataset_train)), k=self.args.select_full_dataset_size)
 
         # Get all gradients
         base_model = copy.deepcopy(self.base_model)
@@ -107,8 +97,8 @@ class SELECTOptimizer(DiscreteOptimizer):
 
             batch_grads = get_grads_final_layer(
                 base_model, 
-                self.dataset, 
-                self.dataset_labels,
+                self.seed_dataset_train, 
+                self.dataset_autolabels,
                 self.tokenizer, 
                 self.projector,
                 sequence_length=self.args.sequence_length, 
@@ -123,8 +113,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
-        assert grads.shape == (len(self.dataset), projection_dim), \
-            f"grads.shape: {grads.shape} != (len(self.dataset), projection_dim): {(len(self.dataset), projection_dim)}"
+        assert grads.shape == (len(self.seed_dataset_train), projection_dim), \
+            f"grads.shape: {grads.shape} != (len(self.seed_dataset_train), projection_dim): {(len(self.seed_dataset_train), projection_dim)}"
         
         # Fill batch using greedy algorithm
         if self.args.select_batch_fill_strategy == "greedy":
@@ -147,7 +137,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                 reverse=True,
             )
         elif self.args.select_batch_fill_strategy == "random":
-            batch = random.choices(range(len(self.dataset)), k=self.args.select_full_dataset_size)
+            batch = random.choices(range(len(self.seed_dataset_train)), k=self.args.select_full_dataset_size)
         else:
             raise ValueError(f"Invalid batch fill strategy: {self.args.select_batch_fill_strategy}")
         
@@ -225,8 +215,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             # Compute full-resolution gradient
             batch_grad = get_grads_final_layer(
                 self.base_model, 
-                self.dataset.select([best_idx]), 
-                self.dataset_labels[None, best_idx],
+                self.seed_dataset_train.select([best_idx]), 
+                self.dataset_autolabels[None, best_idx],
                 self.tokenizer, 
                 self.projector, 
                 sequence_length=self.args.sequence_length, 
@@ -269,7 +259,7 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         # Take step on batch
         inputs = self.tokenizer(
-            self.dataset.select(minibatch)["text"],
+            self.seed_dataset_train.select(minibatch)["text"],
             return_tensors="pt",
             padding="max_length",
             truncation=True,
@@ -282,7 +272,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                 - 
                 100
             )
-            last_token_labels = self.dataset_labels[minibatch][:, None].to(device)
+            last_token_labels = self.dataset_autolabels[minibatch][:, None].to(device)
             inputs["labels"] = torch.cat([no_labels, last_token_labels], dim=1)
         else:
             inputs["labels"] = inputs["input_ids"].detach().clone()
@@ -327,17 +317,18 @@ class SELECTOptimizer(DiscreteOptimizer):
         return metrics
 
     def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if self.args.select_do_classification and self.dataset_labels is None:
+        if self.args.select_do_classification and self.dataset_autolabels is None:
             # Get labels from expert model
             expert_state_dict = buffer[-1]
             expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"].to(device)
             expert_model = copy.deepcopy(self.base_model)
             expert_model.load_state_dict(expert_state_dict)
-            self.dataset_labels = autolabel_dataset(
-                dataset=self.dataset, 
+            self.dataset_autolabels = autolabel_dataset(
+                dataset=self.seed_dataset_train,
                 model=expert_model, 
                 tokenizer=self.tokenizer, 
                 sequence_length=self.args.sequence_length,
+                label_map=self.seed_dataset.label_map,
             )
             expert_state_dict.pop("lm_head.weight")
             
@@ -346,7 +337,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             self._tokenize_dataset_cached(i)
             for i in self.batch
         ])
-        self.Y = self.dataset_labels[self.batch]
+        self.Y = self.dataset_autolabels[self.batch]
         return X_tokens, metrics
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:
@@ -359,7 +350,9 @@ class SELECTOptimizer(DiscreteOptimizer):
             Tokenized text as tensor
         """
         if i not in self.tokenization_cache:
-            text = self.dataset[i][self.dataset_text_column_name]
+            text = self.seed_dataset_train[i][
+                self.seed_dataset.text_column_name
+            ]
             tokens = self.tokenizer(
                 text,
                 return_tensors="pt",

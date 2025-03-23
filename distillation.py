@@ -15,10 +15,12 @@ from utils import (
     get_model, 
     get_world_size,
     get_token_embeddings_random_soft,
-    get_token_embeddings_from_dataset, 
+    get_token_embeddings_from_dataset,
+    get_token_embeddings_from_classification_dataset, 
     load_dataset_from_name, 
     train_expert_model,
-    trange_if_main_worker
+    trange_if_main_worker,
+    ClassificationDataset,
 )
 
 
@@ -32,7 +34,7 @@ class DatasetDistiller:
         self.tokenizer = tokenizer
         self.initial_student_net = get_model("gpt2")
         self.student_net = ReparamModule(get_model("gpt2")).to(device)
-        self.ds, self.ds_text_column_name, self.ds_label_column_name = self._load_dataset()
+        self.classification_dataset = self._load_dataset()
         self.dataset_token_counts = None
 
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -66,22 +68,18 @@ class DatasetDistiller:
             X = torch.cat(X, dim=0)
             Y = torch.cat(Y, dim=0)
         elif self.args.token_init == "dataset":
-            X, Y = get_token_embeddings_from_dataset(
+            X, Y = get_token_embeddings_from_classification_dataset(
                 dataset_size=self.args.dataset_size, 
                 sequence_length=self.args.sequence_length,
-                ds=self.ds, 
-                text_column_name=self.ds_text_column_name
+                classification_dataset=self.classification_dataset
             )
         else:
             raise NotImplementedError(f"Token init {self.args.token_init} not implemented")
         X = X.detach().to(device).requires_grad_(True)
         return X, Y
     
-    def _load_dataset(self) -> tuple[datasets.Dataset, str, str]:
-        dataset, text_column_name, label_column_name = load_dataset_from_name(
-            self.args.dataset
-        )
-        return dataset, text_column_name, label_column_name
+    def _load_dataset(self) -> ClassificationDataset:
+        return ClassificationDataset.from_dataset_name(self.args.dataset)
     
     def _init_discrete_optimizer(self):
         X, Y = self._init_synthetic_data()
@@ -123,14 +121,16 @@ class DatasetDistiller:
             )
         else:
             raise NotImplementedError(f"Optimizer {self.args.discrete_optimizer} not implemented")
-        self.dataset_label_map = optimizer.dataset_label_map
+        
+        # Use label map from the classification dataset
+        optimizer.dataset_label_map = self.classification_dataset.label_map
         return optimizer
     
     def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
         tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
         if labels is not None:
             labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
-            labels = list(map(lambda x: self.dataset_label_map.get(x.strip(), "[?]"), labels))
+            labels = list(map(lambda x: self.classification_dataset.label_map.get(x.strip(), "[?]"), labels))
         else:
             labels = [""] * len(tokens)
         table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
@@ -164,9 +164,9 @@ class DatasetDistiller:
             num_expert_datapoints=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
-            ds=self.ds,
-            text_column_name=self.ds_text_column_name,
-            label_column_name=self.ds_label_column_name,
+            ds=self.classification_dataset.dataset,
+            text_column_name=self.classification_dataset.text_column_name,
+            label_column_name=self.classification_dataset.label_column_name,
             ds_tokens=tokens,
             ds_labels=labels,
         )
@@ -197,9 +197,9 @@ class DatasetDistiller:
             num_expert_datapoints=self.args.minibatch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
-            ds=self.ds,
-            text_column_name=self.ds_text_column_name,
-            label_column_name=self.ds_label_column_name,
+            ds=self.classification_dataset.dataset,
+            text_column_name=self.classification_dataset.text_column_name,
+            label_column_name=self.classification_dataset.label_column_name,
         )
         self.dataset_token_counts = dataset_token_counts.cpu()
 
