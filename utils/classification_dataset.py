@@ -83,20 +83,20 @@ class ClassificationDataset:
         }
     
     @classmethod
-    def from_dataset_name(cls, dataset_name: str):
+    def from_dataset_name(cls, dataset_name: str, seed: int = 42):
         """
         Create a ClassificationDataset from a named dataset.
         
         Args:
             dataset_name: The name of the dataset to load
+            seed: The seed to use for the train-test split
             
         Returns:
             A ClassificationDataset object
         """
-        # The dataset loading logic from load_dataset_from_name
         if dataset_name == "ag_news":
             ds = datasets.load_dataset("fancyzhx/ag_news")
-            ds = ds["train"].train_test_split(test_size=0.1, seed=42)
+            ds = ds["train"].train_test_split(test_size=0.1, seed=seed)
             text_column_name = "text"        
             label_column_name = "label"
             label_map = {
@@ -108,7 +108,7 @@ class ClassificationDataset:
         elif dataset_name.startswith("ag_news_") and dataset_name[8:].isdigit():
             num_samples = int(dataset_name[8:])
             ds = datasets.load_dataset("fancyzhx/ag_news")
-            ds = ds["train"].train_test_split(test_size=0.1, seed=42)
+            ds = ds["train"].train_test_split(test_size=0.1, seed=seed)
             assert len(ds["train"]) >= num_samples, f"Dataset {dataset_name} has only {len(ds['train'])} samples"
             ds["train"] = ds["train"].select(range(num_samples))
             text_column_name = "text"
@@ -121,7 +121,7 @@ class ClassificationDataset:
             }
         elif dataset_name == "dbpedia":
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
-            ds = ds.train_test_split(test_size=0.1, seed=42)
+            ds = ds.train_test_split(test_size=0.1, seed=seed)
             ds["train"] = ds["train"].map(_make_dbpedia_text)
             text_column_name = "text"
             label_column_name = "label"
@@ -133,7 +133,7 @@ class ClassificationDataset:
         elif dataset_name.startswith("dbpedia_") and dataset_name[8:].isdigit():
             num_samples = int(dataset_name[8:])
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
-            ds = ds.train_test_split(test_size=0.1, seed=42)
+            ds = ds.train_test_split(test_size=0.1, seed=seed)
             ds["train"] = ds["train"].select(range(num_samples))
             text_column_name = "text"
             label_column_name = "label"
@@ -144,7 +144,7 @@ class ClassificationDataset:
             }
         elif dataset_name == "nq":
             ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
-            ds = ds.train_test_split(test_size=0.1, seed=42)
+            ds = ds.train_test_split(test_size=0.1, seed=seed)
             text_column_name = "text"
             label_column_name = None
             label_map = None
@@ -152,7 +152,7 @@ class ClassificationDataset:
             # Handle nq_BBB where BBB is any integer
             num_samples = int(dataset_name[3:])
             ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
-            ds = ds.train_test_split(test_size=0.1, seed=42)
+            ds = ds.train_test_split(test_size=0.1, seed=seed)
             ds["train"] = ds["train"].select(range(num_samples))
             text_column_name = "text"
             label_column_name = None

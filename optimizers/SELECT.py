@@ -68,7 +68,7 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         # Load search dataset
         self.true_classification_dataset = true_classification_dataset
-        self.seed_dataset = ClassificationDataset.from_dataset_name(self.args.select_seed_dataset)
+        self.seed_dataset = ClassificationDataset.from_dataset_name(self.args.select_seed_dataset, seed=self.args.seed)
         self.seed_dataset_train_split = self.seed_dataset.dataset["train"]
         print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None

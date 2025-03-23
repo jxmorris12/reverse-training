@@ -591,12 +591,16 @@ def train_expert_model(
     # Check if cached result exists
     if os.path.exists(cache_path) and not uncachable_args_provided:
         print0(f"Loading cached expert model results from {cache_path}")
-        with open(cache_path, "rb") as f:
-            expert_state_dicts, all_token_counts, final_evaluation_metrics = pickle.load(f)
-        print0(f"Loaded cached expert model results from {cache_path} - "
-               f"best eval loss: {final_evaluation_metrics['best_eval_loss']:.3f} / " 
-               f"best eval accuracy: {final_evaluation_metrics['best_eval_accuracy']:.3f}")
-        return expert_state_dicts, all_token_counts, final_evaluation_metrics
+        try:
+            with open(cache_path, "rb") as f:
+                expert_state_dicts, all_token_counts, final_evaluation_metrics = pickle.load(f)
+            print0(f"Loaded cached expert model results from {cache_path} - "
+                f"best eval loss: {final_evaluation_metrics['best_eval_loss']:.3f} / " 
+                f"best eval accuracy: {final_evaluation_metrics['best_eval_accuracy']:.3f}")
+            return expert_state_dicts, all_token_counts, final_evaluation_metrics
+        except Exception as e:
+            print0(f"Error loading cached expert model results from {cache_path}: {e}")
+            pass
     
     # If not cached, run training and cache results
     num_datapoints = len(ds_tokens) if ds_tokens is not None else len(ds["train"])
@@ -653,48 +657,6 @@ def project_x_to_embedding_space(
     Z_tokens = torch.cat(Z_tokens, dim=0)
     return Z, Z_tokens
 
-
-def load_dataset_from_name(dataset_name: str) -> tuple[datasets.Dataset, str, str]:
-    """
-    DEPRECATED: Use ClassificationDataset.from_dataset_name(dataset_name) instead.
-    """
-    warnings.warn(
-        "load_dataset_from_name is deprecated. Use ClassificationDataset.from_dataset_name instead.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    
-    if dataset_name == "ag_news":
-        ds = datasets.load_dataset("fancyzhx/ag_news")
-        text_column_name = "text"        
-        label_column_name = "label"
-    elif dataset_name.startswith("ag_news_") and dataset_name[8:].isdigit():
-        num_samples = int(dataset_name[8:])
-        ds = datasets.load_dataset("fancyzhx/ag_news")
-        ds = ds.train_test_split(test_size=0.1, seed=42)
-        ds["train"] = ds["train"].select(range(num_samples))
-        text_column_name = "text"
-        label_column_name = "label"
-    elif dataset_name == "nq":
-        ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
-        ds = ds.train_test_split(test_size=0.1, seed=42)
-        text_column_name = "text"
-        label_column_name = None
-    elif dataset_name.startswith("nq_") and dataset_name[3:].isdigit():
-        # Handle nq_BBB where BBB is any integer
-        num_samples = int(dataset_name[3:])
-        ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
-        ds = ds.train_test_split(test_size=0.1, seed=42)
-        ds["train"] = ds["train"].select(range(num_samples))
-        text_column_name = "text"
-        label_column_name = None
-    elif dataset_name == "msmarco":
-        ds = datasets.load_dataset("Tevatron/msmarco-passage-corpus")
-        text_column_name = "text"
-        label_column_name = None
-    else:
-        raise NotImplementedError(f"Dataset {dataset_name} not implemented")
-    return ds, text_column_name, label_column_name
 
 def get_world_size() -> int:
     try:

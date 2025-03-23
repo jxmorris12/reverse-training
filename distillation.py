@@ -226,13 +226,13 @@ class DatasetDistiller:
                 break
 
         print("Stopping distillation...")
-        self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
+        final_evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
         wandb.finish()
 
         output = { 
             "args": dict(vars(self.args)),
             "expert_evaluation_metrics": expert_evaluation_metrics,
-            "evaluation_metrics": all_evaluation_metrics,
+            "evaluation_metrics": final_evaluation_metrics,
         }
 
         # clear cache oncemore
@@ -261,7 +261,7 @@ class DatasetDistiller:
             **dataset_evaluation_metrics,
             **output,
         }
-        output_dir = os.path.join(os.path.dirname(__file__), "saves")
+        output_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(output_dir, exist_ok=True)
         pkl_path = os.path.join(output_dir, f"{self.args.exp_name}.pkl")
         with open(pkl_path, "wb") as f:
