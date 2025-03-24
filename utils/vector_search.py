@@ -38,10 +38,12 @@ class ExactVectorDatabase(VectorDatabase):
 
 
 class BatchedExactVectorDatabase(VectorDatabase):
+    # supports a batch dimension, auto-takes a max
+    # vectors.shape = (num_databases, database_size, num_vectors)
     def __init__(self, vectors: torch.Tensor, batch_size: int = 100_000):
         super().__init__(vectors.to(torch.float16))
         self.batch_size = batch_size
-        self.ignore_mask = torch.zeros(vectors.shape[0], dtype=bool)
+        self.ignore_mask = torch.zeros(vectors.shape[1], dtype=bool)
         self.vectors = self.vectors.to(device)
         
     def search(self, query_vector: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -51,14 +53,18 @@ class BatchedExactVectorDatabase(VectorDatabase):
             
         # Setup tensors to store results
         all_sims = []
-        num_vectors = self.vectors.shape[0]
+        num_vectors = self.vectors.shape[1]
+
+        query_vector_norm = query_vector / query_vector.norm(dim=0, keepdim=True)
         
         # Process in batches
         for i in range(0, num_vectors, self.batch_size):
             # Get current batch
             end_idx = min(i + self.batch_size, num_vectors)
-            batch_vectors = self.vectors[i:end_idx].to(device)
-            batch_sims = torch.nn.functional.cosine_similarity(batch_vectors, query_vector, dim=1)
+            batch_vectors = self.vectors[:, i:end_idx].to(device)
+            batch_vectors_norm = batch_vectors / batch_vectors.norm(dim=0, keepdim=True)
+            batch_sims = batch_vectors_norm @ query_vector_norm.T
+            batch_sims = batch_sims.max(dim=0).values
             all_sims.append(batch_sims.flatten())
         
         # Combine all batches

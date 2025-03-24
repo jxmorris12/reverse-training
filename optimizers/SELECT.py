@@ -151,13 +151,13 @@ class SELECTOptimizer(DiscreteOptimizer):
             )
             grads.append(batch_grads)
         
-        grads = torch.stack(grads, dim=0).double().mean(dim=0).float()
+        grads = torch.stack(grads, dim=0)
         grads_db = BatchedExactVectorDatabase(grads)
         
         # Sanity check dimensions
         projection_dim = self.args.select_projection_dim
-        assert grads.shape == (len(self.seed_dataset_train_split), projection_dim), \
-            f"grads.shape: {grads.shape} != (len(self.seed_dataset_train_split), projection_dim): {(len(self.seed_dataset_train_split), projection_dim)}"
+        assert grads.shape == (self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim), \
+            f"grads.shape: {grads.shape} != (self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim): {(self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim)}"
         
         # Fill batch using greedy algorithm
         if self.args.select_batch_fill_strategy == "greedy":
@@ -309,35 +309,13 @@ class SELECTOptimizer(DiscreteOptimizer):
             grads_db.remove_vectors(best_idx)
 
             # Compute full-resolution gradient
-            grads_db.vectors += og_grads_db_vectors[None, best_idx]
+            # TODO: get actually best_idx (don't just set to 0)
+            grads_db.vectors += og_grads_db_vectors[:, best_idx].mean(dim=0, keepdim=True)
 
             if batched:
                 if len(batch) % self.args.minibatch_size == 0:
                     # reset vectors
                     grads_db.vectors = og_grads_db_vectors.clone()
-
-            if (not batched) and (len(batch) % grad_recompute_steps == 0):
-                last_n_batch = batch[-grad_recompute_steps:]
-                full_grad = None
-                for model, _ in pseudoexperts:
-                    batch_grad = get_grads_final_layer(
-                        model, 
-                        self.seed_dataset_train_split.select(last_n_batch), 
-                        self.dataset_autolabels[last_n_batch],
-                        self.tokenizer, 
-                        self.projector, 
-                        sequence_length=self.args.sequence_length,
-                        do_projection=False,
-                        use_cache=False,
-                    )
-                    if full_grad is None:
-                        full_grad = batch_grad.sum(dim=0)
-                    else:
-                        full_grad += batch_grad.sum(dim=0)
-                
-                full_resolution_batch_gradient += full_grad.to(device)
-                full_resolution_batch_gradient_proj = self.projector.project(full_resolution_batch_gradient, model_id=0)
-                grads_db.vectors = og_grads_db_vectors.clone() + full_resolution_batch_gradient_proj
 
             batch_pbar.update(1)
             batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)} | Current sim: {best_sim:.3f} | Overall best sim: {overall_best_sim:.3f}")
