@@ -227,7 +227,7 @@ def _get_grads_final_layer_uncached(
         else:
             all_grads.extend(grads_batch.cpu())
         
-    return torch.stack(all_grads) 
+    return torch.stack(all_grads).to(torch.float16)
 
 
 def get_grads_final_layer(
@@ -264,9 +264,9 @@ def get_grads_final_layer(
             do_projection
         )
     hash_kwargs = {
+        # TODO: hash labels...
         "student_net_hash": hash_model_params(student_net),
         "dataset_hash": dataset._fingerprint,
-        # TODO: hash labels...
         "tokenizer_hash": tokenizer.name_or_path,
         "projector_hash": projector.deterministic_hash(),
         "sequence_length": sequence_length,

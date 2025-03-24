@@ -77,7 +77,7 @@ class DatasetDistiller:
         return X, Y
     
     def _load_dataset(self) -> ClassificationDataset:
-        return ClassificationDataset.from_dataset_name(self.args.dataset)
+        return ClassificationDataset.from_dataset_name(self.args.dataset, seed=self.args.seed)
     
     def _init_discrete_optimizer(self):
         X, Y = self._init_synthetic_data()

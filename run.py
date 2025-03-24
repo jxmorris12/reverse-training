@@ -81,6 +81,7 @@ if __name__ == '__main__':
     parser.add_argument("--select_num_pseudoexperts", type=int, default=1, help="number of pseudoexperts to use in SELECT")
     parser.add_argument("--select_do_classification", type=bool, default=True, help="whether to do classification in SELECT")
     parser.add_argument("--select_batch_fill_strategy", type=str, default="greedy", help="strategy to fill the batch in SELECT", choices=["topk", "topk_balanced", "greedy", "random", "bottomk"])
+    parser.add_argument("--select_label_strategy", type=str, default="auto", choices=["auto", "random"])
     parser.add_argument("--num_eval_epochs", type=int, default=50, help="number of evaluation epochs")
 
 

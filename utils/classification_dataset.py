@@ -121,8 +121,7 @@ class ClassificationDataset:
             }
         elif dataset_name == "dbpedia":
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
-            ds = ds.train_test_split(test_size=0.1, seed=seed)
-            ds["train"] = ds["train"].map(_make_dbpedia_text)
+            ds = ds.map(_make_dbpedia_text)
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
@@ -133,14 +132,25 @@ class ClassificationDataset:
         elif dataset_name.startswith("dbpedia_") and dataset_name[8:].isdigit():
             num_samples = int(dataset_name[8:])
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
-            ds = ds.train_test_split(test_size=0.1, seed=seed)
+            ds = ds.map(_make_dbpedia_text)
             ds["train"] = ds["train"].select(range(num_samples))
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
                 "0": "Company",
-                "1": "Organization",
-                "2": "Location",
+                "1": "Educational Institution",
+                "2": "Artist",
+                "3": "Athlete",
+                "4": "Office Holder",
+                "5": "Mean Of Transportation",
+                "6": "Building",
+                "7": "Natural Place",
+                "8": "Village",
+                "9": "Animal",
+                "10": "Plant",
+                "11": "Album",
+                "12": "Film",
+                "13": "Written Work",
             }
         elif dataset_name == "nq":
             ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
@@ -159,6 +169,14 @@ class ClassificationDataset:
             label_map = None
         elif dataset_name == "msmarco":
             ds = datasets.load_dataset("Tevatron/msmarco-passage-corpus")
+            text_column_name = "text"
+            label_column_name = None
+            label_map = None
+        elif dataset_name.startswith("msmarco_") and dataset_name[8:].isdigit():
+            num_samples = int(dataset_name[8:])
+            ds = datasets.load_dataset("Tevatron/msmarco-passage-corpus")["train"]
+            ds = ds.train_test_split(test_size=0.1, seed=seed)
+            ds["train"] = ds["train"].select(range(num_samples))
             text_column_name = "text"
             label_column_name = None
             label_map = None

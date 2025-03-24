@@ -21,6 +21,43 @@ from utils.vector_search import (
     BatchedExactVectorDatabase,
 )
 
+def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor, full_expert_model_params: torch.Tensor, num_pseudoexperts: int) -> list[tuple[torch.nn.Module, int]]:
+    """Create pseudoexperts by interpolating between base and expert models.
+    
+    Args:
+        model: The model to update with pseudoexpert parameters, or None to just get params list
+        full_base_params: Flattened parameters of the base model
+        full_expert_model_params: Flattened parameters of the expert model
+        description: Optional description string for logging purposes
+        
+    Returns:
+        If model is None: List of pseudoexpert parameter tensors
+        If model is not None: Generator yielding (model, idx) tuples for each pseudoexpert
+    """
+    pseudoexpert_params_list = []
+    
+    for i in range(num_pseudoexperts):
+        step_frac = i / num_pseudoexperts
+        print(f"[create_pseudoexperts] Pseudoexpert {i}/{num_pseudoexperts} -> step_frac = {step_frac}")
+        
+        # Interpolate linearly from base model to expert model
+        pseudoexpert_params = (
+            (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
+        )
+        
+        pseudoexpert_params_list.append(pseudoexpert_params)
+        
+        # If model is provided, set its parameters to the current pseudoexpert
+        counter = 0
+        new_model = copy.deepcopy(model)
+        for p in new_model.parameters():
+            p.data = pseudoexpert_params[counter:counter+p.numel()].reshape(p.data.shape).to(p.data.dtype)
+            counter += p.numel()
+        
+        # Return the model with updated parameters for further processing
+        yield new_model, i
+    
+
 class SELECTOptimizer(DiscreteOptimizer):
     X: torch.Tensor
     Y: torch.Tensor
@@ -73,6 +110,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None
     
+    
     def _rank_dataset_by_influence(
             self, 
             full_base_params, full_expert_model_params,
@@ -90,21 +128,17 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get all gradients
         base_model = copy.deepcopy(self.base_model)
         grads = []
-        for i in range(self.args.select_num_pseudoexperts):
-            step_frac = i / self.args.select_num_pseudoexperts
-            print(f"[rank_dataset_by_influence] Pseudoexpert {i}/{self.args.select_num_pseudoexperts} -> step_frac = {step_frac}")
-            # Interpolate linearly from base model to expert model
-            pseudoexpert_params = (
-                (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
-            )
-            # Set params
-            counter = 0
-            for i, p in enumerate(base_model.parameters()):
-                p.data = pseudoexpert_params[counter:counter+p.numel()].reshape(p.data.shape).to(p.data.dtype)
-                counter += p.numel()
-
+        
+        # Use the new helper function to create pseudoexperts
+        pseudoexperts = _create_pseudoexperts(
+            base_model, 
+            full_base_params, 
+            full_expert_model_params, 
+            num_pseudoexperts=self.args.select_num_pseudoexperts
+        )
+        for model, i in pseudoexperts:
             batch_grads = get_grads_final_layer(
-                base_model, 
+                model, 
                 self.seed_dataset_train_split, 
                 self.dataset_autolabels,
                 self.tokenizer, 
@@ -247,6 +281,14 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
         og_grads_db_vectors = grads_db.vectors.clone()
+
+        # Use the new helper function to create pseudoexperts with last_layer params (with model=None to just get parameters)
+        pseudoexperts = _create_pseudoexperts(
+            self.base_model, 
+            last_layer_base_params, 
+            last_layer_expert_model_params, 
+            num_pseudoexperts=self.args.select_num_pseudoexperts
+        )
         
         full_resolution_batch_gradient = torch.zeros_like(last_layer_base_params)
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
@@ -261,33 +303,33 @@ class SELECTOptimizer(DiscreteOptimizer):
             grads_db.remove_vectors(best_idx)
 
             # Compute full-resolution gradient
-            batch_grad = get_grads_final_layer(
-                self.base_model, 
-                self.seed_dataset_train_split.select([best_idx]), 
-                self.dataset_autolabels[None, best_idx],
-                self.tokenizer, 
-                self.projector, 
-                sequence_length=self.args.sequence_length, 
-                do_projection=False,
-                use_cache=False,
-            ).to(device)
-            # add to everything
-            batch_grad_proj = self.projector.project(batch_grad, model_id=0)
-            grads_db.vectors += batch_grad_proj
+            grads_db.vectors += og_grads_db_vectors[None, best_idx]
 
             if len(batch) % grad_recompute_steps == 0:
                 last_n_batch = batch[-grad_recompute_steps:]
-                full_grad = get_grads_final_layer(
-                    self.base_model, 
-                    self.seed_dataset_train_split.select(last_n_batch), 
-                    self.dataset_autolabels[last_n_batch],
-                    self.tokenizer, 
-                    self.projector, 
-                    sequence_length=self.args.sequence_length,
-                    do_projection=False,
-                    use_cache=False,
-                )
-                full_resolution_batch_gradient += full_grad.sum(dim=0).to(device)
+                current_state_dict = copy.deepcopy(self.base_model.state_dict())
+
+                full_grad = None
+                for model, _ in pseudoexperts:
+                    batch_grad = get_grads_final_layer(
+                        model, 
+                        self.seed_dataset_train_split.select(last_n_batch), 
+                        self.dataset_autolabels[last_n_batch],
+                        self.tokenizer, 
+                        self.projector, 
+                        sequence_length=self.args.sequence_length,
+                        do_projection=False,
+                        use_cache=False,
+                    )
+                    if full_grad is None:
+                        full_grad = batch_grad.sum(dim=0)
+                    else:
+                        full_grad += batch_grad.sum(dim=0)
+                
+                # Restore original model state
+                self.base_model.load_state_dict(current_state_dict)
+                
+                full_resolution_batch_gradient += full_grad.to(device)
                 full_resolution_batch_gradient_proj = self.projector.project(full_resolution_batch_gradient, model_id=0)
                 grads_db.vectors = og_grads_db_vectors + full_resolution_batch_gradient_proj
 
@@ -308,7 +350,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         last_layer_expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items() if "wte" in k]).double().to(device)
         
         # Update batch if needed
-        should_update_batch = (self.args.select_steps_per_grad > 0) and (it % self.args.select_steps_per_grad == 0)
+        should_update_batch = (self.args.select_steps_per_grad > 0) and (step % self.args.select_steps_per_grad == 0)
         if (not len(self.batch)) or should_update_batch:
             self.base_model.to(device)
             self.batch = self._rank_dataset_by_influence(
@@ -390,13 +432,23 @@ class SELECTOptimizer(DiscreteOptimizer):
             expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"].to(device)
             expert_model = copy.deepcopy(self.base_model)
             expert_model.load_state_dict(expert_state_dict)
-            self.dataset_autolabels = autolabel_dataset(
-                dataset=self.seed_dataset_train_split,
-                model=expert_model, 
-                tokenizer=self.tokenizer, 
-                sequence_length=self.args.sequence_length,
-                label_map=self.true_classification_dataset.label_map,
-            )
+            if self.args.select_label_strategy == "auto":
+                self.dataset_autolabels = autolabel_dataset(
+                    dataset=self.seed_dataset_train_split,
+                    model=expert_model, 
+                    tokenizer=self.tokenizer, 
+                    sequence_length=self.args.sequence_length,
+                    label_map=self.true_classification_dataset.label_map,
+                )
+            elif self.args.select_label_strategy == "random":
+                self.dataset_autolabels = torch.randint(
+                    0, 
+                    len(self.true_classification_dataset.label_map), 
+                    (len(self.seed_dataset_train_split),),
+                    device=device,
+                )
+            else:
+                raise ValueError(f"Invalid label strategy: {self.args.select_label_strategy}")
             expert_state_dict.pop("lm_head.weight")
             
         metrics = self.step_with_grad(step, buffer)
