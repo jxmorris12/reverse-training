@@ -151,7 +151,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             )
             grads.append(batch_grads)
         
-        grads = torch.stack(grads, dim=0).double().sum(dim=0).float()
+        grads = torch.stack(grads, dim=0).double().mean(dim=0).float()
         grads_db = BatchedExactVectorDatabase(grads)
         
         # Sanity check dimensions
@@ -166,6 +166,14 @@ class SELECTOptimizer(DiscreteOptimizer):
                 last_layer_base_params=last_layer_base_params,
                 last_layer_expert_model_params=last_layer_expert_model_params,
                 pseudoexperts=pseudoexperts,
+            )
+        elif self.args.select_batch_fill_strategy == "greedy_batched":
+            batch = self._fill_batch_greedy(
+                grads_db=grads_db,
+                last_layer_base_params=last_layer_base_params,
+                last_layer_expert_model_params=last_layer_expert_model_params,
+                pseudoexperts=pseudoexperts,
+                batched=True,
             )
         elif self.args.select_batch_fill_strategy == "topk":
             batch = self._fill_batch_topk(
@@ -265,6 +273,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             last_layer_expert_model_params: torch.Tensor,
             pseudoexperts: list[tuple[torch.nn.Module, int]],
             grad_recompute_steps: int = 32,
+            batched: bool = False,
         ) -> list:
         """Greedily fill a batch with examples that have the most influence on optimization direction.
         
@@ -302,7 +311,12 @@ class SELECTOptimizer(DiscreteOptimizer):
             # Compute full-resolution gradient
             grads_db.vectors += og_grads_db_vectors[None, best_idx]
 
-            if len(batch) % grad_recompute_steps == 0:
+            if batched:
+                if len(batch) % self.args.minibatch_size == 0:
+                    # reset vectors
+                    grads_db.vectors = og_grads_db_vectors.clone()
+
+            if (not batched) and (len(batch) % grad_recompute_steps == 0):
                 last_n_batch = batch[-grad_recompute_steps:]
                 full_grad = None
                 for model, _ in pseudoexperts:
@@ -435,12 +449,16 @@ class SELECTOptimizer(DiscreteOptimizer):
                     label_map=self.true_classification_dataset.label_map,
                 )
             elif self.args.select_label_strategy == "random":
-                self.dataset_autolabels = torch.randint(
-                    0, 
-                    len(self.true_classification_dataset.label_map), 
-                    (len(self.seed_dataset_train_split),),
-                    device=device,
+                tokenized_labels = torch.tensor(
+                    [self.tokenizer.encode(f" {x}")[0] for x in self.true_classification_dataset.label_map]
                 )
+                dataset_autolabels_idxs = torch.randint(
+                    0, 
+                    len(tokenized_labels), 
+                    (len(self.seed_dataset_train_split),),
+                    device="cpu",
+                )
+                self.dataset_autolabels = tokenized_labels[dataset_autolabels_idxs.cpu()]
             else:
                 raise ValueError(f"Invalid label strategy: {self.args.select_label_strategy}")
             expert_state_dict.pop("lm_head.weight")

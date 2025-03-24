@@ -80,7 +80,7 @@ def dataset_levenshtein_closest_pair_statistics(dataset_A, dataset_B):
     min_distances = []
     closest_pairs = []  # each element: (index_in_A, best_index_in_B, distance)
 
-    for i, text_A in enumerate(dataset_A):
+    for i, text_A in enumerate(tqdm.tqdm(dataset_A, desc="Computing Levenshtein distances", colour="RED", leave=False)):
         best_distance = math.inf
         best_j = None
         for j, text_B in enumerate(dataset_B):

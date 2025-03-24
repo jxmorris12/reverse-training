@@ -529,7 +529,6 @@ def _train_expert_model_uncached(
                     print(f"Early stopping triggered after {epoch+1} epochs (patience = {early_stopping_patience}, best eval accuracy = {best_eval_accuracy:.3f})")
                     break
 
-    breakpoint()
     # Run one more evaluation
     eval_loss, eval_accuracy = _eval_expert_model(
         student_net=student_net,
