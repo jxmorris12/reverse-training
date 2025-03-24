@@ -25,16 +25,21 @@ def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor
     """Create pseudoexperts by interpolating between base and expert models.
     
     Args:
-        model: The model to update with pseudoexpert parameters, or None to just get params list
+        model: The model to update with pseudoexpert parameters
         full_base_params: Flattened parameters of the base model
         full_expert_model_params: Flattened parameters of the expert model
-        description: Optional description string for logging purposes
+        num_pseudoexperts: Number of pseudoexperts to create
         
     Returns:
-        If model is None: List of pseudoexpert parameter tensors
-        If model is not None: Generator yielding (model, idx) tuples for each pseudoexpert
+        List of tuples containing (model, idx) for each pseudoexpert
     """
     pseudoexperts = []
+    
+    # Validate parameter counts
+    model_param_count = sum(p.numel() for p in model.parameters())
+    if full_base_params.numel() != model_param_count or full_expert_model_params.numel() != model_param_count:
+        raise ValueError(f"Parameter count mismatch: model has {model_param_count} parameters, "
+                         f"but got {full_base_params.numel()} base params and {full_expert_model_params.numel()} expert params")
     
     for i in range(num_pseudoexperts):
         step_frac = i / num_pseudoexperts
@@ -45,7 +50,7 @@ def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor
             (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
         )
         
-        # If model is provided, set its parameters to the current pseudoexpert
+        # Create a new model copy and set its parameters
         counter = 0
         new_model = copy.deepcopy(model)
         for p in new_model.parameters():
@@ -282,11 +287,13 @@ class SELECTOptimizer(DiscreteOptimizer):
         og_grads_db_vectors = grads_db.vectors.clone()
         full_resolution_batch_gradient = torch.zeros_like(last_layer_base_params)
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
+        overall_best_sim = float("-inf")
         while len(batch) < self.args.select_full_dataset_size:
             # Use cosine similarity to find best gradient
             best_sim, best_idx = grads_db.search(base_params_diff_projected, 1)
             best_idx = best_idx.item()
             best_sim = best_sim.item()
+            overall_best_sim = max(overall_best_sim, best_sim)
 
             # Add the selected gradient to our batch
             batch.append(best_idx)
@@ -297,10 +304,7 @@ class SELECTOptimizer(DiscreteOptimizer):
 
             if len(batch) % grad_recompute_steps == 0:
                 last_n_batch = batch[-grad_recompute_steps:]
-                current_state_dict = copy.deepcopy(self.base_model.state_dict())
-
                 full_grad = None
-                print("num pseudoexperts:", len(pseudoexperts))
                 for model, _ in pseudoexperts:
                     batch_grad = get_grads_final_layer(
                         model, 
@@ -317,16 +321,15 @@ class SELECTOptimizer(DiscreteOptimizer):
                     else:
                         full_grad += batch_grad.sum(dim=0)
                 
-                # Restore original model state
-                self.base_model.load_state_dict(current_state_dict)
-                
                 full_resolution_batch_gradient += full_grad.to(device)
                 full_resolution_batch_gradient_proj = self.projector.project(full_resolution_batch_gradient, model_id=0)
-                grads_db.vectors = og_grads_db_vectors + full_resolution_batch_gradient_proj
+                grads_db.vectors = og_grads_db_vectors.clone() + full_resolution_batch_gradient_proj
 
             batch_pbar.update(1)
-            batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)}")
-        
+            batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)} | Current sim: {best_sim:.3f} | Overall best sim: {overall_best_sim:.3f}")
+
+        label_distribution = self.dataset_autolabels[batch].unique(return_counts=True)
+        print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f} | Label distribution: {label_distribution}")
         return batch
 
     def step_with_grad(self, step: int, buffer: list) -> dict[str, torch.Tensor]:

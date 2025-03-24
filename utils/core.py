@@ -238,6 +238,12 @@ def autolabel_dataset(
         np.savez(cache_path, labels=labels.numpy())
     
     labels = np.load(cache_path)["labels"]
+
+    # Count unique labels
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    if len(unique_labels) != len(label_map):
+        raise ValueError(f"[autolabel_dataset] Number of unique labels ({len(unique_labels)}) does not match number of labels in label_map ({len(label_map)})")    
+    
     return torch.from_numpy(labels)
 
 
@@ -520,9 +526,10 @@ def _train_expert_model_uncached(
                 
                 if epochs_without_improvement >= early_stopping_patience:
                     pbar.close()
-                    print(f"Early stopping triggered after {epoch+1} epochs (patience = {early_stopping_patience})")
+                    print(f"Early stopping triggered after {epoch+1} epochs (patience = {early_stopping_patience}, best eval accuracy = {best_eval_accuracy:.3f})")
                     break
 
+    breakpoint()
     # Run one more evaluation
     eval_loss, eval_accuracy = _eval_expert_model(
         student_net=student_net,

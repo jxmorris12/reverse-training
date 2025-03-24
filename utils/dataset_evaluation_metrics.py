@@ -138,6 +138,7 @@ def get_sentence_embeddings(texts, tokenizer, model, device, batch_size=128):
         all_embeddings.append(embeddings.cpu().numpy())
     return np.concatenate(all_embeddings, axis=0)
 
+
 def dataset_level_full_ot_with_embeddings(emb_A, emb_B):
     """
     Compute the full optimal transport (Wasserstein) distance between two datasets using pre-computed embeddings.
@@ -154,6 +155,7 @@ def dataset_level_full_ot_with_embeddings(emb_A, emb_B):
     cost_matrix = ot.dist(emb_A, emb_B, metric='sqeuclidean')
     distance = ot.emd2(wA, wB, cost_matrix)
     return distance
+
 
 def dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg=0.1):
     """
@@ -172,6 +174,7 @@ def dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg=0.1):
     cost_matrix = ot.dist(emb_A, emb_B, metric='sqeuclidean')
     distance = ot.sinkhorn2(wA, wB, cost_matrix, reg)
     return distance
+
 
 def example_level_relaxed_wmd_with_embeddings(emb_A, emb_B):
     """
@@ -193,6 +196,7 @@ def example_level_relaxed_wmd_with_embeddings(emb_A, emb_B):
 
     return max(avg_1_to_2, avg_2_to_1)
 
+
 def optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B):
     """
     Compute a cost matrix between every document in dataset_A and dataset_B using relaxed WMD
@@ -205,7 +209,7 @@ def optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B):
     cost_matrix = np.zeros((m, n))
     print(cost_matrix.shape)
 
-    for i in range(m):
+    for i in tqdm.trange(m, desc="Computing relaxed WMD cost matrix", colour="MAGENTA"):
         for j in range(n):
             # Create single-example embeddings for the relaxed WMD calculation
             single_emb_A = emb_A[i:i+1]
@@ -223,6 +227,7 @@ def optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B):
     }
     return stats
 
+
 # Keep these functions for backward compatibility
 def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
     """
@@ -237,6 +242,7 @@ def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model
     emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
     return dataset_level_full_ot_with_embeddings(emb_A, emb_B)
+
 
 def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer, model=model, device=device):
     """
@@ -253,6 +259,7 @@ def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer
     emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
     return dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg)
 
+
 def example_level_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
     """
     Compute a relaxed Word Mover's Distance (RWMD) between two documents.
@@ -262,6 +269,7 @@ def example_level_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=m
     emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
     return example_level_relaxed_wmd_with_embeddings(emb_A, emb_B)
+
 
 def optimal_matching_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
     """
@@ -293,7 +301,7 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
     # Compute embedding-based metrics using the pre-computed embeddings
     full_ot_distance = dataset_level_full_ot_with_embeddings(emb_A, emb_B)
     sinkhorn_distance = dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg=0.1)
-    optimal_matching_relaxed_wmd_stats = optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B)
+    # optimal_matching_relaxed_wmd_stats = optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B)
     
     # Lexical-Based Metrics (these don't use embeddings)
     jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
@@ -303,7 +311,7 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
     results = {
         "full_ot_distance": full_ot_distance,
         "sinkhorn_distance": sinkhorn_distance,
-        "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
+        # "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
         "jaccard_overlap_examples": jaccard_overlap_examples_score,
         "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_score,
         "levenshtein_stats": levenshtein_stats
