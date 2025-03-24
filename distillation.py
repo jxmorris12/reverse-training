@@ -242,7 +242,7 @@ class DatasetDistiller:
         return (Z.cpu(), discrete_optimizer.Y.cpu(), output)
 
     def run_distillation(self):
-        tokens, labels, output = self._run_distillation()
+        tokens, labels, output_metrics = self._run_distillation()
 
         # Compute dataset-level metrics
         input_dataset = self.classification_dataset.dataset["train"][self.classification_dataset.text_column_name]
@@ -259,7 +259,7 @@ class DatasetDistiller:
                 "labels": labels,
             },
             **dataset_evaluation_metrics,
-            **output,
+            **output_metrics,
         }
         output_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(output_dir, exist_ok=True)

@@ -159,7 +159,7 @@ def _get_grads_final_layer_uncached(
     """
     do_classification = (labels is not None)
     all_grads = []
-    pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) < 32))
+    pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) // batch_size < 10))
 
     # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
     params = {k: v.detach() for k, v in student_net.lm_head.named_parameters()}

@@ -34,7 +34,7 @@ def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor
         If model is None: List of pseudoexpert parameter tensors
         If model is not None: Generator yielding (model, idx) tuples for each pseudoexpert
     """
-    pseudoexpert_params_list = []
+    pseudoexperts = []
     
     for i in range(num_pseudoexperts):
         step_frac = i / num_pseudoexperts
@@ -45,18 +45,15 @@ def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor
             (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
         )
         
-        pseudoexpert_params_list.append(pseudoexpert_params)
-        
         # If model is provided, set its parameters to the current pseudoexpert
         counter = 0
         new_model = copy.deepcopy(model)
         for p in new_model.parameters():
             p.data = pseudoexpert_params[counter:counter+p.numel()].reshape(p.data.shape).to(p.data.dtype)
             counter += p.numel()
+        pseudoexperts.append((new_model, i))
         
-        # Return the model with updated parameters for further processing
-        yield new_model, i
-    
+    return pseudoexperts
 
 class SELECTOptimizer(DiscreteOptimizer):
     X: torch.Tensor
@@ -162,7 +159,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch = self._fill_batch_greedy(
                 grads_db=grads_db,
                 last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params
+                last_layer_expert_model_params=last_layer_expert_model_params,
+                pseudoexperts=pseudoexperts,
             )
         elif self.args.select_batch_fill_strategy == "topk":
             batch = self._fill_batch_topk(
@@ -260,6 +258,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             grads_db: BatchedExactVectorDatabase,
             last_layer_base_params: torch.Tensor,
             last_layer_expert_model_params: torch.Tensor,
+            pseudoexperts: list[tuple[torch.nn.Module, int]],
             grad_recompute_steps: int = 32,
         ) -> list:
         """Greedily fill a batch with examples that have the most influence on optimization direction.
@@ -281,15 +280,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
         og_grads_db_vectors = grads_db.vectors.clone()
-
-        # Use the new helper function to create pseudoexperts with last_layer params (with model=None to just get parameters)
-        pseudoexperts = _create_pseudoexperts(
-            self.base_model, 
-            last_layer_base_params, 
-            last_layer_expert_model_params, 
-            num_pseudoexperts=self.args.select_num_pseudoexperts
-        )
-        
         full_resolution_batch_gradient = torch.zeros_like(last_layer_base_params)
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         while len(batch) < self.args.select_full_dataset_size:
@@ -310,6 +300,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                 current_state_dict = copy.deepcopy(self.base_model.state_dict())
 
                 full_grad = None
+                print("num pseudoexperts:", len(pseudoexperts))
                 for model, _ in pseudoexperts:
                     batch_grad = get_grads_final_layer(
                         model, 
