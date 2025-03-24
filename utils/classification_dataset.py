@@ -5,6 +5,22 @@ def _make_dbpedia_text(ex: dict[str, str]) -> dict[str, str]:
     ex["text"] = ex["title"] + " " + ex["content"]
     return ex
 
+DBPEDIA_LABEL_MAP = {
+    "0": "Company",
+    "1": "Educational Institution",
+    "2": "Artist",
+    "3": "Athlete",
+    "4": "Office Holder",
+    "5": "Mean Of Transportation",
+    "6": "Building",
+    "7": "Natural Place",
+    "8": "Village",
+    "9": "Animal",
+    "10": "Plant",
+    "11": "Album",
+    "12": "Film",
+    "13": "Written Work",
+}
 class ClassificationDataset:
     """
     A wrapper class for datasets.Dataset that includes metadata specific to classification tasks.
@@ -124,34 +140,16 @@ class ClassificationDataset:
             ds = ds.map(_make_dbpedia_text)
             text_column_name = "text"
             label_column_name = "label"
-            label_map = {
-                "0": "Company",
-                "1": "Organization",
-                "2": "Location",
-            }
+            label_map = DBPEDIA_LABEL_MAP
         elif dataset_name.startswith("dbpedia_") and dataset_name[8:].isdigit():
             num_samples = int(dataset_name[8:])
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
             ds = ds.map(_make_dbpedia_text)
-            ds["train"] = ds["train"].select(range(num_samples))
+            ds["train"] = ds["train"].shuffle(seed=seed).select(range(num_samples))
+            ds["test"] = ds["test"].shuffle(seed=seed)
             text_column_name = "text"
             label_column_name = "label"
-            label_map = {
-                "0": "Company",
-                "1": "Educational Institution",
-                "2": "Artist",
-                "3": "Athlete",
-                "4": "Office Holder",
-                "5": "Mean Of Transportation",
-                "6": "Building",
-                "7": "Natural Place",
-                "8": "Village",
-                "9": "Animal",
-                "10": "Plant",
-                "11": "Album",
-                "12": "Film",
-                "13": "Written Work",
-            }
+            label_map = DBPEDIA_LABEL_MAP
         elif dataset_name == "nq":
             ds = datasets.load_dataset("jxm/nq_corpus_dpr")["train"]
             ds = ds.train_test_split(test_size=0.1, seed=seed)
