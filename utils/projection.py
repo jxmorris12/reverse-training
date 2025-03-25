@@ -287,7 +287,9 @@ def get_grads_final_layer(
     cache_key = hashlib.sha256(full_cache_key.encode()).hexdigest()
     cache_path = os.path.join(cache_dir, f"get_grads_final_layer_{cache_key}.npz")
 
-    if not os.path.exists(cache_path):
+    try:
+        grads = np.load(cache_path)["grads"]
+    except:
         print(f"Getting grads for final layer with cache key: {full_cache_key} => {cache_key}")
         grads = _get_grads_final_layer_uncached(
             student_net, 

@@ -21,6 +21,21 @@ from utils.vector_search import (
     BatchedExactVectorDatabase,
 )
 
+
+def obtain_gradients_with_adam(vectorized_grads, avg, avg_sq):
+    """ obtain gradients with adam optimizer states. """
+    # https://github.com/princeton-nlp/LESS/blob/8abf9628b9a814ac3045445eebc8ba3c908fdc78/less/data_selection/collect_grad_reps.py#L130
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1e-08
+
+    updated_avg = beta1 * avg + (1 - beta1) * vectorized_grads
+    updated_avg_sq = beta2 * avg_sq + (1 - beta2) * vectorized_grads ** 2
+    vectorized_grads = updated_avg / torch.sqrt(updated_avg_sq + eps)
+
+    return vectorized_grads
+
+
 def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor, full_expert_model_params: torch.Tensor, num_pseudoexperts: int) -> list[tuple[torch.nn.Module, int]]:
     """Create pseudoexperts by interpolating between base and expert models.
     
@@ -112,6 +127,57 @@ class SELECTOptimizer(DiscreteOptimizer):
         print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None
     
+    def _run_warmup(
+            self, 
+            base_model: torch.nn.Module, 
+            last_layer_expert_model_params: torch.Tensor,
+            max_num_warmup_epochs: int = 10,
+            mse_step_patience: int = 25,
+        ):
+        """Runs SGD warmup on the base model using random minibatches of the seed dataset."""
+        best_mse = float("inf")
+        best_mse_step = 0
+        best_state_dict = None
+        
+        original_mse = (base_model.lm_head.weight.data.flatten() - last_layer_expert_model_params).double().pow(2).sum().item()
+        step = 0
+        base_model.to(device)
+
+        pbar = tqdm.trange(len(self.seed_dataset_train_split) // self.args.minibatch_size * max_num_warmup_epochs)
+        warmup_optimizer = torch.optim.Adam(base_model.parameters(), lr=self.args.select_lr_student)
+        for step in pbar:
+            minibatch = random.sample(range(len(self.seed_dataset_train_split)), k=self.args.minibatch_size)
+            inputs = self.tokenizer(
+                self.seed_dataset_train_split.select(minibatch)["text"],
+                return_tensors="pt",
+                padding="max_length", 
+                truncation=True,
+                max_length=self.args.sequence_length,
+            )
+            inputs = { k: v.to(device) for k, v in inputs.items() }
+            labels = self.dataset_autolabels[minibatch]
+            inputs["labels"] = torch.zeros_like(inputs["input_ids"]) - 100
+            inputs["labels"][:, -1] = labels
+            outputs = base_model(**inputs)
+            loss = outputs.loss
+            loss.backward()
+            warmup_optimizer.step()
+            warmup_optimizer.zero_grad()
+            base_model.zero_grad()
+
+            mse = (base_model.lm_head.weight.data.flatten() - last_layer_expert_model_params).double().pow(2).sum().item()
+            pbar.set_description(f"Current MSE: {mse:.3f} | Best MSE: {best_mse:.3f} at step {best_mse_step} | Steps since last improvement: {step - best_mse_step} | Loss: {loss.item():.3f}")
+            if mse < best_mse:
+                best_mse = mse
+                best_state_dict = copy.deepcopy(base_model.state_dict())
+                best_mse_step = step
+            elif step - best_mse_step > mse_step_patience:
+                pbar.close()
+                break
+        base_model.load_state_dict(best_state_dict)
+        mse_ratio = best_mse / original_mse
+        print(f"SELECTOptimizer: Warmup complete. Best MSE: {best_mse} | Best MSE step: {best_mse_step} | Original MSE: {original_mse} | MSE ratio: {mse_ratio}")
+    
     
     def _rank_dataset_by_influence(
             self, 
@@ -130,6 +196,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get all gradients
         base_model = copy.deepcopy(self.base_model)
         grads = []
+
+        if self.args.select_do_warmup:
+            self._run_warmup(base_model, last_layer_expert_model_params)
         
         # Use the new helper function to create pseudoexperts
         pseudoexperts = _create_pseudoexperts(
@@ -139,6 +208,9 @@ class SELECTOptimizer(DiscreteOptimizer):
             num_pseudoexperts=self.args.select_num_pseudoexperts
         )
         for model, i in pseudoexperts:
+            model_cache_key = self.base_model.config._name_or_path + f"_{i}_{self.args.select_num_pseudoexperts}"
+            if self.args.select_do_warmup:
+                model_cache_key += f"_warmup"
             batch_grads = get_grads_final_layer(
                 model, 
                 self.seed_dataset_train_split, 
@@ -147,8 +219,11 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.projector,
                 sequence_length=self.args.sequence_length, 
                 use_cache=True,
-                model_cache_key=self.base_model.config._name_or_path + f"_{i}_{self.args.select_num_pseudoexperts}",
+                model_cache_key=model_cache_key,
             )
+            zero_moment = torch.zeros_like(batch_grads)
+            zero_moment_sq = torch.zeros_like(batch_grads)
+            # batch_grads = obtain_gradients_with_adam(batch_grads, zero_moment, zero_moment_sq)
             grads.append(batch_grads)
         
         grads = torch.stack(grads, dim=0)
@@ -293,26 +368,41 @@ class SELECTOptimizer(DiscreteOptimizer):
             model_id=0
         )
 
+        # Split grads_db per-label
+        unique_labels = self.dataset_autolabels.unique()
+        grads_db_per_label = [
+            BatchedExactVectorDatabase(grads_db.vectors[:, self.dataset_autolabels == label]) for label in unique_labels
+        ]
+        grads_db_per_label_idxs = [
+            (self.dataset_autolabels == label).nonzero().flatten() for label in unique_labels
+        ]
+
         og_grads_db_vectors = grads_db.vectors.clone()
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         overall_best_sim = float("-inf")
         while len(batch) < self.args.select_full_dataset_size:
+            current_label = len(batch) % len(unique_labels)
+            label_grads_db = grads_db_per_label[current_label]
             # Use cosine similarity to find best gradient
-            best_sim, best_idx = grads_db.search(base_params_diff_projected, 1)
+            best_sim, best_idx = label_grads_db.search(base_params_diff_projected, 1)
             best_idx = best_idx.item()
             best_sim = best_sim.item()
             overall_best_sim = max(overall_best_sim, best_sim)
 
             # Add the selected gradient to our batch
-            batch.append(best_idx)
-            grads_db.remove_vectors(best_idx)
+            grads_db_per_label[current_label].remove_vectors(best_idx)
 
+            best_idx_remapped = grads_db_per_label_idxs[current_label][best_idx].item()
+            batch.append(best_idx_remapped)
             # Compute full-resolution gradient
             # TODO: get actually best_idx (don't just set to 0)
-            grads_db.vectors += og_grads_db_vectors[:, best_idx].mean(dim=0, keepdim=True)
+
+            this_grads_db_vector = og_grads_db_vectors[:, best_idx_remapped].mean(dim=0, keepdim=True)
+            grads_db.vectors += this_grads_db_vector
 
             if batched:
                 if len(batch) % self.args.minibatch_size == 0:
+                    batch_grads_list = []
                     # reset vectors
                     grads_db.vectors = og_grads_db_vectors.clone()
 

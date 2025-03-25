@@ -597,6 +597,13 @@ def train_expert_model(
     # Check if cached result exists
     if os.path.exists(cache_path) and not uncachable_args_provided:
         print0(f"Loading cached expert model results from {cache_path}")
+
+        #########################################################
+        # Tmp: Save train set.
+        # ds["train"].to_parquet("train_ds.parquet")
+        # print(f"Saved train set to train_ds.parquet")
+        #########################################################
+
         try:
             with open(cache_path, "rb") as f:
                 expert_state_dicts, all_token_counts, final_evaluation_metrics = pickle.load(f)

@@ -110,6 +110,22 @@ class ClassificationDataset:
         Returns:
             A ClassificationDataset object
         """
+        if " " in dataset_name:
+            # Concatenate multiple datasets
+            dataset_names = dataset_name.split(" ")
+            dataset_list = [cls.from_dataset_name(name, seed) for name in dataset_names]
+            ds = dataset_list[0].dataset
+            for other_dataset in dataset_list[1:]:
+                for split in other_dataset.dataset.keys():
+                    # ds[split] = ds[split].concatenate(other_dataset.dataset[split])
+                    ds[split] = datasets.concatenate_datasets([ds[split], other_dataset.dataset[split]])
+            return cls(
+                ds, 
+                text_column_name=dataset_list[0].text_column_name, 
+                label_column_name=dataset_list[0].label_column_name, 
+                label_map=dataset_list[0].label_map
+            )
+
         if dataset_name == "ag_news":
             ds = datasets.load_dataset("fancyzhx/ag_news")
             ds = ds["train"].train_test_split(test_size=0.1, seed=seed)
