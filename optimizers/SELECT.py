@@ -22,20 +22,6 @@ from utils.vector_search import (
 )
 
 
-def obtain_gradients_with_adam(vectorized_grads, avg, avg_sq):
-    """ obtain gradients with adam optimizer states. """
-    # https://github.com/princeton-nlp/LESS/blob/8abf9628b9a814ac3045445eebc8ba3c908fdc78/less/data_selection/collect_grad_reps.py#L130
-    beta1 = 0.9
-    beta2 = 0.999
-    eps = 1e-08
-
-    updated_avg = beta1 * avg + (1 - beta1) * vectorized_grads
-    updated_avg_sq = beta2 * avg_sq + (1 - beta2) * vectorized_grads ** 2
-    vectorized_grads = updated_avg / torch.sqrt(updated_avg_sq + eps)
-
-    return vectorized_grads
-
-
 def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor, full_expert_model_params: torch.Tensor, num_pseudoexperts: int) -> list[tuple[torch.nn.Module, int]]:
     """Create pseudoexperts by interpolating between base and expert models.
     
@@ -219,11 +205,9 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.projector,
                 sequence_length=self.args.sequence_length, 
                 use_cache=True,
+                use_adam=True,
                 model_cache_key=model_cache_key,
             )
-            zero_moment = torch.zeros_like(batch_grads)
-            zero_moment_sq = torch.zeros_like(batch_grads)
-            # batch_grads = obtain_gradients_with_adam(batch_grads, zero_moment, zero_moment_sq)
             grads.append(batch_grads)
         
         grads = torch.stack(grads, dim=0)
@@ -369,35 +353,24 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
         # Split grads_db per-label
-        unique_labels = self.dataset_autolabels.unique()
-        grads_db_per_label = [
-            BatchedExactVectorDatabase(grads_db.vectors[:, self.dataset_autolabels == label]) for label in unique_labels
-        ]
-        grads_db_per_label_idxs = [
-            (self.dataset_autolabels == label).nonzero().flatten() for label in unique_labels
-        ]
-
         og_grads_db_vectors = grads_db.vectors.clone()
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         overall_best_sim = float("-inf")
         while len(batch) < self.args.select_full_dataset_size:
-            current_label = len(batch) % len(unique_labels)
-            label_grads_db = grads_db_per_label[current_label]
             # Use cosine similarity to find best gradient
-            best_sim, best_idx = label_grads_db.search(base_params_diff_projected, 1)
+            best_sim, best_idx = grads_db.search(base_params_diff_projected, 1)
             best_idx = best_idx.item()
             best_sim = best_sim.item()
             overall_best_sim = max(overall_best_sim, best_sim)
 
             # Add the selected gradient to our batch
-            grads_db_per_label[current_label].remove_vectors(best_idx)
+            grads_db.remove_vectors(best_idx)
 
-            best_idx_remapped = grads_db_per_label_idxs[current_label][best_idx].item()
-            batch.append(best_idx_remapped)
+            batch.append(best_idx)
             # Compute full-resolution gradient
             # TODO: get actually best_idx (don't just set to 0)
 
-            this_grads_db_vector = og_grads_db_vectors[:, best_idx_remapped].mean(dim=0, keepdim=True)
+            this_grads_db_vector = og_grads_db_vectors[:, best_idx].mean(dim=0, keepdim=True)
             grads_db.vectors += this_grads_db_vector
 
             if batched:

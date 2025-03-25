@@ -21,6 +21,31 @@ DBPEDIA_LABEL_MAP = {
     "12": "Film",
     "13": "Written Work",
 }
+
+NEWSGROUP_LABEL_MAP = {
+    "0": "alt.atheism",
+    "1": "comp.graphics",
+    "2": "comp.os.ms-windows.misc",
+    "3": "comp.sys.ibm.pc.hardware",
+    "4": "comp.sys.mac.hardware",
+    "5": "comp.windows.x",
+    "6": "misc.forsale",
+    "7": "rec.autos",
+    "8": "rec.motorcycles",
+    "9": "rec.sport.baseball",
+    "10": "rec.sport.hockey",
+    "11": "sci.crypt",
+    "12": "sci.electronics",
+    "13": "sci.med",
+    "14": "sci.space",
+    "15": "soc.religion.christian",
+    "16": "talk.politics.guns",
+    "17": "talk.politics.mideast",
+    "18": "talk.politics.misc",
+    "19": "talk.religion.misc",
+}
+
+
 class ClassificationDataset:
     """
     A wrapper class for datasets.Dataset that includes metadata specific to classification tasks.
@@ -151,6 +176,19 @@ class ClassificationDataset:
                 "2": "Business",
                 "3": "Sci/Tech",
             }
+        elif dataset_name == "newsgroup":
+            ds = datasets.load_dataset("SetFit/20_newsgroups")
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = NEWSGROUP_LABEL_MAP
+        elif dataset_name.startswith("newsgroup_") and dataset_name[10:].isdigit():
+            num_samples = int(dataset_name[10:])
+            ds = datasets.load_dataset("SetFit/20_newsgroups")
+            ds = ds["train"].train_test_split(test_size=0.1, seed=seed)
+            ds["train"] = ds["train"].select(range(num_samples))
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = NEWSGROUP_LABEL_MAP
         elif dataset_name == "dbpedia":
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
             ds = ds.map(_make_dbpedia_text)
