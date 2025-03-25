@@ -36,6 +36,8 @@ class CudaProjector:
         self.device = device
         self.max_batch_size = max_batch_size
         self.block_size = block_size
+
+        self._dimension_lock = None
         
         if isinstance(device, str):
             device = torch.device(device)
@@ -58,22 +60,28 @@ class CudaProjector:
 
     def project(
         self,
-        grads: torch.Tensor,
+        x: torch.Tensor,
         model_id: int,
     ) -> torch.Tensor:
         # Convert dict to tensor if needed
-        if isinstance(grads, dict):
-            grads = vectorize(grads, device=self.device)
+        if isinstance(x, dict):
+            x = vectorize(x, device=self.device)
         
         # Optionally add a batch dimension
-        if grads.ndim == 1:
-            grads = grads[None]
+        if x.ndim == 1:
+            x = x[None]
 
-        batch_size = grads.shape[0]
+        batch_size = x.shape[0]
+        dim = x.shape[1]
+
+        if self._dimension_lock is None:
+            self._dimension_lock = dim
+        elif self._dimension_lock != dim:
+            raise ValueError(f"Dimension of input to projector changed from {self._dimension_lock} to {dim}.")
 
         # Downcast from double to float
-        if grads.dtype == torch.float64:
-            grads = grads.to(torch.float32)
+        if x.dtype == torch.float64:
+            x = x.to(torch.float32)
 
         effective_batch_size = 32
         if batch_size <= 8:
@@ -90,7 +98,7 @@ class CudaProjector:
 
         try:
             result = fn(
-                grads, self.proj_dim, self.seed + int(1e4) * model_id, self.num_sms
+                x, self.proj_dim, self.seed + int(1e4) * model_id, self.num_sms
             )
         except RuntimeError as e:
             if "CUDA error: too many resources requested for launch" in str(e):
@@ -102,7 +110,7 @@ class CudaProjector:
                     )
                 )
             else:
-                print("Error for dtype: ", grads.dtype, "and shape: ", grads.shape)
+                print("Error for dtype: ", x.dtype, "and shape: ", x.shape)
                 raise e
 
         return result

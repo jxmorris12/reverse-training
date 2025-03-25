@@ -55,14 +55,14 @@ class BatchedExactVectorDatabase(VectorDatabase):
         all_sims = []
         num_vectors = self.vectors.shape[1]
 
-        query_vector_norm = query_vector / query_vector.norm(dim=0, keepdim=True)
+        query_vector_norm = query_vector / query_vector.norm(dim=-1, keepdim=True)
         
         # Process in batches
         for i in range(0, num_vectors, self.batch_size):
             # Get current batch
             end_idx = min(i + self.batch_size, num_vectors)
             batch_vectors = self.vectors[:, i:end_idx].to(device)
-            batch_vectors_norm = batch_vectors / batch_vectors.norm(dim=0, keepdim=True)
+            batch_vectors_norm = batch_vectors / batch_vectors.norm(dim=-1, keepdim=True)
             batch_sims = batch_vectors_norm @ query_vector_norm.T
             batch_sims = batch_sims.max(dim=0).values
             all_sims.append(batch_sims.flatten())

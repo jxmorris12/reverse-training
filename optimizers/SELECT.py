@@ -294,7 +294,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
         og_grads_db_vectors = grads_db.vectors.clone()
-        full_resolution_batch_gradient = torch.zeros_like(last_layer_base_params)
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         overall_best_sim = float("-inf")
         while len(batch) < self.args.select_full_dataset_size:
