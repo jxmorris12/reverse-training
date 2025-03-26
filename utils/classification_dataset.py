@@ -184,7 +184,6 @@ class ClassificationDataset:
         elif dataset_name.startswith("newsgroup_") and dataset_name[10:].isdigit():
             num_samples = int(dataset_name[10:])
             ds = datasets.load_dataset("SetFit/20_newsgroups")
-            ds = ds["train"].train_test_split(test_size=0.1, seed=seed)
             ds["train"] = ds["train"].select(range(num_samples))
             text_column_name = "text"
             label_column_name = "label"

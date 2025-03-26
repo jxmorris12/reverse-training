@@ -171,9 +171,8 @@ class DatasetDistiller:
         )
 
         # log
-        metrics = { **dataset_metrics, **evaluation_metrics }
         wandb.log(metrics, step=step)
-        return evaluation_metrics
+        return { **dataset_metrics, **evaluation_metrics }
     
     def _distributed_broadcast_everything(self, expert_buffer: list[dict[str, torch.Tensor]], dataset_token_counts: torch.Tensor) -> None:
         if get_world_size() <= 1:

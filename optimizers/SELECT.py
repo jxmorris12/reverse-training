@@ -302,7 +302,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get the best remaining gradient
         if balanced:
             # Optionally we balance by label to avoid over-representing any one label
-            tokenized_labels = self.tokenized_labels
+            tokenized_labels = self.tokenized_labels.flatten().tolist()
             best_idxs = []
             label_counts = { label: 0 for label in tokenized_labels }
             selected_data_by_label = { label: [] for label in tokenized_labels }
@@ -406,7 +406,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             grads_db.vectors += this_grads_db_vector
 
             if batched:
-                if len(batch) % self.args.minibatch_size == 0:
+                if len(batch) % self.args.expert_batch_size == 0:
                     batch_grads_list = []
                     # reset vectors
                     grads_db.vectors = og_grads_db_vectors.clone()

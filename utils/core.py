@@ -395,8 +395,8 @@ def _train_expert_model_uncached(
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
         early_stopping_patience: int = 10,
-        num_eval_datapoints: int = 1024,
-        # num_eval_datapoints: int = 2048,
+        # num_eval_datapoints: int = 1024,
+        num_eval_datapoints: int = 2048,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
@@ -431,7 +431,7 @@ def _train_expert_model_uncached(
         print(f"[train_expert_model] Label distribution: {ds_labels.unique(return_counts=True)}")
     else:
         print(f"[train_expert_model] First datapoint: {train_ds[0][text_column_name]}")
-        print(f"[train_expert_model] First datapoint label: {train_ds[0][label_column_name]}")
+        if label_column_name is not None: print(f"[train_expert_model] First datapoint label: {train_ds[0][label_column_name]}")
 
     for epoch in range(num_experts):
         for _i in range(num_steps_per_expert):

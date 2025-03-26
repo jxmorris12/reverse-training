@@ -20,12 +20,16 @@ def load_results_as_df(path: str) -> pd.DataFrame:
     parsed_results = [
         {
             **ex["args"],
-            **ex["expert_evaluation_metrics"],
-            **ex["evaluation_metrics"],
+            **{ f"expert_evaluation_{k}": v for k, v in ex["expert_evaluation_metrics"].items() },
+            **{ f"evaluation_{k}": v for k, v in ex["evaluation_metrics"].items() },
             "dataset_sinkhorn_distance": ex["sinkhorn_distance"],
             "dataset_full_ot_distance": ex["full_ot_distance"],
             "dataset_jaccard_overlap_examples": ex["jaccard_overlap_examples"],
             "dataset_jaccard_overlap_vocabulary": ex["jaccard_overlap_vocabulary"],
+            **{
+                f"dataset_levenshtein_stats_{k}": v
+                for k, v in ex["levenshtein_stats"].items()
+            }
         } for ex in results
     ]
     return pd.DataFrame(parsed_results)

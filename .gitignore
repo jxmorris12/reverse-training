@@ -3,5 +3,7 @@ __pycache__/
 exp_scripts/
 log_submitit/
 results/
+*results*/
+*cache*/
 saves/
 wandb/
