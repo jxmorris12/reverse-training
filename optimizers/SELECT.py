@@ -99,6 +99,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         Returns:
             List of tuples containing (model, idx) for each pseudoexpert
         """
+        if self.args.select_num_pseudoexperts <= 1:
+            return [(model, 0)]
+        
         pseudoexperts = []
 
         label_mask = (
@@ -221,7 +224,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.projector,
                 sequence_length=self.args.sequence_length, 
                 use_cache=False,
-                use_adam_adjustment=False,
                 do_projection=True,
                 model_cache_key=model_cache_key,
             )
@@ -243,6 +245,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                 base_params=base_params,
                 expert_params=expert_params,
                 pseudoexperts=pseudoexperts,
+                batched=False,
             )
         elif self.args.select_batch_fill_strategy == "greedy_batched":
             batch = self._fill_batch_greedy(
@@ -340,6 +343,13 @@ class SELECTOptimizer(DiscreteOptimizer):
             best_sims = best_sims.flip(dims=[0])
             best_idxs = best_idxs.flip(dims=[0])
         return best_idxs.tolist()
+    
+    def _get_model_params(self, model: torch.nn.Module) -> torch.Tensor:
+        """Get the parameters of the expert model."""
+        if self.args.select_grads_full_model:
+            return torch.cat([p.flatten().detach() for p in model.parameters()])
+        else:
+            return torch.cat([p.flatten().detach() for p in model.lm_head.parameters()])
 
 
     def _fill_batch_greedy(
@@ -368,28 +378,33 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         # TODO: Make the following work w/ just last layer grads.
         # Project parameter differences
-        # pseudoexperts_projected_diffs = []
-        # last_params = torch.cat([p.flatten().detach() for p in self.base_model.parameters()])
-        # for model, i in pseudoexperts:
-        #     model_params = torch.cat([p.flatten().detach() for p in model.parameters()])
-        #     model_params_diff = model_params - last_params
-        #     model_params_diff_projected = self.projector.project(
-        #         model_params_diff, 
-        #         model_id=0
-        #     )
-        #     pseudoexperts_projected_diffs.append(model_params_diff_projected)
-        #     last_params = model_params
-        # pseudoexperts_projected_diffs = torch.stack(pseudoexperts_projected_diffs, dim=0)
+        pseudoexperts_projected_diffs = []
+        last_params = self._get_model_params(self.base_model)
+        for model, i in pseudoexperts:
+            model_params = self._get_model_params(model)
+            model_params_diff = model_params - last_params
+            model_params_diff_projected = self.projector.project(
+                model_params_diff, 
+                model_id=0
+            )
+            pseudoexperts_projected_diffs.append(model_params_diff_projected)
+            last_params = model_params
 
-        params_diff_projected = self.projector.project(base_params - expert_params, model_id=0)
+        params_diff_projected = self.projector.project(last_params - expert_params, model_id=0)
+        pseudoexperts_projected_diffs.append(params_diff_projected)
+        pseudoexperts_projected_diffs = torch.stack(pseudoexperts_projected_diffs, dim=0)
 
         # Split grads_db per-label
         og_grads_db_vectors = grads_db.vectors.cpu().clone()
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         overall_best_sim = float("-inf")
+        current_grad_sum = torch.zeros(params_diff_projected.shape, device="cpu")
         while len(batch) < self.args.select_full_dataset_size:
             # Use cosine similarity to find best gradient
-            best_sim, best_idx = grads_db.search(params_diff_projected, 1)
+            if self.args.select_num_pseudoexperts <= 1:
+                best_sim, best_idx = grads_db.search(params_diff_projected, 1)
+            else:
+                best_sim, best_idx = grads_db.search(pseudoexperts_projected_diffs, 1)
             best_idx = best_idx.item()
             best_sim = best_sim.item()
             overall_best_sim = max(overall_best_sim, best_sim)
@@ -399,12 +414,10 @@ class SELECTOptimizer(DiscreteOptimizer):
             # Add the selected gradient to our batch
             grads_db.remove_vectors(best_idx)
             batch.append(best_idx)
-            # Compute full-resolution gradient
-            # TODO: get actually best_idx (don't just set to 0)
 
             this_grads_db_vector = og_grads_db_vectors[:, best_idx].mean(dim=0, keepdim=True)
             grads_db.vectors += this_grads_db_vector
-
+            current_grad_sum += this_grads_db_vector
             if batched:
                 if len(batch) % self.args.expert_batch_size == 0:
                     batch_grads_list = []

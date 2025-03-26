@@ -44,7 +44,7 @@ class BatchedExactVectorDatabase(VectorDatabase):
         super().__init__(vectors.to(torch.float64))
         self.batch_size = batch_size
         self.ignore_mask = torch.zeros(vectors.shape[1], dtype=bool)
-        self.vectors = self.vectors
+        self.vectors = self.vectors.to(torch.float64)
         
     def search(self, query_vector: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         # Make sure query vector is on GPU
@@ -64,7 +64,7 @@ class BatchedExactVectorDatabase(VectorDatabase):
             batch_vectors = self.vectors[:, i:end_idx].to(device).double()
             batch_vectors_norm = batch_vectors / batch_vectors.norm(dim=-1, keepdim=True)
             batch_sims = batch_vectors_norm @ query_vector_norm.T
-            batch_sims = batch_sims.max(dim=0).values
+            batch_sims = batch_sims.mean(dim=0)
             all_sims.append(batch_sims.flatten())
 
         # Combine all batches
@@ -80,5 +80,3 @@ class BatchedExactVectorDatabase(VectorDatabase):
     
     def reset_removed_vectors(self):
         self.ignore_mask = torch.zeros(self.vectors.shape[0], dtype=bool)
-
-
