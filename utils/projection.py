@@ -17,20 +17,6 @@ class ProjectionType(str, Enum):
     normal = "normal"
 
 
-def obtain_gradients_with_adam(vectorized_grads, avg, avg_sq):
-    """ obtain gradients with adam optimizer states. """
-    # https://github.com/princeton-nlp/LESS/blob/8abf9628b9a814ac3045445eebc8ba3c908fdc78/less/data_selection/collect_grad_reps.py#L130
-    beta1 = 0.9
-    beta2 = 0.999
-    eps = 1e-08
-
-    updated_avg = beta1 * avg + (1 - beta1) * vectorized_grads
-    updated_avg_sq = beta2 * avg_sq + (1 - beta2) * vectorized_grads ** 2
-    vectorized_grads = updated_avg / torch.sqrt(updated_avg_sq + eps)
-
-    return vectorized_grads
-
-
 class CudaProjector:
     """A performant implementation of the projection for CUDA."""
     def __init__(
@@ -162,7 +148,6 @@ def _get_grads_final_layer_uncached(
         sequence_length: int, 
         do_projection: bool = True,
         batch_size: int = 32,
-        use_adam_adjustment: bool = False,
     ) -> torch.Tensor:
     """
     Computes gradients for each example in the dataset with respect to the model parameters.
@@ -175,7 +160,6 @@ def _get_grads_final_layer_uncached(
         sequence_length: Maximum sequence length for tokenization
         batch_size: Number of examples to process at once
         do_projection: Whether to project the gradients
-        use_adam_adjustment: Whether to update gradients with adam optimizer states
         
     Returns:
         A tensor of shape (len(dataset), projection_dim) containing the gradients
@@ -244,15 +228,6 @@ def _get_grads_final_layer_uncached(
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, inputs["labels"])
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in student_net.lm_head.named_parameters()], dim=1)
 
-        if use_adam_adjustment:
-            # We can just set the avg and avg_sq to 0 because we're 
-            # starting from step 0
-            grads_batch = obtain_gradients_with_adam(
-                grads_batch, 
-                avg=torch.zeros_like(grads_batch), 
-                avg_sq=torch.zeros_like(grads_batch),
-            )
-
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
             all_grads.extend(projected_grads.cpu())
@@ -272,7 +247,6 @@ def get_grads_final_layer(
         do_projection: bool = True,
         use_cache: bool = True,
         model_cache_key: str = "",
-        use_adam_adjustment: bool = False,
     ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
     
@@ -295,7 +269,6 @@ def get_grads_final_layer(
             projector=projector, 
             sequence_length=sequence_length, 
             do_projection=do_projection,
-            use_adam_adjustment=use_adam_adjustment,
         )
     hash_kwargs = {
         # TODO: hash labels...
@@ -306,7 +279,6 @@ def get_grads_final_layer(
         "sequence_length": sequence_length,
         "do_projection": do_projection,
         "model_cache_key": model_cache_key,
-        "use_adam_adjustment": use_adam_adjustment,
     }
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -326,7 +298,6 @@ def get_grads_final_layer(
             projector=projector, 
             sequence_length=sequence_length, 
             do_projection=do_projection,
-            use_adam_adjustment=use_adam_adjustment,
         )
         np.savez(cache_path, grads=grads.numpy())
 
@@ -344,7 +315,6 @@ def _get_grads_full_model_uncached(
         sequence_length: int, 
         do_projection: bool = True,
         batch_size: int = 32,
-        use_adam_adjustment: bool = False,
     ) -> torch.Tensor:
     """
     Computes gradients for each example in the dataset with respect to the model parameters.
@@ -357,7 +327,6 @@ def _get_grads_full_model_uncached(
         sequence_length: Maximum sequence length for tokenization
         batch_size: Number of examples to process at once
         do_projection: Whether to project the gradients
-        use_adam_adjustment: Whether to update gradients with adam optimizer states
         
     Returns:
         A tensor of shape (len(dataset), projection_dim) containing the gradients
@@ -432,16 +401,6 @@ def _get_grads_full_model_uncached(
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in student_net.named_parameters()], dim=1)
 
-
-        if use_adam_adjustment:
-            # We can just set the avg and avg_sq to 0 because we're 
-            # starting from step 0
-            grads_batch = obtain_gradients_with_adam(
-                grads_batch, 
-                avg=torch.zeros_like(grads_batch), 
-                avg_sq=torch.zeros_like(grads_batch),
-            )
-
         grads_batch = grads_batch.double() / grads_batch.norm(dim=1, keepdim=True)
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
@@ -462,7 +421,6 @@ def get_grads_full_model(
         do_projection: bool = True,
         use_cache: bool = True,
         model_cache_key: str = "",
-        use_adam_adjustment: bool = False,
     ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
     
@@ -485,7 +443,6 @@ def get_grads_full_model(
             projector=projector, 
             sequence_length=sequence_length, 
             do_projection=do_projection,
-            use_adam_adjustment=use_adam_adjustment,
         )
     hash_kwargs = {
         "student_net_hash": hash_model_params(student_net),
@@ -495,7 +452,6 @@ def get_grads_full_model(
         "sequence_length": sequence_length,
         "do_projection": do_projection,
         "model_cache_key": model_cache_key,
-        "use_adam_adjustment": use_adam_adjustment,
     }
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -515,7 +471,6 @@ def get_grads_full_model(
             projector=projector, 
             sequence_length=sequence_length, 
             do_projection=do_projection,
-            use_adam_adjustment=use_adam_adjustment,
         )
         np.savez(cache_path, grads=grads.numpy())
 

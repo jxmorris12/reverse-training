@@ -221,7 +221,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.projector,
                 sequence_length=self.args.sequence_length, 
                 use_cache=False,
-                use_adam_adjustment=False,
                 do_projection=True,
                 model_cache_key=model_cache_key,
             )
