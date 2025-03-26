@@ -396,6 +396,7 @@ def _train_expert_model_uncached(
         ds_labels: Optional[torch.Tensor] = None,
         early_stopping_patience: int = 10,
         num_eval_datapoints: int = 1024,
+        # num_eval_datapoints: int = 2048,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     student_net = get_model("gpt2").to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
@@ -406,8 +407,8 @@ def _train_expert_model_uncached(
     train_ds = ds["train"]
     eval_ds = ds["test"].select(range(num_eval_datapoints))
 
-    # optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
-    optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
+    optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
+    # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
 
     expert_state_dicts = [_get_state_dict(student_net)]
     step = 0
@@ -622,9 +623,9 @@ def train_expert_model(
     # If not cached, run training and cache results
     num_datapoints = len(ds_tokens) if ds_tokens is not None else len(ds["train"])
     if not uncachable_args_provided:
-        print0(f"Training expert model with {num_datapoints} datapoints and caching results to {cache_path}")
+        print0(f"Training expert model with {num_datapoints} datapoints / batch size {expert_batch_size} and caching results to {cache_path}")
     else:
-        print0(f"Training expert model with {num_datapoints} datapoints")
+        print0(f"Training expert model with {num_datapoints} datapoints / batch size {expert_batch_size}")
     
     results = _train_expert_model_uncached(
         num_experts=num_experts,

@@ -105,7 +105,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             self.tokenized_labels[:, None] == torch.arange(self.tokenizer.vocab_size, device=device)[None, :]
         ).any(dim=0)
         num_steps_per_pseudoexpert = 10
-        optim = torch.optim.SGD(model.parameters(), lr=1e-4)
+        # optim = torch.optim.SGD(model.parameters(), lr=1e-4)
+        optim = torch.optim.Adam(model.parameters(), lr=1e-4)
         for i in range(num_pseudoexperts):
             for j in range(num_steps_per_pseudoexpert):
                 # Classify batch
@@ -219,9 +220,9 @@ class SELECTOptimizer(DiscreteOptimizer):
                 self.tokenizer, 
                 self.projector,
                 sequence_length=self.args.sequence_length, 
-                use_cache=False, # TMP
-                use_adam=False,  # TMP
-                do_projection=True, # TMP
+                use_cache=False,
+                use_adam_adjustment=False,
+                do_projection=True,
                 model_cache_key=model_cache_key,
             )
             grads.append(batch_grads)
@@ -383,7 +384,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         params_diff_projected = self.projector.project(base_params - expert_params, model_id=0)
 
         # Split grads_db per-label
-        og_grads_db_vectors = grads_db.vectors.clone()
+        og_grads_db_vectors = grads_db.vectors.cpu().clone()
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
         overall_best_sim = float("-inf")
         while len(batch) < self.args.select_full_dataset_size:
@@ -392,6 +393,8 @@ class SELECTOptimizer(DiscreteOptimizer):
             best_idx = best_idx.item()
             best_sim = best_sim.item()
             overall_best_sim = max(overall_best_sim, best_sim)
+
+            assert best_idx not in batch, f"Best idx {best_idx} is already in batch"
 
             # Add the selected gradient to our batch
             grads_db.remove_vectors(best_idx)
