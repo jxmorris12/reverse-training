@@ -495,7 +495,6 @@ def _train_expert_model_uncached(
                 ignore_index=-100,
                 reduction="mean"
             )
-            print(f"[train_expert_model] {tokens.input_ids.shape} | Loss = {loss:.3f}")
             pbar.set_description(f"Epoch {epoch} | Step {step+1} | Loss = {loss:.3f}")
             pbar.update(1)
             loss.backward()

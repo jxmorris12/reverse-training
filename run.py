@@ -91,4 +91,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    if args.select_grads_full_model:
+        print("WARNING: Setting select_grads_full_model to False for now.")
+    args.select_grads_full_model = False # Hardcoded to False for now.
+
     main(args)

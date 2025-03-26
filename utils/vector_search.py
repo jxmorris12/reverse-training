@@ -68,6 +68,7 @@ class BatchedExactVectorDatabase(VectorDatabase):
             all_sims.append(batch_sims.flatten())
 
             if batch_sims.isnan().any():
+                breakpoint()
                 raise ValueError("batch_sims contains NaNs")
         
         # Combine all batches
@@ -75,7 +76,6 @@ class BatchedExactVectorDatabase(VectorDatabase):
         combined_sims[self.ignore_mask] = -float("inf")
         top_k_sims, top_k_indices = torch.topk(combined_sims, k, largest=True)
 
-        breakpoint()
         return top_k_sims, top_k_indices
     
     def remove_vectors(self, idxs: torch.Tensor):
