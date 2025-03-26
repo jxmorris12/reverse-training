@@ -1,5 +1,5 @@
 from .optimizer import DiscreteOptimizer
-
+import datasets
 import collections
 import copy
 import random
@@ -22,45 +22,6 @@ from utils.vector_search import (
     BatchedExactVectorDatabase,
 )
 
-
-def _create_pseudoexperts(model: torch.nn.Module, full_base_params: torch.Tensor, full_expert_model_params: torch.Tensor, num_pseudoexperts: int) -> list[tuple[torch.nn.Module, int]]:
-    """Create pseudoexperts by interpolating between base and expert models.
-    
-    Args:
-        model: The model to update with pseudoexpert parameters
-        full_base_params: Flattened parameters of the base model
-        full_expert_model_params: Flattened parameters of the expert model
-        num_pseudoexperts: Number of pseudoexperts to create
-        
-    Returns:
-        List of tuples containing (model, idx) for each pseudoexpert
-    """
-    pseudoexperts = []
-    
-    # Validate parameter counts
-    model_param_count = sum(p.numel() for p in model.parameters())
-    if full_base_params.numel() != model_param_count or full_expert_model_params.numel() != model_param_count:
-        raise ValueError(f"Parameter count mismatch: model has {model_param_count} parameters, "
-                         f"but got {full_base_params.numel()} base params and {full_expert_model_params.numel()} expert params")
-    
-    for i in range(num_pseudoexperts):
-        step_frac = i / num_pseudoexperts
-        print(f"[create_pseudoexperts] Pseudoexpert {i}/{num_pseudoexperts} -> step_frac = {step_frac}")
-        
-        # Interpolate linearly from base model to expert model
-        pseudoexpert_params = (
-            (1 - step_frac) * full_base_params + step_frac * full_expert_model_params
-        )
-        
-        # Create a new model copy and set its parameters
-        counter = 0
-        new_model = copy.deepcopy(model)
-        for p in new_model.parameters():
-            p.data = pseudoexpert_params[counter:counter+p.numel()].reshape(p.data.shape).to(p.data.dtype)
-            counter += p.numel()
-        pseudoexperts.append((new_model, i))
-        
-    return pseudoexperts
 
 class SELECTOptimizer(DiscreteOptimizer):
     X: torch.Tensor
@@ -113,61 +74,94 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.seed_dataset_train_split = self.seed_dataset.dataset["train"]
         print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None
-    
-    def _run_warmup(
-            self, 
-            base_model: torch.nn.Module, 
-            last_layer_expert_model_params: torch.Tensor,
-            max_num_warmup_epochs: int = 10,
-            mse_step_patience: int = 25,
-        ):
-        """Runs SGD warmup on the base model using random minibatches of the seed dataset."""
-        best_mse = float("inf")
-        best_mse_step = 0
-        best_state_dict = None
+        self.tokenized_labels = torch.tensor([
+            self.tokenizer.encode(f" {x}")[0]
+            for x in self.true_classification_dataset.label_map
+        ], device=device)
+
+    def _run_create_pseudoexperts(
+        self,
+        model: torch.nn.Module, 
+        expert_model: torch.nn.Module,
+        full_base_params: torch.Tensor, 
+        full_expert_model_params: torch.Tensor, 
+        num_pseudoexperts: int,
+        dataset: datasets.Dataset,
+    ) -> list[tuple[torch.nn.Module, int]]:
+        """Create pseudoexperts by interpolating from base to expert models.
         
-        original_mse = (base_model.lm_head.weight.data.flatten() - last_layer_expert_model_params).double().pow(2).sum().item()
-        step = 0
-        base_model.to(device)
+        Args:
+            model: The model to update with pseudoexpert parameters
+            full_base_params: Flattened parameters of the base model
+            full_expert_model_params: Flattened parameters of the expert model
+            num_pseudoexperts: Number of pseudoexperts to create
+            
+        Returns:
+            List of tuples containing (model, idx) for each pseudoexpert
+        """
+        pseudoexperts = []
 
-        pbar = tqdm.trange(len(self.seed_dataset_train_split) // self.args.minibatch_size * max_num_warmup_epochs)
-        warmup_optimizer = torch.optim.Adam(base_model.parameters(), lr=self.args.select_lr_student)
-        for step in pbar:
-            minibatch = random.sample(range(len(self.seed_dataset_train_split)), k=self.args.minibatch_size)
-            inputs = self.tokenizer(
-                self.seed_dataset_train_split.select(minibatch)["text"],
-                return_tensors="pt",
-                padding="max_length", 
-                truncation=True,
-                max_length=self.args.sequence_length,
-            )
-            inputs = { k: v.to(device) for k, v in inputs.items() }
-            labels = self.dataset_autolabels[minibatch]
-            inputs["labels"] = torch.zeros_like(inputs["input_ids"]) - 100
-            inputs["labels"][:, -1] = labels
-            outputs = base_model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-            warmup_optimizer.step()
-            warmup_optimizer.zero_grad()
-            base_model.zero_grad()
+        label_mask = (
+            self.tokenized_labels[:, None] == torch.arange(self.tokenizer.vocab_size, device=device)[None, :]
+        ).any(dim=0)
+        num_steps_per_pseudoexpert = 10
+        optim = torch.optim.SGD(model.parameters(), lr=self.args.expert_lr)
+        for i in range(num_pseudoexperts):
+            for j in range(num_steps_per_pseudoexpert):
+                # Classify batch
+                batch = dataset.select(random.sample(range(len(dataset)), k=self.args.expert_batch_size))
+                inputs = self.tokenizer(
+                    batch["text"],
+                    return_tensors="pt",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=self.args.sequence_length-1,
+                ).to(device)
+                base_model_outputs = model(**inputs)
+                base_model_params = torch.cat([p.flatten() for p in model.parameters()])
+                with torch.no_grad():
+                    expert_model_outputs = expert_model(**inputs)
+                    expert_model_params = torch.cat([p.flatten().detach() for p in expert_model.parameters()])
+                
+                # Compute KL divergence between base and expert model outputs
+                base_logits = base_model_outputs.logits[:, -1, :]
+                expert_logits = expert_model_outputs.logits[:, -1, :]
 
-            mse = (base_model.lm_head.weight.data.flatten() - last_layer_expert_model_params).double().pow(2).sum().item()
-            pbar.set_description(f"Current MSE: {mse:.3f} | Best MSE: {best_mse:.3f} at step {best_mse_step} | Steps since last improvement: {step - best_mse_step} | Loss: {loss.item():.3f}")
-            if mse < best_mse:
-                best_mse = mse
-                best_state_dict = copy.deepcopy(base_model.state_dict())
-                best_mse_step = step
-            elif step - best_mse_step > mse_step_patience:
-                pbar.close()
-                break
-        base_model.load_state_dict(best_state_dict)
-        mse_ratio = best_mse / original_mse
-        print(f"SELECTOptimizer: Warmup complete. Best MSE: {best_mse} | Best MSE step: {best_mse_step} | Original MSE: {original_mse} | MSE ratio: {mse_ratio}")
-    
-    
+                base_logits = base_logits[:, label_mask]
+                expert_logits = expert_logits[:, label_mask]
+
+                base_logprobs = base_logits.log_softmax(dim=-1)
+                expert_logprobs = expert_logits.log_softmax(dim=-1)
+                kl_div = torch.nn.functional.kl_div(
+                    base_logprobs, 
+                    expert_logprobs, 
+                    log_target=True,
+                    reduction="batchmean",
+                )
+                # Compute MSE between parameters
+                mse = torch.tensor(0.0, device=device)
+                for base_param, expert_param in zip(model.parameters(), expert_model.parameters()):
+                    mse += torch.nn.functional.mse_loss(base_param, expert_param.detach(), reduction="sum")
+
+                # loss = kl_div + mse
+                loss = (mse * 10.0) + kl_div
+                loss.backward()
+                optim.step()
+                optim.zero_grad()
+                
+                print(f"kl_div: {kl_div} | mse: {mse}")
+            # add pseudoexpert to list
+            pseudoexpert_model = copy.deepcopy(model)
+            pseudoexperts.append((pseudoexpert_model, i))
+            
+        
+        print(f"[SELECTOptimizer._run_create_pseudoexperts] Created {num_pseudoexperts} pseudoexperts | Final loss: {loss} | kl_div: {kl_div} | mse: {mse}")
+        breakpoint()
+        return pseudoexperts
+        
     def _rank_dataset_by_influence(
-            self, 
+            self,
+            expert_state_dict,
             full_base_params, full_expert_model_params,
             last_layer_base_params, last_layer_expert_model_params
         ) -> list:
@@ -187,12 +181,21 @@ class SELECTOptimizer(DiscreteOptimizer):
         if self.args.select_do_warmup:
             self._run_warmup(base_model, last_layer_expert_model_params)
         
-        # Use the new helper function to create pseudoexperts
-        pseudoexperts = _create_pseudoexperts(
+        # Create pseudoexperts by trajectory matching with random data
+        expert_model = copy.deepcopy(self.base_model)
+        expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"].to(device)
+        expert_model.load_state_dict(expert_state_dict)
+
+        expert_model_num_points = self.args.expert_batch_size * self.args.expert_epochs
+        random_idxs = random.sample(range(len(self.seed_dataset_train_split)), k=expert_model_num_points)
+
+        pseudoexperts = self._run_create_pseudoexperts(
             base_model, 
-            full_base_params, 
-            full_expert_model_params, 
-            num_pseudoexperts=self.args.select_num_pseudoexperts
+            expert_model=expert_model,
+            full_base_params=full_base_params, 
+            full_expert_model_params=full_expert_model_params, 
+            num_pseudoexperts=self.args.select_num_pseudoexperts,
+            dataset=self.seed_dataset_train_split.select(random_idxs),
         )
 
         get_grads = get_grads_full_model if self.args.select_grads_full_model else get_grads_final_layer
@@ -291,8 +294,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get the best remaining gradient
         if balanced:
             # Optionally we balance by label to avoid over-representing any one label
-            default_label_map = self.true_classification_dataset.label_map
-            tokenized_labels = [self.tokenizer.encode(f" {x}")[0] for x in default_label_map]
+            tokenized_labels = self.tokenized_labels
             best_idxs = []
             label_counts = { label: 0 for label in tokenized_labels }
             selected_data_by_label = { label: [] for label in tokenized_labels }
@@ -410,8 +412,11 @@ class SELECTOptimizer(DiscreteOptimizer):
         if (not len(self.batch)) or should_update_batch:
             self.base_model.to(device)
             self.batch = self._rank_dataset_by_influence(
-                full_base_params, full_expert_model_params,
-                last_layer_base_params, last_layer_expert_model_params
+                expert_state_dict=expert_state_dict,
+                full_base_params=full_base_params, 
+                full_expert_model_params=full_expert_model_params,
+                last_layer_base_params=last_layer_base_params, 
+                last_layer_expert_model_params=last_layer_expert_model_params
             )
         
         # Calculate current MSE
