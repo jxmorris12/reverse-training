@@ -41,14 +41,14 @@ class BatchedExactVectorDatabase(VectorDatabase):
     # supports a batch dimension, auto-takes a max
     # vectors.shape = (num_databases, database_size, num_vectors)
     def __init__(self, vectors: torch.Tensor, batch_size: int = 100_000):
-        super().__init__(vectors.to(torch.float16))
+        super().__init__(vectors.to(torch.float64))
         self.batch_size = batch_size
         self.ignore_mask = torch.zeros(vectors.shape[1], dtype=bool)
         self.vectors = self.vectors.to(device)
         
     def search(self, query_vector: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
         # Make sure query vector is on GPU
-        query_vector = query_vector.to(torch.float16)
+        query_vector = query_vector.to(torch.float64)
         query_vector = query_vector.to(device)
             
         # Setup tensors to store results
@@ -61,16 +61,21 @@ class BatchedExactVectorDatabase(VectorDatabase):
         for i in range(0, num_vectors, self.batch_size):
             # Get current batch
             end_idx = min(i + self.batch_size, num_vectors)
-            batch_vectors = self.vectors[:, i:end_idx].to(device)
+            batch_vectors = self.vectors[:, i:end_idx].to(device).double()
             batch_vectors_norm = batch_vectors / batch_vectors.norm(dim=-1, keepdim=True)
             batch_sims = batch_vectors_norm @ query_vector_norm.T
             batch_sims = batch_sims.max(dim=0).values
             all_sims.append(batch_sims.flatten())
+
+            if batch_sims.isnan().any():
+                raise ValueError("batch_sims contains NaNs")
         
         # Combine all batches
         combined_sims = torch.cat(all_sims)
         combined_sims[self.ignore_mask] = -float("inf")
         top_k_sims, top_k_indices = torch.topk(combined_sims, k, largest=True)
+
+        breakpoint()
         return top_k_sims, top_k_indices
     
     def remove_vectors(self, idxs: torch.Tensor):

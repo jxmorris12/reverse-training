@@ -41,7 +41,7 @@ class CudaProjector:
         proj_type: ProjectionType,
         device,
         max_batch_size: int = 256,
-        block_size: int = 128,
+        block_size: int = 512,
     ) -> None:
         self.grad_dim = grad_dim
         self.proj_dim = proj_dim
@@ -151,7 +151,6 @@ class CudaProjector:
         # Return the hash of this tuple
         return int(hashlib.md5(str(key_tuple).encode()).hexdigest(), 16)
         
-
 
 @find_executable_batch_size
 def _get_grads_final_layer_uncached(
@@ -320,6 +319,195 @@ def get_grads_final_layer(
     except:
         print(f"Getting grads for final layer with cache key: {full_cache_key} => {cache_key}")
         grads = _get_grads_final_layer_uncached(
+            student_net=student_net, 
+            dataset=dataset,
+            labels=labels, 
+            tokenizer=tokenizer, 
+            projector=projector, 
+            sequence_length=sequence_length, 
+            do_projection=do_projection,
+            use_adam=use_adam,
+        )
+        np.savez(cache_path, grads=grads.numpy())
+
+    grads = np.load(cache_path)["grads"]
+    return torch.from_numpy(grads)
+
+
+@find_executable_batch_size
+def _get_grads_full_model_uncached(
+        student_net, 
+        dataset, 
+        labels,
+        tokenizer, 
+        projector, 
+        sequence_length: int, 
+        do_projection: bool = True,
+        batch_size: int = 32,
+        use_adam: bool = False,
+    ) -> torch.Tensor:
+    """
+    Computes gradients for each example in the dataset with respect to the model parameters.
+    
+    Args:
+        student_net: The model to compute gradients for
+        dataset: The dataset containing examples
+        tokenizer: Tokenizer for processing text examples
+        projector: Projector for projecting gradients to a lower-dimensional space
+        sequence_length: Maximum sequence length for tokenization
+        batch_size: Number of examples to process at once
+        do_projection: Whether to project the gradients
+        use_adam: Whether to update gradients with adam optimizer states
+        
+    Returns:
+        A tensor of shape (len(dataset), projection_dim) containing the gradients
+    """
+    do_classification = (labels is not None)
+    all_grads = []
+    pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) // batch_size < 10))
+
+    # print first datapoint
+    print(f"[get_grads_full_model] First datapoint: {dataset[0]['text']}")
+    print(f"[get_grads_full_model] First datapoint label: {labels[0]}")
+
+    # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
+    params = {k: v.detach() for k, v in student_net.named_parameters()}
+    buffers = {k: v.detach() for k, v in student_net.named_buffers()}
+    
+    for batch_start in pbar:
+        batch_end = min(batch_start + batch_size, len(dataset))
+        batch = dataset.select(range(batch_start, batch_end))
+        
+        inputs = tokenizer(
+            batch["text"],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=sequence_length-1,
+        )
+        inputs = { k: v.to(device) for k, v in inputs.items() }
+
+        if do_classification:
+            # concatenate labels to end of input ids
+            inputs["input_ids"] = torch.cat([
+                inputs["input_ids"], 
+                labels[batch_start:batch_end][:, None].to(device),
+            ], dim=1)
+            inputs["attention_mask"] = torch.cat([
+                inputs["attention_mask"],
+                torch.ones(len(inputs["input_ids"]), 1, device=device),
+            ], dim=1)
+            # set labels
+            inputs["labels"] = inputs["input_ids"][:, 1:].detach().clone()
+            inputs["labels"][:, :-1] = -100
+        else:
+            inputs["labels"] = inputs["input_ids"].detach().clone()
+        
+        @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        def compute_loss(params, buffers, input_ids, attention_mask, labels):
+            net_output = torch.func.functional_call(
+                module=student_net,
+                parameter_and_buffer_dicts=(params, buffers),
+                kwargs={"input_ids": input_ids[None], "attention_mask": attention_mask[None]},
+            )[0]
+            
+            logits = net_output[:, :-1]
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), 
+                labels.reshape(-1).to(device),
+                ignore_index=-100,
+                reduction="mean"
+            )
+            # print(f"[get_grads_full_model] {input_ids.shape} | Loss = {loss:.3f}")
+            return loss
+
+        # Create vectorized gradient function
+        ft_compute_grad = torch.func.grad(compute_loss)
+        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0, 0))
+
+        # Non-vectorized gradient function
+        # ft_compute_sample_grad = torch.func.grad(compute_loss)
+
+        # Compute per-sample gradients
+        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
+        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in student_net.named_parameters()], dim=1)
+
+
+        if use_adam:
+            # We can just set the avg and avg_sq to 0 because we're 
+            # starting from step 0
+            grads_batch = obtain_gradients_with_adam(
+                grads_batch, 
+                avg=torch.zeros_like(grads_batch), 
+                avg_sq=torch.zeros_like(grads_batch),
+            )
+
+        grads_batch = grads_batch.double() / grads_batch.norm(dim=1, keepdim=True)
+        if do_projection:
+            projected_grads = projector.project(grads_batch, model_id=0)
+            all_grads.extend(projected_grads.cpu())
+        else:
+            all_grads.extend(grads_batch.cpu())
+        
+    return torch.stack(all_grads)
+
+
+def get_grads_full_model(
+        student_net, 
+        dataset, 
+        labels,
+        tokenizer, 
+        projector, 
+        sequence_length: int, 
+        do_projection: bool = True,
+        use_cache: bool = True,
+        model_cache_key: str = "",
+        use_adam: bool = False,
+    ) -> torch.Tensor:
+    """Get model predictions for the sequence_length-th token for each example in the dataset.
+    
+    Args:
+        dataset: Dataset to label
+        model: Model to use for labeling
+        tokenizer: Tokenizer for processing text
+        sequence_length: Maximum sequence length for tokenization
+        batch_size: Batch size for processing
+        
+    Returns:
+        Tensor of shape (len(dataset),) containing the predicted token ids
+    """
+    if not use_cache:
+        return _get_grads_full_model_uncached(
+            student_net=student_net, 
+            dataset=dataset, 
+            labels=labels, 
+            tokenizer=tokenizer, 
+            projector=projector, 
+            sequence_length=sequence_length, 
+            do_projection=do_projection,
+            use_adam=use_adam,
+        )
+    hash_kwargs = {
+        "student_net_hash": hash_model_params(student_net),
+        "dataset_hash": dataset._fingerprint,
+        "tokenizer_hash": tokenizer.name_or_path,
+        "projector_hash": projector.deterministic_hash(),
+        "sequence_length": sequence_length,
+        "do_projection": do_projection,
+        "model_cache_key": model_cache_key,
+        "use_adam": use_adam,
+    }
+    cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    full_cache_key = _get_cache_key(**hash_kwargs)
+    cache_key = hashlib.sha256(full_cache_key.encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, f"get_grads_full_model_{cache_key}.npz")
+
+    try:
+        grads = np.load(cache_path)["grads"]
+    except:
+        print(f"Getting grads for full model with cache key: {full_cache_key} => {cache_key}")
+        grads = _get_grads_full_model_uncached(
             student_net=student_net, 
             dataset=dataset,
             labels=labels, 

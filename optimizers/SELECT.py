@@ -15,7 +15,8 @@ from utils import (
 from utils.projection import (
     CudaProjector,
     ProjectionType,
-    get_grads_final_layer
+    get_grads_final_layer,
+    get_grads_full_model,
 )
 from utils.vector_search import (
     BatchedExactVectorDatabase,
@@ -92,7 +93,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             grad_dim=param_count,
             proj_dim=args.select_projection_dim,
             seed=0,
-            block_size=128,
+            block_size=256,
             proj_type=ProjectionType.rademacher,
             device=device,
             max_batch_size=256,
@@ -193,19 +194,24 @@ class SELECTOptimizer(DiscreteOptimizer):
             full_expert_model_params, 
             num_pseudoexperts=self.args.select_num_pseudoexperts
         )
+
+        get_grads = get_grads_full_model if self.args.select_grads_full_model else get_grads_final_layer
         for model, i in pseudoexperts:
+            # TODO: Add other expert hparams to model_cache_key – lr, steps, batch size.
             model_cache_key = self.base_model.config._name_or_path + f"_{i}_{self.args.select_num_pseudoexperts}"
             if self.args.select_do_warmup:
                 model_cache_key += f"_warmup"
-            batch_grads = get_grads_final_layer(
+            print(f"[SELECTOptimizer._rank_dataset_by_influence] Getting grads for model {i} | model_cache_key: {model_cache_key}")
+            batch_grads = get_grads(
                 model, 
                 self.seed_dataset_train_split, 
                 self.dataset_autolabels,
                 self.tokenizer, 
                 self.projector,
                 sequence_length=self.args.sequence_length, 
-                use_cache=True,
-                use_adam=True,
+                use_cache=False, # TMP
+                use_adam=False, # TMP
+                # do_projection=True, # TMP
                 model_cache_key=model_cache_key,
             )
             grads.append(batch_grads)
@@ -214,44 +220,45 @@ class SELECTOptimizer(DiscreteOptimizer):
         grads_db = BatchedExactVectorDatabase(grads)
         
         # Sanity check dimensions
-        projection_dim = self.args.select_projection_dim
-        assert grads.shape == (self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim), \
-            f"grads.shape: {grads.shape} != (self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim): {(self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim)}"
+        # projection_dim = self.argexpor.shape} != (self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim): {(self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim)}"
         
         # Fill batch using greedy algorithm
+        base_params = full_base_params if self.args.select_grads_full_model else last_layer_base_params
+        expert_params = full_expert_model_params if self.args.select_grads_full_model else last_layer_expert_model_params
+
         if self.args.select_batch_fill_strategy == "greedy":
             batch = self._fill_batch_greedy(
                 grads_db=grads_db,
-                last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params,
+                base_params=base_params,
+                expert_params=expert_params,
                 pseudoexperts=pseudoexperts,
             )
         elif self.args.select_batch_fill_strategy == "greedy_batched":
             batch = self._fill_batch_greedy(
                 grads_db=grads_db,
-                last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params,
+                base_params=base_params,
+                expert_params=expert_params,
                 pseudoexperts=pseudoexperts,
                 batched=True,
             )
         elif self.args.select_batch_fill_strategy == "topk":
             batch = self._fill_batch_topk(
                 grads_db=grads_db,
-                last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params,
+                base_params=base_params,
+                expert_params=expert_params,
             )
         elif self.args.select_batch_fill_strategy == "topk_balanced":
             batch = self._fill_batch_topk(
                 grads_db=grads_db,
-                last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params,
+                base_params=base_params,
+                expert_params=expert_params,
                 balanced=True,
             )
         elif self.args.select_batch_fill_strategy == "bottomk":
             batch = self._fill_batch_topk(
                 grads_db=grads_db,
-                last_layer_base_params=last_layer_base_params,
-                last_layer_expert_model_params=last_layer_expert_model_params,
+                base_params=base_params,
+                expert_params=expert_params,
                 reverse=True,
             )
         elif self.args.select_batch_fill_strategy == "random":
@@ -266,14 +273,14 @@ class SELECTOptimizer(DiscreteOptimizer):
     def _fill_batch_topk(
             self, 
             grads_db: BatchedExactVectorDatabase,
-            last_layer_base_params: torch.Tensor,
-            last_layer_expert_model_params: torch.Tensor,
+            base_params: torch.Tensor,
+            expert_params: torch.Tensor,
             reverse: bool = False,
             balanced: bool = False,
         ) -> list:
         """Fill a batch with the top k examples that have the most influence on optimization direction."""
         base_params_diff_projected = self.projector.project(
-            (last_layer_base_params - last_layer_expert_model_params), 
+            (base_params - expert_params), 
             model_id=0
         )
         
@@ -328,8 +335,8 @@ class SELECTOptimizer(DiscreteOptimizer):
     def _fill_batch_greedy(
             self, 
             grads_db: BatchedExactVectorDatabase,
-            last_layer_base_params: torch.Tensor,
-            last_layer_expert_model_params: torch.Tensor,
+            base_params: torch.Tensor,
+            expert_params: torch.Tensor,
             pseudoexperts: list[tuple[torch.nn.Module, int]],
             grad_recompute_steps: int = 32,
             batched: bool = False,
@@ -348,9 +355,10 @@ class SELECTOptimizer(DiscreteOptimizer):
         best_sim = float("-inf")
         # Project parameter difference
         base_params_diff_projected = self.projector.project(
-            (last_layer_base_params - last_layer_expert_model_params), 
+            (base_params - expert_params), 
             model_id=0
         )
+        # base_params_diff_projected = (base_params - expert_params).double() # TMP
 
         # Split grads_db per-label
         og_grads_db_vectors = grads_db.vectors.clone()
@@ -358,6 +366,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         overall_best_sim = float("-inf")
         while len(batch) < self.args.select_full_dataset_size:
             # Use cosine similarity to find best gradient
+            breakpoint()
             best_sim, best_idx = grads_db.search(base_params_diff_projected, 1)
             best_idx = best_idx.item()
             best_sim = best_sim.item()
@@ -365,7 +374,6 @@ class SELECTOptimizer(DiscreteOptimizer):
 
             # Add the selected gradient to our batch
             grads_db.remove_vectors(best_idx)
-
             batch.append(best_idx)
             # Compute full-resolution gradient
             # TODO: get actually best_idx (don't just set to 0)

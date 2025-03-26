@@ -240,9 +240,9 @@ def autolabel_dataset(
     labels = np.load(cache_path)["labels"]
 
     # Count unique labels
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    if len(unique_labels) != len(label_map):
-        raise ValueError(f"[autolabel_dataset] Number of unique labels ({len(unique_labels)}) does not match number of labels in label_map ({len(label_map)})")    
+    # unique_labels, counts = np.unique(labels, return_counts=True)
+    # if len(unique_labels) != len(label_map):
+        # raise ValueError(f"[autolabel_dataset] Number of unique labels ({len(unique_labels)}) does not match number of labels in label_map ({len(label_map)})")    
     
     return torch.from_numpy(labels)
 
@@ -406,7 +406,8 @@ def _train_expert_model_uncached(
     train_ds = ds["train"]
     eval_ds = ds["test"].select(range(num_eval_datapoints))
 
-    optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
+    # optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
+    optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
 
     expert_state_dicts = [_get_state_dict(student_net)]
     step = 0
@@ -424,12 +425,12 @@ def _train_expert_model_uncached(
 
     # Print first datapoint
     if ds_tokens is not None:
-        print(f"First datapoint: {ds_tokens[0]}")
-        print(f"First datapoint label: {ds_labels[0]}")
-        print(f"Label distribution: {ds_labels.unique(return_counts=True)}")
+        print(f"[train_expert_model] First datapoint: {ds_tokens[0]}")
+        print(f"[train_expert_model] First datapoint label: {ds_labels[0]}")
+        print(f"[train_expert_model] Label distribution: {ds_labels.unique(return_counts=True)}")
     else:
-        print(f"First datapoint: {train_ds[0][text_column_name]}")
-        print(f"First datapoint label: {train_ds[0][label_column_name]}")
+        print(f"[train_expert_model] First datapoint: {train_ds[0][text_column_name]}")
+        print(f"[train_expert_model] First datapoint label: {train_ds[0][label_column_name]}")
 
     for epoch in range(num_experts):
         for _i in range(num_steps_per_expert):
@@ -482,7 +483,10 @@ def _train_expert_model_uncached(
                         attention_mask=tokens.attention_mask,
                     )
                 # Track token counts
-                all_token_counts += torch.bincount(tokens.input_ids.flatten(), minlength=tokenizer.vocab_size)
+                all_token_counts += torch.bincount(
+                    tokens.input_ids.flatten(), 
+                    minlength=tokenizer.vocab_size
+                )
             
             logits = outputs.logits[:, :-1]
             loss = torch.nn.functional.cross_entropy(
@@ -491,6 +495,7 @@ def _train_expert_model_uncached(
                 ignore_index=-100,
                 reduction="mean"
             )
+            print(f"[train_expert_model] {tokens.input_ids.shape} | Loss = {loss:.3f}")
             pbar.set_description(f"Epoch {epoch} | Step {step+1} | Loss = {loss:.3f}")
             pbar.update(1)
             loss.backward()

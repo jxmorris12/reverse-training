@@ -193,7 +193,7 @@ class DatasetDistiller:
         expert_buffer, dataset_token_counts, expert_evaluation_metrics = train_expert_model(
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
-            expert_batch_size=self.args.minibatch_size,
+            expert_batch_size=self.args.expert_batch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
             ds=self.classification_dataset.dataset,
