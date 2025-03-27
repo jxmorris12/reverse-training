@@ -166,7 +166,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         """Rank dataset examples by influence on optimization direction"""
         assert self.args.select_full_dataset_size <= len(self.seed_dataset_train_split), \
             f"select_full_dataset_size: {self.args.select_full_dataset_size} must be less than dataset size: {len(self.seed_dataset_train_split)}"
-    
 
         # If we're using random batch fill strategy, we can already return the random batch
         if self.args.select_batch_fill_strategy == "random":
@@ -181,7 +180,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Create pseudoexperts by trajectory matching with random data
         expert_model = copy.deepcopy(self.base_model)
-        expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"].to(device)
         expert_model.load_state_dict(expert_state_dict)
 
         expert_model_num_points = self.args.expert_batch_size * self.args.expert_epochs
@@ -414,19 +412,28 @@ class SELECTOptimizer(DiscreteOptimizer):
         print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f} | Label distribution: {label_distribution}")
         return batch
     
-    def _prepare_model_state_dict(self, expert_state_dict: dict) -> dict:
+    def _restore_model_state_dict(self, expert_state_dict: dict) -> dict:
         """Prepare expert model state dict for use in SELECT."""
-        if "wte.weight" in expert_state_dict:
-            expert_state_dict.pop("wte.weight")
+        is_gpt2 = "gpt2" in self.args.base_model_name_or_path
+        if is_gpt2:
+            expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"]
         return expert_state_dict
     
     def _flatten_model_params(self, model_state_dict: dict) -> torch.Tensor:
         """Flatten model parameters."""
-        return torch.cat([v.flatten() for k, v in model_state_dict.items()]).cpu().double()
+        is_gpt2 = "gpt2" in self.args.base_model_name_or_path
+        forbidden_keys = {}
+        if is_gpt2 and "transformer.wte.weight"  in model_state_dict:
+            forbidden_keys = {"transformer.wte.weight"}
+        return torch.cat([v.flatten() for k, v in model_state_dict.items() if k not in forbidden_keys]).cpu().double()
     
     def _get_last_layer_params(self, model_state_dict: dict) -> torch.Tensor:
         """Get last layer parameters."""
-        return torch.cat([v.flatten() for k, v in model_state_dict.items() if "wte" in k]).cpu().double()
+        is_gpt2 = "gpt2" in self.args.base_model_name_or_path
+        if is_gpt2:
+            return torch.cat([v.flatten() for k, v in model_state_dict.items() if "wte" in k]).cpu().double()
+        else:
+            return torch.cat([v.flatten() for k, v in model_state_dict.items() if "lm_head" in k]).cpu().double()
 
     def step_with_grad(self, step: int, buffer: list) -> dict[str, torch.Tensor]:
         """Perform one step of SELECT optimization"""
@@ -435,7 +442,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         last_layer_base_params = self._get_last_layer_params(self.base_model.state_dict())
         
         # Get expert model parameters from buffer
-        expert_state_dict = self._prepare_model_state_dict(buffer[-1])
+        expert_state_dict = buffer[-1]
         full_expert_model_params = self._flatten_model_params(expert_state_dict)
         last_layer_expert_model_params = self._get_last_layer_params(expert_state_dict)
         
@@ -524,9 +531,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         if self.args.select_do_classification and self.dataset_autolabels is None:
             # Get labels from expert model
             expert_state_dict = buffer[-1]
-            expert_state_dict["lm_head.weight"] = expert_state_dict["transformer.wte.weight"].to(device)
             expert_model = copy.deepcopy(self.base_model)
-            expert_model.load_state_dict(expert_state_dict)
+            expert_model.load_state_dict(self._restore_model_state_dict(expert_state_dict))
             if self.args.select_label_strategy == "auto":
                 self.dataset_autolabels = autolabel_dataset(
                     dataset=self.seed_dataset_train_split,

@@ -236,7 +236,7 @@ def _get_grads_final_layer_uncached(
             all_grads.extend(projected_grads.cpu())
         else:
             all_grads.extend(grads_batch.cpu())
-        
+    
     return torch.stack(all_grads).to(torch.float16)
 
 
@@ -411,6 +411,7 @@ def _get_grads_full_model_uncached(
         else:
             all_grads.extend(grads_batch.cpu())
         
+    print(f"[get_grads_full_model] grads_batch.shape: {grads_batch.shape}")
     return torch.stack(all_grads)
 
 
