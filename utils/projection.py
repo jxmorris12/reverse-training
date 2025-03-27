@@ -66,6 +66,8 @@ class CudaProjector:
         # Convert dict to tensor if needed
         if isinstance(x, dict):
             x = vectorize(x, device=self.device)
+
+        x = x.to(self.device)
         
         # Optionally add a batch dimension
         if x.ndim == 1:
@@ -75,6 +77,7 @@ class CudaProjector:
         dim = x.shape[1]
 
         if self._dimension_lock is None:
+            print(f"[CudaProjector] Setting dimension lock to {dim}")
             self._dimension_lock = dim
         elif self._dimension_lock != dim:
             raise ValueError(f"Dimension of input to projector changed from {self._dimension_lock} to {dim}.")

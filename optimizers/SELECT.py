@@ -41,7 +41,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.tokenizer = tokenizer
         self.student_net = student_net
         self.initial_student_net = initial_student_net
-        self.base_model = get_model("gpt2")
+        self.base_model = get_model(args.base_model_name_or_path)
 
         self.Y = Y
 
@@ -229,9 +229,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         grads = torch.stack(grads, dim=0)
         grads_db = BatchedExactVectorDatabase(grads)
         
-        # Sanity check dimensions
-        # projection_dim = self.argexpor.shape} != (self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim): {(self.args.select_num_pseudoexperts, len(self.seed_dataset_train_split), projection_dim)}"
-        
         # Fill batch using greedy algorithm
         base_params = full_base_params if self.args.select_grads_full_model else last_layer_base_params
         expert_params = full_expert_model_params if self.args.select_grads_full_model else last_layer_expert_model_params
@@ -416,19 +413,31 @@ class SELECTOptimizer(DiscreteOptimizer):
         label_distribution = self.dataset_autolabels[batch].unique(return_counts=True)
         print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f} | Label distribution: {label_distribution}")
         return batch
+    
+    def _prepare_model_state_dict(self, expert_state_dict: dict) -> dict:
+        """Prepare expert model state dict for use in SELECT."""
+        if "wte.weight" in expert_state_dict:
+            expert_state_dict.pop("wte.weight")
+        return expert_state_dict
+    
+    def _flatten_model_params(self, model_state_dict: dict) -> torch.Tensor:
+        """Flatten model parameters."""
+        return torch.cat([v.flatten() for k, v in model_state_dict.items()]).cpu().double()
+    
+    def _get_last_layer_params(self, model_state_dict: dict) -> torch.Tensor:
+        """Get last layer parameters."""
+        return torch.cat([v.flatten() for k, v in model_state_dict.items() if "wte" in k]).cpu().double()
 
     def step_with_grad(self, step: int, buffer: list) -> dict[str, torch.Tensor]:
         """Perform one step of SELECT optimization"""
         # Get current model parameters
-        full_base_params = torch.cat([p.flatten().cpu().detach().requires_grad_(False) for p in self.base_model.parameters()]).double().to(device)
-        last_layer_base_params = torch.cat([p.flatten().cpu().detach().requires_grad_(False) for p in self.base_model.lm_head.parameters()]).double().to(device)
+        full_base_params = self._flatten_model_params(self.base_model.state_dict())
+        last_layer_base_params = self._get_last_layer_params(self.base_model.state_dict())
         
         # Get expert model parameters from buffer
-        expert_state_dict = buffer[-1]
-        if "wte.weight" in expert_state_dict:
-            expert_state_dict.pop("wte.weight")
-        full_expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items()]).double().to(device)
-        last_layer_expert_model_params = torch.cat([v.flatten() for k, v in expert_state_dict.items() if "wte" in k]).double().to(device)
+        expert_state_dict = self._prepare_model_state_dict(buffer[-1])
+        full_expert_model_params = self._flatten_model_params(expert_state_dict)
+        last_layer_expert_model_params = self._get_last_layer_params(expert_state_dict)
         
         # Update batch if needed
         should_update_batch = (self.args.select_steps_per_grad > 0) and (step % self.args.select_steps_per_grad == 0)

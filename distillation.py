@@ -26,19 +26,19 @@ class DatasetDistiller:
     def __init__(self, args):
         # train model for a couple steps
         self.args = args
-        tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.base_model_name_or_path)
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
         self.tokenizer = tokenizer
-        self.initial_student_net = get_model("gpt2")
-        self.student_net = ReparamModule(get_model("gpt2")).to(device)
+        self.initial_student_net = get_model(args.base_model_name_or_path)
+        self.student_net = ReparamModule(get_model(args.base_model_name_or_path)).to(device)
         self.classification_dataset = self._load_dataset()
         self.dataset_token_counts = None
 
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.args.token_init == "random":
             student_token_embeddings = self.initial_student_net.get_input_embeddings().to(device)
-            tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+            tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.base_model_name_or_path)
             X_tokens = torch.randint(
                 low=0,
                 high=tokenizer.vocab_size,
@@ -158,6 +158,7 @@ class DatasetDistiller:
 
         # run full evaluation
         _, __, evaluation_metrics = train_expert_model(
+            base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_eval_epochs,
             num_steps_per_expert=max(1, len(tokens) // self.args.expert_batch_size),
             expert_batch_size=self.args.expert_batch_size,
@@ -184,6 +185,12 @@ class DatasetDistiller:
         torch.distributed.broadcast_object_list(expert_buffer, src=0)
         # broadcast dataset_token_counts from rank 0 to all other ranks
         torch.distributed.broadcast(dataset_token_counts, src=0)
+    
+    def _run_defense(self, expert_buffer: list[dict[str, torch.Tensor]]) -> tuple[list[dict[str, torch.Tensor]], dict[str, float]]:
+        if self.args.defense == None:
+            return expert_buffer, {}
+        else:
+            raise NotImplementedError(f"Defense {self.args.defense} not implemented")
 
     def _run_distillation(self) -> tuple:
         # initialize parameters & optimizers
@@ -191,6 +198,7 @@ class DatasetDistiller:
 
         # load/generate expert trajectories
         expert_buffer, dataset_token_counts, expert_evaluation_metrics = train_expert_model(
+            base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
             expert_batch_size=self.args.expert_batch_size,
@@ -200,6 +208,7 @@ class DatasetDistiller:
             text_column_name=self.classification_dataset.text_column_name,
             label_column_name=self.classification_dataset.label_column_name,
         )
+        new_expert_buffer, new_expert_evaluation_metrics = self._run_defense(expert_buffer)
         self.dataset_token_counts = dataset_token_counts.cpu()
         
         # handle distributed

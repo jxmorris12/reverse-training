@@ -184,10 +184,51 @@ class ClassificationDataset:
         elif dataset_name.startswith("newsgroup_") and dataset_name[10:].isdigit():
             num_samples = int(dataset_name[10:])
             ds = datasets.load_dataset("SetFit/20_newsgroups")
-            ds["train"] = ds["train"].select(range(num_samples))
+            ds["train"] = ds["train"].shuffle(seed=seed).select(range(num_samples))
+            ds["test"] = ds["test"].shuffle(seed=42)
             text_column_name = "text"
             label_column_name = "label"
             label_map = NEWSGROUP_LABEL_MAP
+        elif dataset_name == "rotten_tomatoes":
+            ds = datasets.load_dataset("cornell-movie-review-data/rotten_tomatoes")
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = {
+                "0": "neg",
+                "1": "pos",
+            }
+        elif dataset_name.startswith("rotten_tomatoes_") and dataset_name[16:].isdigit():
+            num_samples = int(dataset_name[16:])
+            ds = datasets.load_dataset("cornell-movie-review-data/rotten_tomatoes")
+            ds["train"] = ds["train"].shuffle(seed=seed).select(range(num_samples))
+            ds["test"] = ds["test"].shuffle(seed=42)
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = {
+                "0": "neg",
+                "1": "pos",
+            }
+        elif dataset_name == "imdb":
+            ds = datasets.load_dataset("stanfordnlp/imdb")
+            ds["train"] = ds["train"].shuffle(seed=seed)
+            ds["test"] = ds["test"].shuffle(seed=42)
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = {
+                "0": "Negative",
+                "1": "Positive",
+            }
+        elif dataset_name.startswith("imdb_") and dataset_name[5:].isdigit():
+            num_samples = int(dataset_name[5:])
+            ds = datasets.load_dataset("stanfordnlp/imdb")
+            ds["train"] = ds["train"].shuffle(seed=seed).select(range(num_samples))
+            ds["test"] = ds["test"].shuffle(seed=42)
+            text_column_name = "text"
+            label_column_name = "label"
+            label_map = {
+                "0": "Negative",
+                "1": "Positive",
+            }   
         elif dataset_name == "dbpedia":
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")
             ds = ds.map(_make_dbpedia_text)

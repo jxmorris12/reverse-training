@@ -384,6 +384,7 @@ def _eval_expert_model(
 
 
 def _train_expert_model_uncached(
+        base_model_name_or_path: str,
         num_experts: int, 
         num_steps_per_expert: int, 
         expert_batch_size: int, 
@@ -398,8 +399,8 @@ def _train_expert_model_uncached(
         # num_eval_datapoints: int = 1024,
         num_eval_datapoints: int = 2048,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
-    student_net = get_model("gpt2").to(device)
-    tokenizer = transformers.AutoTokenizer.from_pretrained("gpt2")
+    student_net = get_model(base_model_name_or_path).to(device)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(base_model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left" # important for correct truncation
     tokenizer.padding_side = "left" 
@@ -563,6 +564,7 @@ def _train_expert_model_uncached(
 
 
 def train_expert_model(
+        base_model_name_or_path: str,
         num_experts: int, 
         num_steps_per_expert: int, 
         expert_batch_size: int, 
@@ -583,6 +585,7 @@ def train_expert_model(
     
     # Generate cache key based on all parameters
     cache_kwargs = {
+        "base_model_name_or_path": base_model_name_or_path,
         "num_experts": num_experts,
         "num_steps_per_expert": num_steps_per_expert,
         "expert_batch_size": expert_batch_size,
@@ -595,6 +598,7 @@ def train_expert_model(
         **kwargs  # Include any additional kwargs in cache key generation
     }
     cache_key = _get_cache_key(**cache_kwargs)
+    cache_key = hashlib.sha256(cache_key.encode()).hexdigest()
     cache_path = os.path.join(cache_dir, f"expert_model_{cache_key}.pkl")
 
     uncachable_args_provided = (ds_tokens is not None) or (ds_labels is not None)
@@ -628,6 +632,7 @@ def train_expert_model(
         print0(f"Training expert model with {num_datapoints} datapoints / batch size {expert_batch_size}")
     
     results = _train_expert_model_uncached(
+        base_model_name_or_path=base_model_name_or_path,
         num_experts=num_experts,
         num_steps_per_expert=num_steps_per_expert,
         expert_batch_size=expert_batch_size,
