@@ -93,4 +93,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    if args.base_model_name_or_path == "tinyllama":
+        args.base_model_name_or_path = "TinyLlama/TinyLlama_v1.1"
+
     main(args)
