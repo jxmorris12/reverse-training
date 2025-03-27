@@ -252,8 +252,12 @@ def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     state_dict = model.state_dict()
     
     # hack to get around gpt weight-tying:
-    if torch.isclose(state_dict["transformer.wte.weight"], state_dict["lm_head.weight"]).all():
-        del state_dict["lm_head.weight"]
+    try:
+        # this literally only matters for gpt2
+        if torch.isclose(state_dict["transformer.wte.weight"], state_dict["lm_head.weight"]).all():
+            del state_dict["lm_head.weight"]
+    except KeyError:
+        pass
     
     return { k: v.detach().clone() for k,v in state_dict.items() }
 

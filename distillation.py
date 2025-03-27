@@ -37,45 +37,46 @@ class DatasetDistiller:
         self.dataset_token_counts = None
 
     def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.args.token_init == "random":
-            student_token_embeddings = self.initial_student_net.get_input_embeddings().to(device)
-            tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.base_model_name_or_path)
-            X_tokens = torch.randint(
-                low=0,
-                high=tokenizer.vocab_size,
-                size=[self.args.dataset_size, self.args.sequence_length - 1],
-                device=device,
-            )
-            X = student_token_embeddings(X_tokens)
+        return (None, None)
+        # if self.args.token_init == "random":
+        #     student_token_embeddings = self.initial_student_net.get_input_embeddings().to(device)
+        #     tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.base_model_name_or_path)
+        #     X_tokens = torch.randint(
+        #         low=0,
+        #         high=tokenizer.vocab_size,
+        #         size=[self.args.dataset_size, self.args.sequence_length - 1],
+        #         device=device,
+        #     )
+        #     X = student_token_embeddings(X_tokens)
 
-            num_classes = 4
-            CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
-            token_labels_syn = torch.randint(low=0, high=num_classes, size=[self.args.dataset_size], device=device)
-            Y = CLASS_MAP[token_labels_syn]
+        #     num_classes = 4
+        #     CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
+        #     token_labels_syn = torch.randint(low=0, high=num_classes, size=[self.args.dataset_size], device=device)
+        #     Y = CLASS_MAP[token_labels_syn]
 
-        elif self.args.token_init == "random_soft":
-            X, Y = [], []
-            init_minibatch_size = 512
-            for _ in trange_if_main_worker(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
-                x, y = get_token_embeddings_random_soft(
-                    student_net=self.initial_student_net,
-                    dataset_size=min(init_minibatch_size, self.args.dataset_size),
-                    sequence_length=self.args.sequence_length,
-                )
-                X.append(x)
-                Y.append(y)
-            X = torch.cat(X, dim=0)
-            Y = torch.cat(Y, dim=0)
-        elif self.args.token_init == "dataset":
-            X, Y = get_token_embeddings_from_classification_dataset(
-                dataset_size=self.args.dataset_size, 
-                sequence_length=self.args.sequence_length,
-                classification_dataset=self.classification_dataset
-            )
-        else:
-            raise NotImplementedError(f"Token init {self.args.token_init} not implemented")
-        X = X.detach().to(device).requires_grad_(True)
-        return X, Y
+        # elif self.args.token_init == "random_soft":
+        #     X, Y = [], []
+        #     init_minibatch_size = 512
+        #     for _ in trange_if_main_worker(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
+        #         x, y = get_token_embeddings_random_soft(
+        #             student_net=self.initial_student_net,
+        #             dataset_size=min(init_minibatch_size, self.args.dataset_size),
+        #             sequence_length=self.args.sequence_length,
+        #         )
+        #         X.append(x)
+        #         Y.append(y)
+        #     X = torch.cat(X, dim=0)
+        #     Y = torch.cat(Y, dim=0)
+        # elif self.args.token_init == "dataset":
+        #     X, Y = get_token_embeddings_from_classification_dataset(
+        #         dataset_size=self.args.dataset_size, 
+        #         sequence_length=self.args.sequence_length,
+        #         classification_dataset=self.classification_dataset
+        #     )
+        # else:
+        #     raise NotImplementedError(f"Token init {self.args.token_init} not implemented")
+        # X = X.detach().to(device).requires_grad_(True)
+        # return X, Y
     
     def _load_dataset(self) -> ClassificationDataset:
         return ClassificationDataset.from_dataset_name(self.args.dataset, seed=self.args.seed)

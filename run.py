@@ -89,7 +89,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--defense", type=str, default=None, help="defense to use", choices=["none", "gaussian", "retrain"])
     parser.add_argument("--exp_name", type=str, required=True, help="experiment name [user-provided str]")
-    parser.add_argument("--base_model_name_or_path", type=str, default="gpt2", help="base model name or path")
+    parser.add_argument("--base_model_name_or_path", "--model", type=str, default="gpt2", help="base model name or path")
 
     args = parser.parse_args()
 
