@@ -8,3 +8,5 @@ results/
 saves/
 wandb/
 data/
+slurm_out/
+*.sh

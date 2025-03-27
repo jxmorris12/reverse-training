@@ -48,13 +48,17 @@ def perform_ablation_study(ref_texts: list[str], rec_texts: list[str], replaceme
         avg_sinkhorn = np.mean([m["sinkhorn_distance"] for m in metrics_list])
         avg_optimal_matching_relaxed_wmd = np.mean([m["optimal_matching_relaxed_wmd"]["average_relaxed_wmd"] for m in metrics_list])
         avg_optimal_matching_relaxed_wmd_min = np.mean([m["optimal_matching_relaxed_wmd"]["min_relaxed_wmd"] for m in metrics_list])
-        avg_optimal_matching_relaxed_wmd_min = np.mean([m["optimal_matching_relaxed_wmd"]["max_relaxed_wmd"] for m in metrics_list])
+        avg_optimal_matching_relaxed_wmd_max = np.mean([m["optimal_matching_relaxed_wmd"]["max_relaxed_wmd"] for m in metrics_list])
 
         avg_jaccard_examples = np.mean([m["jaccard_overlap_examples"] for m in metrics_list])
         avg_jaccard_vocab = np.mean([m["jaccard_overlap_vocabulary"] for m in metrics_list])
+
         avg_lev_avg = np.mean([m["levenshtein_stats"]["average_distance"] for m in metrics_list])
         avg_lev_min = np.mean([m["levenshtein_stats"]["min_distance"] for m in metrics_list])
         avg_lev_max = np.mean([m["levenshtein_stats"]["max_distance"] for m in metrics_list])
+        
+        avg_containment_similarity_examples = np.mean([m["containment_similarity_examples"] for m in metrics_list])
+        avg_containment_similarity_vocab = np.mean([m["containment_similarity_vocabulary"] for m in metrics_list])
         
         ablation_results[f"{percent}%"] = {
             "average_full_ot_distance": float(avg_full_ot),
@@ -62,6 +66,8 @@ def perform_ablation_study(ref_texts: list[str], rec_texts: list[str], replaceme
             "average_optimal_matching_relaxed_wmd": float(avg_optimal_matching_relaxed_wmd),
             "average_jaccard_overlap_examples": float(avg_jaccard_examples),
             "average_jaccard_overlap_vocabulary": float(avg_jaccard_vocab),
+            "average_containment_similarity_examples": float(avg_containment_similarity_examples),
+            "average_containment_similarity_vocabulary": float(avg_containment_similarity_vocab),
             "average_levenshtein_distance": float(avg_lev_avg),
             "min_levenshtein_distance": float(avg_lev_min),
             "max_levenshtein_distance": float(avg_lev_max)
@@ -94,19 +100,33 @@ def load_datasets(reference_parquet: str, recovered_json: str, ) -> tuple[list[s
     return reference_texts, recovered_texts
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Run ablation study on dataset recovery")
+    parser.add_argument("--reference", required=True, help="Path to reference dataset (parquet)")
+    parser.add_argument("--recovered", required=True, help="Path to recovered dataset (json)")
+    parser.add_argument("--output", required=True, help="Path to output file")
+    parser.add_argument("--trials", type=int, default=5, help="Number of trials per percentage")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--percentages", type=int, nargs="+", help="Replacement percentages")
+    
+    args = parser.parse_args()
+  
     
     # File paths (adjust if needed)
-    reference_file = "data/train_ds.parquet"
-    recovered_file = "data/ex_1000.json"
+    reference_file = args.reference
+    recovered_file = args.recovered
     
     # Load datasets and extract the "text" field
     reference_texts, recovered_texts = load_datasets(reference_file, recovered_file)
     
     # For ablation study, we assume both lists are of equal length.
     # If not, you might need to sample or match lengths.
-    min_len = min(len(reference_texts), len(recovered_texts))
-    reference_texts = reference_texts[:min_len]
-    recovered_texts = recovered_texts[:min_len]
+
+    # Found the "problem" #
+    # min_len = min(len(reference_texts), len(recovered_texts))
+    # reference_texts = reference_texts[:min_len]
+    # recovered_texts = recovered_texts[:min_len]
     
     # Define the replacement percentages: 0%, 10%, ..., 100%
     replacement_percents = list(range(0, 101, 10))
@@ -115,7 +135,7 @@ if __name__ == "__main__":
     ablation_results = perform_ablation_study(reference_texts, recovered_texts, replacement_percents, num_trials=1, seed=42)
     
     # Save the ablation results to a JSON file
-    output_filename = "ablation_results/ablation_study_results_ex1000_add.json"
+    output_filename = args.output
     with open(output_filename, "w") as f:
         json.dump(ablation_results, f, indent=4)
     

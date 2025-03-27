@@ -522,7 +522,10 @@ def evaluate_dataset_similarity(raw_reference_dataset: list[str], raw_recovered_
 
     jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
     jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
-    levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
+
+    #BUG Found: the function is implemented at the opposite. 
+    # levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
+    levenshtein_stats = dataset_levenshtein_closest_pair_statistics(recovered_dataset, reference_dataset)
 
     containment_similarity_examples_score = containment_similarity_examples(reference_dataset, recovered_dataset)
     containment_similarity_vocabulary_score = containment_similarity_vocabulary(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
