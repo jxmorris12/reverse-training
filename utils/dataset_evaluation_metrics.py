@@ -437,29 +437,28 @@ def optimal_matching_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, mode
     return optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B)
 
 
-def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset: list[str]) -> dict[str, float]:
+def evaluate_dataset_similarity(raw_reference_dataset: list[str], raw_recovered_dataset: list[str], max_tokens: int = 32) -> dict[str, float]:
     """
     Evaluate two datasets (reference and recovered) using dataset-level OT metrics,
     and save the results to a JSON file.
     
     Parameters:
-      - reference_dataset (list of str): The ground truth dataset.
-      - recovered_dataset (list of str): The recovered dataset.
+      - raw_reference_dataset (list of str): The ground truth dataset.
+      - raw_recovered_dataset (list of str): The recovered dataset.
       
     Returns:
       - results (dict): A dictionary containing the computed metrics.
     """
     # Pre-process all texts once for Levenshtein distance
-    max_tokens = 64
 
     tokenized_ref_texts = [
         tokenizer.tokenize(text, max_length=max_tokens, padding=True, truncation=True) 
-        for text in reference_dataset
+        for text in raw_reference_dataset
     ]
     reference_dataset = list(map(tokenizer.convert_tokens_to_string, tokenized_ref_texts))
     tokenized_rec_texts = [
         tokenizer.tokenize(text, max_length=max_tokens, padding=True, truncation=True) 
-        for text in recovered_dataset
+        for text in raw_recovered_dataset
     ]
     recovered_dataset = list(map(tokenizer.convert_tokens_to_string, tokenized_rec_texts))
     

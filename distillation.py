@@ -137,10 +137,10 @@ class DatasetDistiller:
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)
 
-    def _evaluate_and_log(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> dict[str, float]:
-        self._log_table(tokens, labels, step=step)
-        tokens = tokens.cpu()
-        labels = labels.cpu() if labels is not None else None
+    def _evaluate_and_log(self, Z_text: torch.Tensor, Z_tokens: torch.Tensor, Y: torch.Tensor, step: int) -> dict[str, float]:
+        self._log_table(Z_tokens, Y, step=step)
+        tokens = Z_tokens.cpu()
+        labels = Y.cpu()
 
         # TODO: Recheck the below logic!
         # compare tokens to dataset_token_counts
@@ -220,13 +220,13 @@ class DatasetDistiller:
         all_evaluation_metrics = []
         total_time_in_evaluation = 0
         for step in pbar:
-            Z, metrics = discrete_optimizer.step(step, expert_buffer)
+            Z_text, Z_tokens, Y, metrics = discrete_optimizer.step(step, expert_buffer)
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=step)
 
             if (step + 1) % self.args.eval_every == 0:
                 eval_start_time = time.time()
-                evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
+                evaluation_metrics = self._evaluate_and_log(Z_text, Z_tokens, Y, step=step)
                 evaluation_metrics["step"] = step
                 all_evaluation_metrics.append(evaluation_metrics)
                 eval_end_time = time.time()
@@ -241,7 +241,7 @@ class DatasetDistiller:
 
         print("Stopping distillation...")
         eval_start_time = time.time()
-        final_evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
+        final_evaluation_metrics = self._evaluate_and_log(Z_text, Z_tokens, Y, step=step)
         wandb.finish()
         eval_end_time = time.time()
         total_time_in_evaluation += eval_end_time - eval_start_time
@@ -257,22 +257,19 @@ class DatasetDistiller:
         gc.collect()
         torch.cuda.empty_cache()
 
-        return (Z.cpu(), discrete_optimizer.Y.cpu(), output)
+        return (Z_text, Z_tokens.cpu(), Y.cpu(), output)
 
     def run_distillation(self):
         import time
         start_time = time.time()
-        tokens, labels, output_metrics = self._run_distillation()
+        output_dataset, tokens, labels, output_metrics = self._run_distillation()
         end_time = time.time()
         print(f"Distillation total time: {end_time - start_time} seconds")
 
         # Compute dataset-level metrics
         input_dataset = self.classification_dataset.dataset["train"][self.classification_dataset.text_column_name]
-        output_dataset = self.tokenizer.batch_decode(
-            tokens, add_special_tokens=False
-        )
         print(f"[run_distillation] Computing dataset-level metrics with {len(input_dataset)} examples and {len(output_dataset)} output examples")
-        dataset_evaluation_metrics = evaluate_dataset_similarity(input_dataset, output_dataset)
+        dataset_evaluation_metrics = evaluate_dataset_similarity(input_dataset, output_dataset, max_tokens=self.args.sequence_length)
         print(dataset_evaluation_metrics)
 
         data = {

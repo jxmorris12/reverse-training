@@ -550,12 +550,13 @@ class SELECTOptimizer(DiscreteOptimizer):
                 raise ValueError(f"Invalid label strategy: {self.args.select_label_strategy}")
         
         metrics = self.step_with_grad(step, buffer)
+        X = self.seed_dataset_train_split.select(self.batch)["text"]
         X_tokens = torch.stack([
             self._tokenize_dataset_cached(i)
             for i in self.batch
         ])
-        self.Y = self.dataset_autolabels[self.batch]
-        return X_tokens, metrics
+        Y = self.dataset_autolabels[self.batch]
+        return X, X_tokens, Y, metrics
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:
         """Tokenize dataset entry with caching.
