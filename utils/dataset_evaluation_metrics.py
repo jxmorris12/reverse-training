@@ -110,7 +110,7 @@ def jaccard_overlap_examples(dataset1, dataset2):
     """
     set1 = set(dataset1)
     set2 = set(dataset2)
-    return jaccard_similarity(set1, set2)
+    return jaccard_similarity(set1, set2) * 100
 
 def jaccard_overlap_vocabulary(dataset1_token_sets, dataset2_token_sets):
     """
@@ -123,7 +123,7 @@ def jaccard_overlap_vocabulary(dataset1_token_sets, dataset2_token_sets):
     tokens2 = set()
     for tokens in dataset2_token_sets:
         tokens2.update(tokens)
-    return jaccard_similarity(tokens1, tokens2)
+    return jaccard_similarity(tokens1, tokens2) * 100
 
 
 def jaccard_overlap_vocabulary_truncated(dataset1_tokens, dataset2_tokens):
@@ -133,7 +133,7 @@ def jaccard_overlap_vocabulary_truncated(dataset1_tokens, dataset2_tokens):
     tokens2 = set()
     for tokens in dataset2_tokens:
         tokens2.update(tokens)
-    return jaccard_similarity(tokens1, tokens2)
+    return jaccard_similarity(tokens1, tokens2) * 100
 
 
 def compute_levenshtein_distance(s1, s2):
@@ -180,6 +180,49 @@ def dataset_levenshtein_closest_pair_statistics(dataset_A, dataset_B):
     }
     return stats
 
+
+def containment_similarity_examples(dataset1, dataset2):
+    """
+    Compute the containment similarity for two datasets at the example level,
+    after truncating each example to max_tokens tokens.
+
+    dataset 1 is our ground truth data (ref)
+    dataset 2 is our recovered data (rec)
+    
+    Returns a percentage (0-100) where 100 indicates that one dataset is a subset of the other.
+    """
+    set1 = set(dataset1)
+    set2 = set(dataset2)
+
+    if not set1 or not set2:
+        return 0.0
+    
+    containment = max(len(set1.intersection(set2)) / len(set1),
+                      len(set1.intersection(set2)) / len(set2))
+    return containment * 100
+
+
+def containment_similarity_vocabulary(dataset1_token_sets, dataset2_token_sets):
+    """
+    Compute the containment similarity based on the union of tokens from each dataset,
+    after truncating each example to max_tokens tokens.
+    
+    Returns a percentage (0-100) where 100 indicates full containment at the token level.
+    """
+    tokens1 = set()
+    for tokens in dataset1_token_sets:
+        tokens1.update(tokens)
+    tokens2 = set()
+    for tokens in dataset2_token_sets:
+        tokens2.update(tokens)
+
+    
+    if not tokens1 or not tokens2:
+        return 0.0
+    
+    containment = max(len(tokens1.intersection(tokens2)) / len(tokens1),
+                      len(tokens1.intersection(tokens2)) / len(tokens2))
+    return containment * 100
 
 ##############################
 # Lexical-Based OT Metrics
@@ -481,6 +524,9 @@ def evaluate_dataset_similarity(raw_reference_dataset: list[str], raw_recovered_
     jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
     levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
 
+    containment_similarity_examples_score = containment_similarity_examples(reference_dataset, recovered_dataset)
+    containment_similarity_vocabulary_score = containment_similarity_vocabulary(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
+
     # Use the preprocessed texts for the discrete OT distances
     discrete_ot_distance_levenshtein_score = discrete_ot_distance_levenshtein(
         reference_dataset, recovered_dataset,
@@ -496,12 +542,15 @@ def evaluate_dataset_similarity(raw_reference_dataset: list[str], raw_recovered_
         "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
         "jaccard_overlap_examples": jaccard_overlap_examples_score,
         "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_truncated_score,
+        "containment_similarity_examples": containment_similarity_examples_score,
+        "containment_similarity_vocabulary": containment_similarity_vocabulary_score,
         "levenshtein_stats": levenshtein_stats,
         "discrete_ot_distance_levenshtein": discrete_ot_distance_levenshtein_score,
         "discrete_ot_distance_jaccard": discrete_ot_distance_jaccard_score,
     }
     
     return results
+
 
 
 def dummy_test():
@@ -511,15 +560,16 @@ def dummy_test():
     dataset_A = [
         "The quick brown fox jumps over the lazy dog.",
         "Hello world, this is a test sentence.",
+        "I eat a dog.",
+        "Transformers have revolutionized NLP.",
         "Data science and machine learning are evolving fields.",
-        "Transformers have revolutionized NLP."
     ]
     
     dataset_B = [
-        "Transformers have changed the landscape of NLP.",
-        "Hello world, this is an example test sentence.",
-        "Data science and AI are rapidly evolving.",
-        "The quick brown fox leaps over the lazy dog."
+        "Hello world, this is a test sentence.",
+        "The quick brown fox jumps over the lazy dog.",
+        "Data science and machine learning are evolving fields.",
+        "Transformers have revolutionized NLP."
     ]
     
     results = evaluate_dataset_similarity(dataset_A, dataset_B)
