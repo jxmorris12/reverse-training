@@ -40,7 +40,8 @@ class ExactVectorDatabase(VectorDatabase):
 class BatchedExactVectorDatabase(VectorDatabase):
     # supports a batch dimension, auto-takes a max
     # vectors.shape = (num_databases, database_size, num_vectors)
-    def __init__(self, vectors: torch.Tensor, batch_size: int = 100_000):
+    # TODO: Is there a smart way to automatically tune this size?
+    def __init__(self, vectors: torch.Tensor, batch_size: int = 200_000):
         super().__init__(vectors.to(torch.float64))
         self.batch_size = batch_size
         self.ignore_mask = torch.zeros(vectors.shape[1], dtype=bool)

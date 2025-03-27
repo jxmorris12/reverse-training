@@ -4,7 +4,9 @@ import pickle
 import os
 
 def load_results(path: str) -> dict:
-    files = glob.glob(os.path.join(path, "*.pkl"))
+    pkl_glob = os.path.join(path, "*.pkl")
+    files = glob.glob(pkl_glob)
+    print(f"Found {len(files)} files in {pkl_glob}")
     results = []
     for file in files:
         with open(file, "rb") as f:

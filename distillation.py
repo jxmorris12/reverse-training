@@ -242,7 +242,11 @@ class DatasetDistiller:
         return (Z.cpu(), discrete_optimizer.Y.cpu(), output)
 
     def run_distillation(self):
+        import time
+        start_time = time.time()
         tokens, labels, output_metrics = self._run_distillation()
+        end_time = time.time()
+        print(f"Distillation total time: {end_time - start_time} seconds")
 
         # Compute dataset-level metrics
         input_dataset = self.classification_dataset.dataset["train"][self.classification_dataset.text_column_name]
@@ -258,10 +262,11 @@ class DatasetDistiller:
                 "tokens": tokens,
                 "labels": labels,
             },
+            "time_elapsed": (end_time - start_time),
             **dataset_evaluation_metrics,
             **output_metrics,
         }
-        output_dir = os.path.join(os.path.dirname(__file__), "results")
+        output_dir = os.path.join(os.path.dirname(__file__), self.args.results_dir)
         os.makedirs(output_dir, exist_ok=True)
         pkl_path = os.path.join(output_dir, f"{self.args.exp_name}.pkl")
         with open(pkl_path, "wb") as f:

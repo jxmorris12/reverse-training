@@ -85,7 +85,7 @@ if __name__ == '__main__':
     parser.add_argument("--select_do_warmup", type=bool, default=False, help="whether to do SGD warmup in SELECT")
     parser.add_argument("--select_grads_full_model", type=bool, default=False, help="whether to use full model gradients in SELECT")
     parser.add_argument("--num_eval_epochs", type=int, default=100, help="number of evaluation epochs")
-
+    parser.add_argument("--results_dir", type=str, default="results", help="results directory")
 
     parser.add_argument("--exp_name", type=str, required=True, help="experiment name [user-provided str]")
 
