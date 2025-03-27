@@ -18,6 +18,12 @@ model = AutoModel.from_pretrained(MODEL_NAME).to(device)
 model.eval()
 
 
+def preprocess_text(text, tokenizer, max_tokens=64):
+    tokens = tokenizer.tokenize(text)
+    truncated_tokens = tokens[:max_tokens]
+    return " ".join(truncated_tokens)
+
+
 ##############################
 # Lexical-Based Metrics
 ##############################
@@ -52,6 +58,16 @@ def jaccard_overlap_vocabulary(dataset1, dataset2, tokenizer=tokenizer):
     tokens2 = set()
     for text in dataset2:
         tokens2.update(tokenizer.tokenize(text))
+    return jaccard_similarity(tokens1, tokens2)
+
+
+def jaccard_overlap_vocabulary_truncated(dataset1, dataset2, tokenizer=tokenizer, max_tokens=64):
+    tokens1 = set()
+    for text in dataset1:
+        tokens1.update(tokenizer.tokenize(preprocess_text(text, tokenizer, max_tokens)))
+    tokens2 = set()
+    for text in dataset2:
+        tokens2.update(tokenizer.tokenize(preprocess_text(text, tokenizer, max_tokens)))
     return jaccard_similarity(tokens1, tokens2)
 
 
@@ -100,6 +116,40 @@ def dataset_levenshtein_closest_pair_statistics(dataset_A, dataset_B):
     return stats
 
 
+##############################
+# Lexical-Based OT Metrics
+##############################
+
+def discrete_ot_distance_levenshtein(dataset_A, dataset_B, tokenizer=tokenizer, max_tokens=64):
+    # Build cost matrix using token-level Levenshtein distance on truncated texts.
+    n = len(dataset_A)
+    m = len(dataset_B)
+    cost_matrix = np.zeros((n, m))
+    for i in range(n):
+        text_A = preprocess_text(dataset_A[i], tokenizer, max_tokens)
+        for j in range(m):
+            text_B = preprocess_text(dataset_B[j], tokenizer, max_tokens)
+            cost_matrix[i, j] = Levenshtein.distance(text_A, text_B)
+    # Compute OT distance using uniform weights.
+    wA = np.ones(n) / n
+    wB = np.ones(m) / m
+    return ot.emd2(wA, wB, cost_matrix)
+
+def discrete_ot_distance_jaccard(dataset_A, dataset_B, tokenizer=tokenizer, max_tokens=64):
+    # Build cost matrix based on 1 - Jaccard similarity for truncated token sets.
+    n = len(dataset_A)
+    m = len(dataset_B)
+    cost_matrix = np.zeros((n, m))
+    for i in range(n):
+        tokens_A = set(tokenizer.tokenize(preprocess_text(dataset_A[i], tokenizer, max_tokens)))
+        for j in range(m):
+            tokens_B = set(tokenizer.tokenize(preprocess_text(dataset_B[j], tokenizer, max_tokens)))
+            cost_matrix[i, j] = 1 - jaccard_similarity(tokens_A, tokens_B)
+    # Compute OT distance using uniform weights.
+    wA = np.ones(n) / n
+    wB = np.ones(m) / m
+    return ot.emd2(wA, wB, cost_matrix)
+
 
 ##############################
 # Embedding-Based OT Metrics
@@ -138,6 +188,10 @@ def get_sentence_embeddings(texts, tokenizer, model, device, batch_size=128):
         all_embeddings.append(embeddings.cpu().numpy())
     return np.concatenate(all_embeddings, axis=0)
 
+def get_truncated_sentence_embeddings(texts, tokenizer, model, device, max_tokens=64):
+    # Preprocess texts: tokenize and truncate to max_tokens.
+    truncated_texts = [preprocess_text(text, tokenizer, max_tokens) for text in texts]
+    return get_sentence_embeddings(truncated_texts, tokenizer, model, device)
 
 def dataset_level_full_ot_with_embeddings(emb_A, emb_B):
     """
@@ -227,6 +281,31 @@ def optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B):
     }
     return stats
 
+def optimal_matching_relaxed_wmd_with_embeddings_optimized(emb_A, emb_B):
+    """
+    Compute a cost matrix of Euclidean distances between every embedding in emb_A and emb_B.
+    Then, use the Hungarian algorithm to obtain an optimal one-to-one matching.
+    
+    Optimized to compute all pairwise distances at once using matrix operations.
+    
+    Returns summary statistics and the matched pairs.
+    """
+    # Compute pairwise Euclidean distances in one vectorized operation
+    # This creates a matrix of shape (len(emb_A), len(emb_B))
+    cost_matrix = np.linalg.norm(emb_A[:, np.newaxis, :] - emb_B[np.newaxis, :, :], axis=2)
+    
+    # Use Hungarian algorithm for optimal matching
+    row_idx, col_idx = linear_sum_assignment(cost_matrix)
+    matched_costs = cost_matrix[row_idx, col_idx]
+    
+    stats = {
+        "average_relaxed_wmd": float(np.mean(matched_costs)),
+        "min_relaxed_wmd": float(np.min(matched_costs)),
+        "max_relaxed_wmd": float(np.max(matched_costs)),
+        "matched_pairs": list(zip(row_idx.tolist(), col_idx.tolist(), matched_costs.tolist()))
+    }
+    return stats
+
 
 # Keep these functions for backward compatibility
 def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model, device=device):
@@ -239,8 +318,11 @@ def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model
     
     Returns a scalar distance value. Lower values indicate higher similarity.
     """
-    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+    # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)
+
     return dataset_level_full_ot_with_embeddings(emb_A, emb_B)
 
 
@@ -255,8 +337,12 @@ def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer
     The regularization parameter 'reg' controls the trade-off between accuracy and computation speed.
     Returns a scalar distance value. Lower values indicate higher similarity.
     """
-    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+    # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+
+    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)
+
     return dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg)
 
 
@@ -266,8 +352,12 @@ def example_level_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=m
     For each token embedding in doc1, find the minimal Euclidean distance to any token in doc2,
     and vice versa. The relaxed WMD is defined as the maximum of these two average distances.
     """
-    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+    # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+
+    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)
+
     return example_level_relaxed_wmd_with_embeddings(emb_A, emb_B)
 
 
@@ -277,8 +367,12 @@ def optimal_matching_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, mode
     Then, use the Hungarian algorithm to obtain an optimal one-to-one matching.
     Returns summary statistics and the matched pairs.
     """
-    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+    # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
+
+    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)   
+
     return optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B)
 
 
@@ -295,26 +389,35 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
       - results (dict): A dictionary containing the computed metrics.
     """
     # Compute embeddings once for both datasets
-    emb_A = get_sentence_embeddings(reference_dataset, tokenizer, model, device)
-    emb_B = get_sentence_embeddings(recovered_dataset, tokenizer, model, device)
+    # emb_A = get_sentence_embeddings(reference_dataset, tokenizer, model, device)
+    # emb_B = get_sentence_embeddings(recovered_dataset, tokenizer, model, device)
+    emb_A = get_truncated_sentence_embeddings(reference_dataset, tokenizer, model, device)
+    emb_B = get_truncated_sentence_embeddings(recovered_dataset, tokenizer, model, device)
     
     # Compute embedding-based metrics using the pre-computed embeddings
     full_ot_distance = dataset_level_full_ot_with_embeddings(emb_A, emb_B)
     sinkhorn_distance = dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg=0.1)
-    # optimal_matching_relaxed_wmd_stats = optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B)
+    optimal_matching_relaxed_wmd_stats = optimal_matching_relaxed_wmd_with_embeddings_optimized(emb_A, emb_B)
     
-    # Lexical-Based Metrics (these don't use embeddings)
+    ### Lexical-Based Metrics (these don't use embeddings) ###
+
     jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
-    jaccard_overlap_vocabulary_score = jaccard_overlap_vocabulary(reference_dataset, recovered_dataset)
+    # jaccard_overlap_vocabulary_score = jaccard_overlap_vocabulary(reference_dataset, recovered_dataset)
+    jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(reference_dataset, recovered_dataset)
     levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
+
+    discrete_ot_distance_levenshtein_score = discrete_ot_distance_levenshtein(reference_dataset, recovered_dataset)
+    discrete_ot_distance_jaccard_score = discrete_ot_distance_jaccard(reference_dataset, recovered_dataset)
     
     results = {
         "full_ot_distance": full_ot_distance,
         "sinkhorn_distance": sinkhorn_distance,
-        # "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
+        "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
         "jaccard_overlap_examples": jaccard_overlap_examples_score,
-        "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_score,
-        "levenshtein_stats": levenshtein_stats
+        "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_truncated_score,
+        "levenshtein_stats": levenshtein_stats,
+        "discrete_ot_distance_levenshtein": discrete_ot_distance_levenshtein_score,
+        "discrete_ot_distance_jaccard": discrete_ot_distance_jaccard_score,
     }
     return results
 
