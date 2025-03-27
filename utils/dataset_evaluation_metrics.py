@@ -1,14 +1,15 @@
+import functools
+import gc
+import math
+import tqdm
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 import ot  # Optimal Transport library
 import Levenshtein # Token Edit
-import math
-import tqdm
 from scipy.optimize import linear_sum_assignment
-
-from utils.batch import find_executable_batch_size
 
 # Load Sentence T5 model and tokenizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -18,11 +19,75 @@ model = AutoModel.from_pretrained(MODEL_NAME).to(device)
 model.eval()
 
 
-def preprocess_text(text, tokenizer, max_tokens=64):
-    tokens = tokenizer.tokenize(text)
-    truncated_tokens = tokens[:max_tokens]
-    return " ".join(truncated_tokens)
+def should_reduce_batch_size(exception: Exception) -> bool:
+    """
+    Checks if `exception` relates to CUDA out-of-memory, CUDNN not supported, or CPU out-of-memory
 
+    Args:
+        exception (`Exception`):
+            An exception
+    """
+    _statements = [
+        "CUDA out of memory.",  # CUDA OOM
+        "cuDNN error: CUDNN_STATUS_NOT_SUPPORTED.",  # CUDNN SNAFU
+        "DefaultCPUAllocator: can't allocate memory",  # CPU OOM
+    ]
+    if isinstance(exception, RuntimeError) and len(exception.args) == 1:
+        return any(err in exception.args[0] for err in _statements)
+    return False
+
+
+# modified from https://github.com/huggingface/accelerate/blob/85a75d4c3d0deffde2fc8b917d9b1ae1cb580eb2/src/accelerate/utils/memory.py#L87
+def find_executable_batch_size(function: callable = None, starting_batch_size: int = 512):
+    """
+    A basic decorator that will try to execute `function`. If it fails from exceptions related to out-of-memory or
+    CUDNN, the batch size is cut in half and passed to `function`
+
+    `function` must take in a `batch_size` parameter as its first argument.
+
+    Args:
+        function (`callable`, *optional*):
+            A function to wrap
+        starting_batch_size (`int`, *optional*):
+            The batch size to try and fit into memory
+
+    Example:
+
+    ```python
+    >>> from utils import find_executable_batch_size
+
+
+    >>> @find_executable_batch_size(starting_batch_size=128)
+    ... def train(batch_size, model, optimizer):
+    ...     ...
+
+
+    >>> train(model, optimizer)
+    ```
+    """
+    if function is None:
+        return functools.partial(find_executable_batch_size, starting_batch_size=starting_batch_size)
+
+    batch_size = starting_batch_size
+
+    def decorator(*args, **kwargs):
+        nonlocal batch_size
+        gc.collect()
+        torch.cuda.empty_cache()
+        while True:
+            if batch_size == 0:
+                raise RuntimeError("No executable batch size found, reached zero.")
+            try:
+                return function(*args, **kwargs, batch_size=batch_size)
+            except Exception as e:
+                if should_reduce_batch_size(e):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    batch_size //= 2
+                else:
+                    raise
+
+    return decorator
 
 ##############################
 # Lexical-Based Metrics
@@ -47,27 +112,27 @@ def jaccard_overlap_examples(dataset1, dataset2):
     set2 = set(dataset2)
     return jaccard_similarity(set1, set2)
 
-def jaccard_overlap_vocabulary(dataset1, dataset2, tokenizer=tokenizer):
+def jaccard_overlap_vocabulary(dataset1_token_sets, dataset2_token_sets):
     """
     Compute Jaccard similarity based on the union of tokens from each dataset.
     Uses the T5 tokenizer to tokenize each example.
     """
     tokens1 = set()
-    for text in dataset1:
-        tokens1.update(tokenizer.tokenize(text))
+    for tokens in dataset1_token_sets:
+        tokens1.update(tokens)
     tokens2 = set()
-    for text in dataset2:
-        tokens2.update(tokenizer.tokenize(text))
+    for tokens in dataset2_token_sets:
+        tokens2.update(tokens)
     return jaccard_similarity(tokens1, tokens2)
 
 
-def jaccard_overlap_vocabulary_truncated(dataset1, dataset2, tokenizer=tokenizer, max_tokens=64):
+def jaccard_overlap_vocabulary_truncated(dataset1_tokens, dataset2_tokens):
     tokens1 = set()
-    for text in dataset1:
-        tokens1.update(tokenizer.tokenize(preprocess_text(text, tokenizer, max_tokens)))
+    for tokens in dataset1_tokens:
+        tokens1.update(tokens)
     tokens2 = set()
-    for text in dataset2:
-        tokens2.update(tokenizer.tokenize(preprocess_text(text, tokenizer, max_tokens)))
+    for tokens in dataset2_tokens:
+        tokens2.update(tokens)
     return jaccard_similarity(tokens1, tokens2)
 
 
@@ -125,11 +190,11 @@ def discrete_ot_distance_levenshtein(dataset_A, dataset_B, tokenizer=tokenizer, 
     n = len(dataset_A)
     m = len(dataset_B)
     cost_matrix = np.zeros((n, m))
-    for i in range(n):
-        text_A = preprocess_text(dataset_A[i], tokenizer, max_tokens)
+    
+    # Skip preprocessing if already done    
+    for i in tqdm.trange(n, desc="Computing discrete OT distance (Levenshtein)", colour="RED", leave=False):
         for j in range(m):
-            text_B = preprocess_text(dataset_B[j], tokenizer, max_tokens)
-            cost_matrix[i, j] = Levenshtein.distance(text_A, text_B)
+            cost_matrix[i, j] = Levenshtein.distance(dataset_A[i], dataset_B[j])
     # Compute OT distance using uniform weights.
     wA = np.ones(n) / n
     wB = np.ones(m) / m
@@ -140,11 +205,11 @@ def discrete_ot_distance_jaccard(dataset_A, dataset_B, tokenizer=tokenizer, max_
     n = len(dataset_A)
     m = len(dataset_B)
     cost_matrix = np.zeros((n, m))
-    for i in range(n):
-        tokens_A = set(tokenizer.tokenize(preprocess_text(dataset_A[i], tokenizer, max_tokens)))
+    
+    # Skip preprocessing if already done
+    for i in tqdm.trange(n, desc="Computing discrete OT distance (Jaccard)", colour="RED", leave=False):
         for j in range(m):
-            tokens_B = set(tokenizer.tokenize(preprocess_text(dataset_B[j], tokenizer, max_tokens)))
-            cost_matrix[i, j] = 1 - jaccard_similarity(tokens_A, tokens_B)
+            cost_matrix[i, j] = 1 - jaccard_similarity(dataset_A[i], dataset_B[j])
     # Compute OT distance using uniform weights.
     wA = np.ones(n) / n
     wB = np.ones(m) / m
@@ -188,10 +253,6 @@ def get_sentence_embeddings(texts, tokenizer, model, device, batch_size=128):
         all_embeddings.append(embeddings.cpu().numpy())
     return np.concatenate(all_embeddings, axis=0)
 
-def get_truncated_sentence_embeddings(texts, tokenizer, model, device, max_tokens=64):
-    # Preprocess texts: tokenize and truncate to max_tokens.
-    truncated_texts = [preprocess_text(text, tokenizer, max_tokens) for text in texts]
-    return get_sentence_embeddings(truncated_texts, tokenizer, model, device)
 
 def dataset_level_full_ot_with_embeddings(emb_A, emb_B):
     """
@@ -320,8 +381,8 @@ def dataset_level_full_ot(dataset_A, dataset_B, tokenizer=tokenizer, model=model
     """
     # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
-    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)
+    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
     return dataset_level_full_ot_with_embeddings(emb_A, emb_B)
 
@@ -340,8 +401,8 @@ def dataset_level_sinkhorn_ot(dataset_A, dataset_B, reg=0.1, tokenizer=tokenizer
     # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
-    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)
+    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
     return dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg)
 
@@ -355,8 +416,8 @@ def example_level_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=m
     # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
-    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)
+    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
     return example_level_relaxed_wmd_with_embeddings(emb_A, emb_B)
 
@@ -370,8 +431,8 @@ def optimal_matching_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, mode
     # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
-    emb_A = get_truncated_sentence_embeddings(dataset_A, tokenizer, model, device)
-    emb_B = get_truncated_sentence_embeddings(dataset_B, tokenizer, model, device)   
+    emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
+    emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)   
 
     return optimal_matching_relaxed_wmd_with_embeddings(emb_A, emb_B)
 
@@ -388,11 +449,27 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
     Returns:
       - results (dict): A dictionary containing the computed metrics.
     """
+    # Pre-process all texts once for Levenshtein distance
+    max_tokens = 64
+
+    tokenized_ref_texts = [
+        tokenizer.tokenize(text, max_length=max_tokens, padding=True, truncation=True) 
+        for text in reference_dataset
+    ]
+    reference_dataset = list(map(tokenizer.convert_tokens_to_string, tokenized_ref_texts))
+    tokenized_rec_texts = [
+        tokenizer.tokenize(text, max_length=max_tokens, padding=True, truncation=True) 
+        for text in recovered_dataset
+    ]
+    recovered_dataset = list(map(tokenizer.convert_tokens_to_string, tokenized_rec_texts))
+    
+    # Pre-process all texts once for Jaccard similarity (tokenize and create sets)
+    preprocessed_ref_token_sets = [set(tokens) for tokens in tokenized_ref_texts]
+    preprocessed_rec_token_sets = [set(tokens) for tokens in tokenized_rec_texts]
+    
     # Compute embeddings once for both datasets
-    # emb_A = get_sentence_embeddings(reference_dataset, tokenizer, model, device)
-    # emb_B = get_sentence_embeddings(recovered_dataset, tokenizer, model, device)
-    emb_A = get_truncated_sentence_embeddings(reference_dataset, tokenizer, model, device)
-    emb_B = get_truncated_sentence_embeddings(recovered_dataset, tokenizer, model, device)
+    emb_A = get_sentence_embeddings(reference_dataset, tokenizer, model, device)
+    emb_B = get_sentence_embeddings(recovered_dataset, tokenizer, model, device)
     
     # Compute embedding-based metrics using the pre-computed embeddings
     full_ot_distance = dataset_level_full_ot_with_embeddings(emb_A, emb_B)
@@ -402,12 +479,17 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
     ### Lexical-Based Metrics (these don't use embeddings) ###
 
     jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
-    # jaccard_overlap_vocabulary_score = jaccard_overlap_vocabulary(reference_dataset, recovered_dataset)
-    jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(reference_dataset, recovered_dataset)
+    jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
     levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
 
-    discrete_ot_distance_levenshtein_score = discrete_ot_distance_levenshtein(reference_dataset, recovered_dataset)
-    discrete_ot_distance_jaccard_score = discrete_ot_distance_jaccard(reference_dataset, recovered_dataset)
+    # Use the preprocessed texts for the discrete OT distances
+    discrete_ot_distance_levenshtein_score = discrete_ot_distance_levenshtein(
+        reference_dataset, recovered_dataset,
+    )
+    
+    discrete_ot_distance_jaccard_score = discrete_ot_distance_jaccard(
+        preprocessed_ref_token_sets, preprocessed_rec_token_sets, 
+    )
     
     results = {
         "full_ot_distance": full_ot_distance,
@@ -419,6 +501,7 @@ def evaluate_dataset_similarity(reference_dataset: list[str], recovered_dataset:
         "discrete_ot_distance_levenshtein": discrete_ot_distance_levenshtein_score,
         "discrete_ot_distance_jaccard": discrete_ot_distance_jaccard_score,
     }
+    
     return results
 
 

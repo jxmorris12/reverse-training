@@ -1,6 +1,7 @@
 import gc
 import os
 import pickle
+import time
 
 import torch
 import transformers
@@ -217,15 +218,19 @@ class DatasetDistiller:
         # run optimization
         pbar = trange_if_main_worker(0, self.args.max_iterations+1, desc="iterations")
         all_evaluation_metrics = []
+        total_time_in_evaluation = 0
         for step in pbar:
             Z, metrics = discrete_optimizer.step(step, expert_buffer)
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=step)
 
             if (step + 1) % self.args.eval_every == 0:
+                eval_start_time = time.time()
                 evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
                 evaluation_metrics["step"] = step
                 all_evaluation_metrics.append(evaluation_metrics)
+                eval_end_time = time.time()
+                total_time_in_evaluation += eval_end_time - eval_start_time
 
             # clear cache
             gc.collect()
@@ -235,13 +240,17 @@ class DatasetDistiller:
                 break
 
         print("Stopping distillation...")
+        eval_start_time = time.time()
         final_evaluation_metrics = self._evaluate_and_log(Z, discrete_optimizer.Y, step=step)
         wandb.finish()
+        eval_end_time = time.time()
+        total_time_in_evaluation += eval_end_time - eval_start_time
 
         output = { 
             "args": dict(vars(self.args)),
             "expert_evaluation_metrics": expert_evaluation_metrics,
             "evaluation_metrics": final_evaluation_metrics,
+            "total_time_in_evaluation": total_time_in_evaluation,
         }
 
         # clear cache oncemore
