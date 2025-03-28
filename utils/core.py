@@ -18,6 +18,7 @@ import tqdm
 from utils.batch import find_executable_batch_size
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+NUMBER_TO_LETTER_MAP = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"]
 
 
 def hash_model_params(model):
@@ -170,7 +171,9 @@ def _autolabel_dataset_uncached(
     # Valid tokens are all tokens that are in the label map, prepended with a space
     # e.g. "1" -> " 1" -> [352]
     valid_token_keys = [f" {s}" for s in list(label_map.keys())]
-    valid_tokens = torch.tensor([tokenizer.encode(s) for s in valid_token_keys]).flatten()
+
+    # Some tokenizers tokenize " 5" as [" ", " 5"] so we just take the last token.
+    valid_tokens = torch.tensor([tokenizer.encode(s)[-1] for s in valid_token_keys]).flatten()
     print(f"[autolabel_dataset] valid_tokens: {valid_token_keys} -> {valid_tokens}")
 
     invalid_tokens_mask = torch.ones(tokenizer.vocab_size, dtype=torch.bool)
@@ -201,6 +204,8 @@ def _autolabel_dataset_uncached(
             predictions = torch.argmax(logits, dim=-1)
             all_labels.append(predictions.cpu())
     
+    model.cpu()
+    model.train()
     return torch.cat(all_labels)
 
 
@@ -224,6 +229,7 @@ def autolabel_dataset(
         "label_map_hash": label_map_hash,
     }
     cache_key = _get_cache_key(**hash_kwargs)
+    cache_key = hashlib.sha256(cache_key.encode()).hexdigest()
     print(f"Autolabeling dataset with cache key: {cache_key}")
     cache_path = os.path.join(cache_dir, f"autolabel_dataset_{cache_key}.npz")
 
@@ -311,6 +317,7 @@ def _eval_expert_model(
     label_column_name: Optional[str],
     sequence_length: int,
     batch_size: int = 32,
+    map_labels_to_letters: bool = False,
 ) -> tuple[float, Optional[float], Optional[float]]:
     """Evaluate expert model on evaluation dataset.
     
@@ -326,8 +333,12 @@ def _eval_expert_model(
     Returns:
         Tuple of (eval_loss, eval_accuracy)
     """
+    assert map_labels_to_letters # Temporary – for consistency
+
     eval_metrics = []
     eval_accuracies = []
+
+    remap_label = lambda x: (NUMBER_TO_LETTER_MAP[x] if map_labels_to_letters else x)
 
     all_idxs = list(range(len(eval_ds)))
     i = 0
@@ -340,7 +351,7 @@ def _eval_expert_model(
         if label_column_name is not None:
             # Classification mode
             examples = [
-                f"{text} {label}" 
+                f"{text} {remap_label(label)}" 
                 for text, label in zip(examples[text_column_name], examples[label_column_name])
             ]
         else:
@@ -387,6 +398,8 @@ def _eval_expert_model(
     return eval_loss, eval_accuracy
 
 
+
+
 def _train_expert_model_uncached(
         base_model_name_or_path: str,
         num_experts: int, 
@@ -400,8 +413,8 @@ def _train_expert_model_uncached(
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
         early_stopping_patience: int = 10,
-        # num_eval_datapoints: int = 1024,
         num_eval_datapoints: int = 2048,
+        map_labels_to_letters: bool = False,
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     student_net = get_model(base_model_name_or_path).to(device)
     tokenizer = transformers.AutoTokenizer.from_pretrained(base_model_name_or_path)
@@ -409,8 +422,9 @@ def _train_expert_model_uncached(
     tokenizer.truncation_side = "left" # important for correct truncation
     tokenizer.padding_side = "left" 
 
+    remap_label = lambda x: (NUMBER_TO_LETTER_MAP[x] if map_labels_to_letters else x)
     train_ds = ds["train"]
-    eval_ds = ds["test"].select(range(num_eval_datapoints))
+    eval_ds = ds["test"].select(range(min(num_eval_datapoints, len(ds["test"]))))
 
     optim = torch.optim.Adam(student_net.parameters(), lr=expert_lr)
     # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
@@ -463,7 +477,7 @@ def _train_expert_model_uncached(
                 if label_column_name is not None:
                     # Classification mode - append label to text w/ space
                     examples = [
-                        f"{text} {label}" 
+                        f"{text} {remap_label(label)}" 
                         for text, label in zip(examples[text_column_name], examples[label_column_name])
                     ]
                 else:
@@ -517,6 +531,7 @@ def _train_expert_model_uncached(
             text_column_name=text_column_name,
             label_column_name=label_column_name,
             sequence_length=sequence_length,
+            map_labels_to_letters=map_labels_to_letters,
         )
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
@@ -547,6 +562,7 @@ def _train_expert_model_uncached(
         text_column_name=text_column_name,
         label_column_name=label_column_name,
         sequence_length=sequence_length,
+        map_labels_to_letters=map_labels_to_letters,
     )
     evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
     evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
@@ -564,6 +580,9 @@ def _train_expert_model_uncached(
 
     if all_token_counts.sum() == 0:
         print0("WARNING: no tokens were counted")
+    
+    student_net.cpu()
+    del student_net
     return expert_state_dicts, all_token_counts, final_evaluation_metrics
 
 
@@ -579,9 +598,11 @@ def train_expert_model(
         label_column_name: str,
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
+        map_labels_to_letters: bool = False,
         **kwargs
     ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     """Train expert models with caching based on input parameters."""
+    assert map_labels_to_letters # Temporary – for consistency
     
     # Create cache directory if it doesn't exist
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
@@ -598,6 +619,7 @@ def train_expert_model(
         "ds_name": ds.config_name if hasattr(ds, "config_name") else "custom",
         "text_column_name": text_column_name,
         "label_column_name": label_column_name,
+        "map_labels_to_letters": map_labels_to_letters,
         "ds_fingerprint": "_".join(str(ds[k]._fingerprint) for k in sorted(ds.keys())),
         **kwargs  # Include any additional kwargs in cache key generation
     }
@@ -647,6 +669,7 @@ def train_expert_model(
         label_column_name=label_column_name,
         ds_tokens=ds_tokens,
         ds_labels=ds_labels,
+        map_labels_to_letters=map_labels_to_letters,
         **kwargs
     )
     

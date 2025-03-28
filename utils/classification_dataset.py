@@ -5,44 +5,45 @@ def _make_dbpedia_text(ex: dict[str, str]) -> dict[str, str]:
     ex["text"] = ex["title"] + " " + ex["content"]
     return ex
 
+
 DBPEDIA_LABEL_MAP = {
-    "0": "Company",
-    "1": "Educational Institution",
-    "2": "Artist",
-    "3": "Athlete",
-    "4": "Office Holder",
-    "5": "Mean Of Transportation",
-    "6": "Building",
-    "7": "Natural Place",
-    "8": "Village",
-    "9": "Animal",
-    "10": "Plant",
-    "11": "Album",
-    "12": "Film",
-    "13": "Written Work",
+    "A":"Company",
+    "B":"Educational Institution",
+    "C":"Artist",
+    "D": "Athlete",
+    "E": "Office Holder",
+    "F": "Mean Of Transportation",
+    "G": "Building",
+    "H": "Natural Place",
+    "I": "Village",
+    "J": "Animal",
+    "K": "Plant",
+    "L": "Album",
+    "M": "Film",
+    "N": "Written Work",
 }
 
 NEWSGROUP_LABEL_MAP = {
-    "0": "alt.atheism",
-    "1": "comp.graphics",
-    "2": "comp.os.ms-windows.misc",
-    "3": "comp.sys.ibm.pc.hardware",
-    "4": "comp.sys.mac.hardware",
-    "5": "comp.windows.x",
-    "6": "misc.forsale",
-    "7": "rec.autos",
-    "8": "rec.motorcycles",
-    "9": "rec.sport.baseball",
-    "10": "rec.sport.hockey",
-    "11": "sci.crypt",
-    "12": "sci.electronics",
-    "13": "sci.med",
-    "14": "sci.space",
-    "15": "soc.religion.christian",
-    "16": "talk.politics.guns",
-    "17": "talk.politics.mideast",
-    "18": "talk.politics.misc",
-    "19": "talk.religion.misc",
+    "A":"alt.atheism",
+    "B":"comp.graphics",
+    "C":"comp.os.ms-windows.misc",
+    "D": "comp.sys.ibm.pc.hardware",
+    "E": "comp.sys.mac.hardware",
+    "F": "comp.windows.x",
+    "G": "misc.forsale",
+    "H": "rec.autos",
+    "I": "rec.motorcycles",
+    "J": "rec.sport.baseball",
+    "K": "rec.sport.hockey",
+    "L": "sci.crypt",
+    "M": "sci.electronics",
+    "N": "sci.med",
+    "O": "sci.space",
+    "P": "soc.religion.christian",
+    "Q": "talk.politics.guns",
+    "R": "talk.politics.mideast",
+    "S": "talk.politics.misc",
+    "T": "talk.religion.misc",
 }
 
 
@@ -74,10 +75,10 @@ class ClassificationDataset:
         # Use default AG News label map if none provided
         if label_map is None:
             self.label_map = {
-                "0": "World",
-                "1": "Sports",
-                "2": "Business",
-                "3": "Sci/Tech",
+                "A":"World",
+                "B":"Sports",
+                "C":"Business",
+                "D": "Sci/Tech",
             }
         else:
             self.label_map = label_map
@@ -86,7 +87,7 @@ class ClassificationDataset:
         """
         Access the underlying dataset with indexing.
         """
-        return self.dataset[idx]
+        return self.relabel_example(self.dataset[idx])
     
     def __len__(self):
         """
@@ -157,10 +158,10 @@ class ClassificationDataset:
             text_column_name = "text"        
             label_column_name = "label"
             label_map = {
-                "0": "World",
-                "1": "Sports",
-                "2": "Business",
-                "3": "Sci/Tech",
+                "A": "World",
+                "B": "Sports",
+                "C": "Business",
+                "D": "Sci/Tech",
             }
         elif dataset_name.startswith("ag_news_") and dataset_name[8:].isdigit():
             num_samples = int(dataset_name[8:])
@@ -171,10 +172,10 @@ class ClassificationDataset:
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
-                "0": "World",
-                "1": "Sports",
-                "2": "Business",
-                "3": "Sci/Tech",
+                "A": "World",
+                "B": "Sports",
+                "C": "Business",
+                "D": "Sci/Tech",
             }
         elif dataset_name == "newsgroup":
             ds = datasets.load_dataset("SetFit/20_newsgroups")
@@ -194,8 +195,8 @@ class ClassificationDataset:
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
-                "0": "neg",
-                "1": "pos",
+                "A":"neg",
+                "B":"pos",
             }
         elif dataset_name.startswith("rotten_tomatoes_") and dataset_name[16:].isdigit():
             num_samples = int(dataset_name[16:])
@@ -205,8 +206,8 @@ class ClassificationDataset:
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
-                "0": "neg",
-                "1": "pos",
+                "A":"neg",
+                "B":"pos",
             }
         elif dataset_name == "imdb":
             ds = datasets.load_dataset("stanfordnlp/imdb")
@@ -215,8 +216,8 @@ class ClassificationDataset:
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
-                "0": "Negative",
-                "1": "Positive",
+                "A":"Negative",
+                "B":"Positive",
             }
         elif dataset_name.startswith("imdb_") and dataset_name[5:].isdigit():
             num_samples = int(dataset_name[5:])
@@ -226,8 +227,8 @@ class ClassificationDataset:
             text_column_name = "text"
             label_column_name = "label"
             label_map = {
-                "0": "Negative",
-                "1": "Positive",
+                "A":"Negative",
+                "B":"Positive",
             }   
         elif dataset_name == "dbpedia":
             ds = datasets.load_dataset("fancyzhx/dbpedia_14")

@@ -140,8 +140,11 @@ class DatasetDistiller:
 
     def _evaluate_and_log(self, Z_text: torch.Tensor, Z_tokens: torch.Tensor, Y: torch.Tensor, step: int) -> dict[str, float]:
         self._log_table(Z_tokens, Y, step=step)
-        tokens = Z_tokens.cpu()
-        labels = Y.cpu()
+        Z_tokens = Z_tokens.cpu()
+        Y = Y.cpu()
+        
+        tokens = Z_tokens
+        labels = Y
 
         # TODO: Recheck the below logic!
         # compare tokens to dataset_token_counts
@@ -171,6 +174,7 @@ class DatasetDistiller:
             label_column_name=self.classification_dataset.label_column_name,
             ds_tokens=tokens,
             ds_labels=labels,
+            map_labels_to_letters=True,
         )
 
         # log
@@ -209,6 +213,7 @@ class DatasetDistiller:
             ds=self.classification_dataset.dataset,
             text_column_name=self.classification_dataset.text_column_name,
             label_column_name=self.classification_dataset.label_column_name,
+            map_labels_to_letters=True,
         )
         new_expert_buffer, new_expert_evaluation_metrics = self._run_defense(expert_buffer)
         self.dataset_token_counts = dataset_token_counts.cpu()
@@ -225,6 +230,10 @@ class DatasetDistiller:
             pbar.set_postfix(**metrics)
             wandb.log(metrics, step=step)
 
+            # clear cache
+            gc.collect()
+            torch.cuda.empty_cache()
+
             if (step + 1) % self.args.eval_every == 0:
                 eval_start_time = time.time()
                 evaluation_metrics = self._evaluate_and_log(Z_text, Z_tokens, Y, step=step)
@@ -232,10 +241,8 @@ class DatasetDistiller:
                 all_evaluation_metrics.append(evaluation_metrics)
                 eval_end_time = time.time()
                 total_time_in_evaluation += eval_end_time - eval_start_time
-
-            # clear cache
-            gc.collect()
-            torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
 
             if discrete_optimizer.should_stop:
                 break

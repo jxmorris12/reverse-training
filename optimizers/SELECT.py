@@ -36,17 +36,13 @@ class SELECTOptimizer(DiscreteOptimizer):
             tokenizer, 
             student_net, 
             initial_student_net,
-            true_classification_dataset: ClassificationDataset):
+            true_classification_dataset: ClassificationDataset
+        ):
         super().__init__(args)
         self.tokenizer = tokenizer
-        self.student_net = student_net
-        self.initial_student_net = initial_student_net
         self.base_model = get_model(args.base_model_name_or_path)
 
         self.Y = Y
-
-        syn_lr = torch.tensor(self.args.lr_teacher).to(device)
-        self.syn_lr = syn_lr.detach().to(device).requires_grad_(True)
 
         # Setup projector
         param_count = sum(p.numel() for p in self.base_model.lm_head.parameters())
@@ -75,9 +71,9 @@ class SELECTOptimizer(DiscreteOptimizer):
         print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None
         self.tokenized_labels = torch.tensor([
-            self.tokenizer.encode(f" {x}")[0]
+            self.tokenizer.encode(f" {x}")[-1]
             for x in self.true_classification_dataset.label_map
-        ], device=device)
+        ])
 
     def _run_create_pseudoexperts(
         self,
@@ -99,10 +95,13 @@ class SELECTOptimizer(DiscreteOptimizer):
         Returns:
             List of tuples containing (model, idx) for each pseudoexpert
         """
+        if self.args.select_num_pseudoexperts <= 1:
+            return [(model, 0)]
+
         pseudoexperts = []
 
         label_mask = (
-            self.tokenized_labels[:, None] == torch.arange(self.tokenizer.vocab_size, device=device)[None, :]
+            self.tokenized_labels[:, None].to(device) == torch.arange(self.tokenizer.vocab_size, device=device)[None, :]
         ).any(dim=0)
         num_steps_per_pseudoexpert = 10
         # optim = torch.optim.SGD(model.parameters(), lr=1e-4)
@@ -150,7 +149,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                 
             print(f"Step {i*num_steps_per_pseudoexpert} | Pseudoexpert {i} | kl_div: {kl_div} | mse: {mse}")
             # add pseudoexpert to list
-            pseudoexpert_model = copy.deepcopy(model)
+            pseudoexpert_model = copy.deepcopy(model).cpu()
             pseudoexperts.append((pseudoexpert_model, i))
             
         
@@ -211,17 +210,31 @@ class SELECTOptimizer(DiscreteOptimizer):
             if self.args.select_do_warmup:
                 model_cache_key += f"_warmup"
             print(f"[SELECTOptimizer._rank_dataset_by_influence] Getting grads for model {i} | model_cache_key: {model_cache_key}")
-            batch_grads = get_grads(
-                model, 
-                self.seed_dataset_train_split, 
-                self.dataset_autolabels,
-                self.tokenizer, 
-                self.projector,
-                sequence_length=self.args.sequence_length, 
-                use_cache=False,
-                do_projection=True,
-                model_cache_key=model_cache_key,
-            )
+
+            if self.args.select_use_expert_grads:
+                batch_grads = get_grads(
+                    model, 
+                    self.seed_dataset_train_split, 
+                    self.dataset_autolabels,
+                    self.tokenizer, 
+                    self.projector,
+                    sequence_length=self.args.sequence_length, 
+                    use_cache=False,
+                    do_projection=True,
+                    model_cache_key=model_cache_key + "_expert_grads",
+                )
+            else:
+                batch_grads = get_grads(
+                    model, 
+                    self.seed_dataset_train_split, 
+                    self.dataset_autolabels,
+                    self.tokenizer, 
+                    self.projector,
+                    sequence_length=self.args.sequence_length, 
+                    use_cache=False,
+                    do_projection=True,
+                    model_cache_key=model_cache_key,
+                )
             grads.append(batch_grads)
         
         grads = torch.stack(grads, dim=0)
@@ -357,7 +370,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         """
         batch = []
         best_sim = float("-inf")
-
         assert base_params.shape == expert_params.shape, f"base_params.shape: {base_params.shape} != expert_params.shape: {expert_params.shape}"
 
         # TODO: Make the following work w/ just last layer grads.
@@ -376,7 +388,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         # pseudoexperts_projected_diffs = torch.stack(pseudoexperts_projected_diffs, dim=0)
 
         params_diff_projected = self.projector.project(base_params - expert_params, model_id=0)
-
         # Split grads_db per-label
         og_grads_db_vectors = grads_db.vectors.cpu().clone()
         batch_pbar = tqdm.trange(0, self.args.select_full_dataset_size, disable=(self.args.select_full_dataset_size < 32))
@@ -458,12 +469,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                 last_layer_expert_model_params=last_layer_expert_model_params
             )
         
-        # Calculate current MSE
-        # TODO: Figure out why the shapes are different. 
-        # (full_base_params -> 124439808,  full_expert_model_params -> 163037184)
-        # base_params_diff = full_base_params - full_expert_model_params
-        # current_mse = (base_params_diff).double().pow(2).sum().item()
-        
         # Select random minibatch from batch
         minibatch = random.sample(self.batch, min(self.args.minibatch_size, len(self.batch)))
         assert len(minibatch) > 0, f"Minibatch is empty"
@@ -494,12 +499,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         base_model_grad_norm = torch.cat([p.grad.flatten().detach().norm(dim=0, p=2, keepdim=True) for p in self.base_model.parameters()], dim=0).norm(dim=0, p=2, keepdim=True)
         base_model_grad_norm = base_model_grad_norm.detach().cpu().item()
 
-        # Calculate gradient direction and step size
-        # with torch.no_grad():
-        #     grad = torch.cat([p.grad.flatten().detach() for p in self.base_model.parameters()], dim=0)
-        #     grad_direction = grad / (grad.norm(dim=0, p=2, keepdim=True) + 1e-10)
-        #     grad_step_size = (grad_direction.double() @ base_params_diff).float()
-
         # Create optimizer and take step
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -507,24 +506,13 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Report metrics
         metrics = {
-            # "param_mse": current_mse,
             "ce_loss": loss.detach().item(),
-            # "grad_step_size": grad_step_size.item() if not torch.isnan(grad_step_size) else 0.0,
-            # "synth_lr": self.syn_lr.detach().item(),
             "base_model_grad_norm": base_model_grad_norm,
         }
         
         torch.cuda.empty_cache()
         
         self.best_idx_counter.update(minibatch)
-        # top_10_selected = self.best_idx_counter.most_common(10)
-
-        # if current_mse < self.best_mse:
-        #     self.steps_since_last_improvement = 0
-        #     self.best_mse = current_mse
-        # else:
-        #     self.steps_since_last_improvement += 1
-
         return metrics
 
     def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -562,7 +550,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             for i in self.batch
         ])
         Y = self.dataset_autolabels[self.batch]
-        return X, X_tokens, Y, metrics
+        return X, X_tokens.cpu(), Y.cpu(), metrics
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:
         """Tokenize dataset entry with caching.

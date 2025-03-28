@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import random
 
@@ -21,6 +22,10 @@ def main(args):
     torch.manual_seed(args.seed + get_rank())
     torch.cuda.manual_seed_all(args.seed + get_rank())
     np.random.seed(args.seed + get_rank())
+
+    # suppress transformers logging
+    logging.getLogger("transformers").setLevel(logging.CRITICAL)
+
 
     wandb.init(
         sync_tensorboard=False,
@@ -86,6 +91,7 @@ if __name__ == '__main__':
     parser.add_argument("--select_grads_full_model", type=int, default=0, help="[bool] whether to use full model gradients in SELECT")
     parser.add_argument("--num_eval_epochs", type=int, default=100, help="number of evaluation epochs")
     parser.add_argument("--results_dir", type=str, default="results", help="results directory")
+    parser.add_argument("--select_use_expert_grads", type=int, default=0, help="whether to use expert grads for SELECT")
 
     parser.add_argument("--defense", type=str, default=None, help="defense to use", choices=["none", "gaussian", "retrain"])
     parser.add_argument("--exp_name", type=str, required=True, help="experiment name [user-provided str]")

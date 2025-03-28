@@ -28,6 +28,11 @@ def load_results_as_df(path: str) -> pd.DataFrame:
             "dataset_full_ot_distance": ex["full_ot_distance"],
             "dataset_jaccard_overlap_examples": ex["jaccard_overlap_examples"],
             "dataset_jaccard_overlap_vocabulary": ex["jaccard_overlap_vocabulary"],
+            # "dataset_containment_similarity_examples": ex["containment_similarity_examples"],
+            # "dataset_containment_similarity_vocabulary": ex["containment_similarity_vocabulary"],
+            # "dataset_levenshtein_stats": ex["levenshtein_stats"],
+            # "dataset_discrete_ot_distance_levenshtein": ex["discrete_ot_distance_levenshtein"],
+            # "dataset_discrete_ot_distance_jaccard": ex["discrete_ot_distance_jaccard"],
             **{
                 f"dataset_levenshtein_stats_{k}": v
                 for k, v in ex["levenshtein_stats"].items()

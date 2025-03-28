@@ -456,9 +456,6 @@ def example_level_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, model=m
     For each token embedding in doc1, find the minimal Euclidean distance to any token in doc2,
     and vice versa. The relaxed WMD is defined as the maximum of these two average distances.
     """
-    # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
-    # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
-
     emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
 
@@ -471,9 +468,6 @@ def optimal_matching_relaxed_wmd(dataset_A, dataset_B, tokenizer=tokenizer, mode
     Then, use the Hungarian algorithm to obtain an optimal one-to-one matching.
     Returns summary statistics and the matched pairs.
     """
-    # emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
-    # emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)
-
     emb_A = get_sentence_embeddings(dataset_A, tokenizer, model, device)
     emb_B = get_sentence_embeddings(dataset_B, tokenizer, model, device)   
 
