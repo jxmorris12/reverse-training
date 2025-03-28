@@ -1,5 +1,6 @@
 from typing import Iterable, Optional
 import collections
+import gc
 import hashlib
 import json
 import numpy as np
@@ -7,7 +8,6 @@ import random
 import time
 import os
 import pickle
-import warnings
 
 import datasets
 import torch
@@ -265,7 +265,7 @@ def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     except KeyError:
         pass
     
-    return { k: v.detach().clone() for k,v in state_dict.items() }
+    return { k: v.detach().clone().cpu() for k,v in state_dict.items() }
 
 
 def get_model_state_dict(model_path: str) -> dict[str, torch.Tensor]:
@@ -334,11 +334,14 @@ def _eval_expert_model(
         Tuple of (eval_loss, eval_accuracy)
     """
     assert map_labels_to_letters # Temporary – for consistency
+    student_net.eval()
 
     eval_metrics = []
     eval_accuracies = []
 
     remap_label = lambda x: (NUMBER_TO_LETTER_MAP[x] if map_labels_to_letters else x)
+
+    # print(f"[eval_expert_model] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
 
     all_idxs = list(range(len(eval_ds)))
     i = 0
@@ -374,10 +377,11 @@ def _eval_expert_model(
             # For language modeling, predict all next tokens
             labels = tokens.input_ids[:, 1:].detach().clone()
         
-        outputs = student_net(
-            input_ids=tokens.input_ids,
-            attention_mask=tokens.attention_mask,
-        )
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = student_net(
+                input_ids=tokens.input_ids,
+                attention_mask=tokens.attention_mask,
+            )
         logits = outputs.logits[:, :-1]
         
         eval_loss = torch.nn.functional.cross_entropy(
@@ -394,6 +398,13 @@ def _eval_expert_model(
 
     eval_loss = sum(eval_metrics) / len(eval_metrics)
     eval_accuracy = sum(eval_accuracies) / len(eval_accuracies) if eval_accuracies else None
+
+
+    # clear cache
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    student_net.train()
     
     return eval_loss, eval_accuracy
 
@@ -454,6 +465,8 @@ def _train_expert_model_uncached(
 
     for epoch in range(num_experts):
         for _i in range(num_steps_per_expert):
+            # Print memory available
+            # print(f"[train_expert_model] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
             if ds_tokens is not None:
                 # Handle pre-tokenized data case
                 if len(ds_tokens) < expert_batch_size:

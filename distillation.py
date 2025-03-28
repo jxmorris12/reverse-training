@@ -221,6 +221,7 @@ class DatasetDistiller:
         # handle distributed
         self._distributed_broadcast_everything(expert_buffer, dataset_token_counts)
 
+        print(f"[run_distillation - start] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         # run optimization
         pbar = trange_if_main_worker(0, self.args.max_iterations+1, desc="iterations")
         all_evaluation_metrics = []
@@ -247,6 +248,7 @@ class DatasetDistiller:
             if discrete_optimizer.should_stop:
                 break
 
+        print(f"[run_distillation - end] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         print("Stopping distillation...")
         eval_start_time = time.time()
         final_evaluation_metrics = self._evaluate_and_log(Z_text, Z_tokens, Y, step=step)
