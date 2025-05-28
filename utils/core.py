@@ -1,4 +1,4 @@
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Union
 import collections
 import gc
 import hashlib
@@ -95,14 +95,19 @@ class ExpertModel:
 
     def compute_outputs(
             self, 
-            examples: list[str], 
+            examples: Union[list[str], torch.Tensor], 
             sequence_length: int, 
             is_tokenized: bool,
             output_hidden_states: bool = False,
         ) -> tuple[transformers.BatchEncoding, torch.Tensor]:
 
         if is_tokenized:
-            tokenized_text = examples
+            input_ids = examples.to(device)
+            attention_mask = (input_ids != self.tokenizer.pad_token_id)
+            tokenized_text = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
         else:
             tokenized_text = self.tokenizer(
                 examples,
@@ -111,11 +116,13 @@ class ExpertModel:
                 truncation=True, 
                 max_length=sequence_length, 
             ).to(device)
+            input_ids = tokenized_text.input_ids
+            attention_mask = tokenized_text.attention_mask
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.student_net(
-                input_ids=tokenized_text.input_ids,
-                attention_mask=tokenized_text.attention_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 output_hidden_states=output_hidden_states,
             )
         
@@ -439,7 +446,7 @@ def _eval_expert_model(
             label_column_name=label_column_name,
             text_column_name=text_column_name,
         )
-        loss, accuracy = expert.get_loss_and_accuracy(
+        _, loss, accuracy = expert.get_loss_and_accuracy(
             examples=examples,
             label_column_name=label_column_name,
             sequence_length=sequence_length
@@ -533,7 +540,7 @@ def _train_expert_model_uncached(
                 )
                 is_tokenized = False
                 
-            loss, accuracy = expert.get_loss_and_accuracy(
+            _, loss, accuracy = expert.get_loss_and_accuracy(
                 examples=examples,
                 label_column_name=label_column_name,
                 sequence_length=sequence_length,
@@ -764,7 +771,4 @@ def tqdm_if_main_worker(*args, **kwargs) -> Iterable:
 
 
 def trange_if_main_worker(*args, **kwargs) -> tqdm.tqdm:
-    if get_rank() == 0:
-        return tqdm.trange(*args, **kwargs)
-    else:
-        return tqdm.trange(*args, **kwargs, disable=True)
+ 
