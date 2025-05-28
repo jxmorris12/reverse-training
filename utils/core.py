@@ -771,4 +771,7 @@ def tqdm_if_main_worker(*args, **kwargs) -> Iterable:
 
 
 def trange_if_main_worker(*args, **kwargs) -> tqdm.tqdm:
- 
+    if get_rank() == 0:
+        return tqdm.trange(*args, **kwargs)
+    else:
+        return tqdm.trange(*args, **kwargs, disable=True)
