@@ -525,6 +525,12 @@ def _train_expert_model_uncached(
             label_column_name=label_column_name,
             sequence_length=sequence_length,
         )
+
+
+        if (eval_accuracy == 0.0) or (eval_loss == float("inf")):
+            breakpoint()
+        else:
+            print("its ok?")
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
         evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)

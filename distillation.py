@@ -98,7 +98,14 @@ class DatasetDistiller:
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)
 
-    def _evaluate_and_log(self, Z_text: torch.Tensor, Z_tokens: torch.Tensor, Y: torch.Tensor, step: int) -> dict[str, float]:
+    def _evaluate_and_log(
+            self, 
+            expert_model: ExpertModel, 
+            Z_text: torch.Tensor, 
+            Z_tokens: torch.Tensor, 
+            Y: torch.Tensor, 
+            step: int
+        ) -> dict[str, float]:
         self._log_table(Z_tokens, Y, step=step)
         Y = Y.cpu().tolist()
         
@@ -112,6 +119,12 @@ class DatasetDistiller:
         #     "dataset_token_f1": f1.detach().cpu().item(),
         # }
 
+        # Map labels back to original dataset
+        label_map = dict(zip(
+            expert_model.all_labels_ids,
+            expert_model.all_labels,
+        ))
+        Y = [label_map[y] for y in Y]
         train_ds = datasets.Dataset.from_dict(
             {
                 "text": Z_text,
@@ -123,6 +136,8 @@ class DatasetDistiller:
             "train": train_ds,
             "test": test_ds,
         })
+
+        assert set(Y) <= set(test_ds[self.classification_dataset.label_column_name])
 
         # run full evaluation
         expert, __, evaluation_metrics = train_expert_model(
@@ -192,7 +207,13 @@ class DatasetDistiller:
 
             if (step + 1) % self.args.eval_every == 0:
                 eval_start_time = time.time()
-                evaluation_metrics = self._evaluate_and_log(Z_text, Z_tokens, Y, step=step)
+                evaluation_metrics = self._evaluate_and_log(
+                    expert_model=expert_model, 
+                    Z_text=Z_text, 
+                    Z_tokens=Z_tokens, 
+                    Y=Y, 
+                    step=step
+                )
                 evaluation_metrics["step"] = step
                 all_evaluation_metrics.append(evaluation_metrics)
                 eval_end_time = time.time()
@@ -206,7 +227,13 @@ class DatasetDistiller:
         print(f"[run_distillation - end] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         print("Stopping distillation...")
         eval_start_time = time.time()
-        final_evaluation_metrics = self._evaluate_and_log(Z_text, Z_tokens, Y, step=step)
+        final_evaluation_metrics = self._evaluate_and_log(
+            expert_model=expert_model, 
+            Z_text=Z_text, 
+            Z_tokens=Z_tokens, 
+            Y=Y, 
+            step=step
+        )
         wandb.finish()
         eval_end_time = time.time()
         total_time_in_evaluation += eval_end_time - eval_start_time
