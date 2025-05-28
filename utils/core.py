@@ -581,8 +581,6 @@ def train_expert_model(
         ds: datasets.DatasetDict, 
         text_column_name: str, 
         label_column_name: str,
-        ds_tokens: Optional[torch.Tensor] = None,
-        ds_labels: Optional[torch.Tensor] = None,
         **kwargs
     ) -> tuple[ExpertModel, list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     """Train expert models with caching based on input parameters."""
@@ -608,10 +606,8 @@ def train_expert_model(
     cache_key = hashlib.sha256(cache_key.encode()).hexdigest()
     cache_path = os.path.join(cache_dir, f"expert_model_{cache_key}.pkl")
 
-    uncachable_args_provided = (ds_tokens is not None) or (ds_labels is not None)
-    
     # Check if cached result exists
-    if os.path.exists(cache_path) and not uncachable_args_provided:
+    if os.path.exists(cache_path):
         print0(f"Loading cached expert model results from {cache_path}")
 
         #########################################################
@@ -632,11 +628,8 @@ def train_expert_model(
             pass
     
     # If not cached, run training and cache results
-    num_datapoints = len(ds_tokens) if ds_tokens is not None else len(ds["train"])
-    if not uncachable_args_provided:
-        print0(f"Training expert model with {num_datapoints} datapoints / batch size {expert_batch_size} and caching results to {cache_path}")
-    else:
-        print0(f"Training expert model with {num_datapoints} datapoints / batch size {expert_batch_size}")
+    num_datapoints = len(ds["train"])
+    print0(f"Training expert model with {num_datapoints} datapoints / batch size {expert_batch_size} and caching results to {cache_path}")
     
     results = _train_expert_model_uncached(
         base_model_name_or_path=base_model_name_or_path,
@@ -648,15 +641,12 @@ def train_expert_model(
         ds=ds,
         text_column_name=text_column_name,
         label_column_name=label_column_name,
-        ds_tokens=ds_tokens,
-        ds_labels=ds_labels,
         **kwargs
     )
     
     # Cache results
-    if not uncachable_args_provided:
-        with open(cache_path, "wb") as f:
-            pickle.dump(results, f)
+    with open(cache_path, "wb") as f:
+        pickle.dump(results, f)
     
     return results
 
