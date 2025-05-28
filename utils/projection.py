@@ -222,6 +222,17 @@ def _get_grads_final_layer_uncached(
                 reduction="mean"
             )
             return loss
+        
+        with torch.no_grad():
+            logits = student_net.lm_head(last_hidden_state)
+            logits = logits[:, -1, :]
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).to(device), 
+                inputs["labels"].reshape(-1).to(device),
+                ignore_index=-100,
+                reduction="mean"
+            )
+            print(f"[get_grads_final_layer] Loss = {loss}")
 
         # Create vectorized gradient function
         ft_compute_grad = torch.func.grad(compute_loss)
@@ -390,7 +401,6 @@ def _get_grads_full_model_uncached(
                 ignore_index=-100,
                 reduction="mean"
             )
-            # print(f"[get_grads_full_model] {input_ids.shape} | Loss = {loss:.3f}")
             return loss
 
         # Create vectorized gradient function

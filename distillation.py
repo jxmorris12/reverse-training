@@ -14,8 +14,8 @@ from utils import (
     device, 
     get_model, 
     get_world_size,
-    get_token_embeddings_random_soft,
-    get_token_embeddings_from_classification_dataset, 
+    # get_token_embeddings_random_soft,
+    # get_token_embeddings_from_classification_dataset, 
     train_expert_model,
     trange_if_main_worker,
     ClassificationDataset,
@@ -34,55 +34,12 @@ class DatasetDistiller:
         self.initial_student_net = get_model(args.base_model_name_or_path)
         self.student_net = ReparamModule(get_model(args.base_model_name_or_path)).to(device)
         self.classification_dataset = self._load_dataset()
-        self.dataset_token_counts = None
-
-    def _init_synthetic_data(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return (None, None)
-        # if self.args.token_init == "random":
-        #     student_token_embeddings = self.initial_student_net.get_input_embeddings().to(device)
-        #     tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.base_model_name_or_path)
-        #     X_tokens = torch.randint(
-        #         low=0,
-        #         high=tokenizer.vocab_size,
-        #         size=[self.args.dataset_size, self.args.sequence_length - 1],
-        #         device=device,
-        #     )
-        #     X = student_token_embeddings(X_tokens)
-
-        #     num_classes = 4
-        #     CLASS_MAP = torch.tensor([352,  362,  657,  513], device=device) # for AG_News... tmp
-        #     token_labels_syn = torch.randint(low=0, high=num_classes, size=[self.args.dataset_size], device=device)
-        #     Y = CLASS_MAP[token_labels_syn]
-
-        # elif self.args.token_init == "random_soft":
-        #     X, Y = [], []
-        #     init_minibatch_size = 512
-        #     for _ in trange_if_main_worker(0, self.args.dataset_size, init_minibatch_size, desc="Initializing"):
-        #         x, y = get_token_embeddings_random_soft(
-        #             student_net=self.initial_student_net,
-        #             dataset_size=min(init_minibatch_size, self.args.dataset_size),
-        #             sequence_length=self.args.sequence_length,
-        #         )
-        #         X.append(x)
-        #         Y.append(y)
-        #     X = torch.cat(X, dim=0)
-        #     Y = torch.cat(Y, dim=0)
-        # elif self.args.token_init == "dataset":
-        #     X, Y = get_token_embeddings_from_classification_dataset(
-        #         dataset_size=self.args.dataset_size, 
-        #         sequence_length=self.args.sequence_length,
-        #         classification_dataset=self.classification_dataset
-        #     )
-        # else:
-        #     raise NotImplementedError(f"Token init {self.args.token_init} not implemented")
-        # X = X.detach().to(device).requires_grad_(True)
-        # return X, Y
     
     def _load_dataset(self) -> ClassificationDataset:
         return ClassificationDataset.from_dataset_name(self.args.dataset, seed=self.args.seed)
     
     def _init_discrete_optimizer(self):
-        X, Y = self._init_synthetic_data()
+        X, Y = [None, None]
         if self.args.discrete_optimizer == "ADMM":
             optimizer = ADMMOptimizer(
                 args=self.args,
@@ -147,19 +104,16 @@ class DatasetDistiller:
         labels = Y
 
         # TODO: Recheck the below logic!
-        # compare tokens to dataset_token_counts
-        dataset_token_counts = self.dataset_token_counts.bool()
-        token_counts = tokens.flatten().bincount(minlength=self.tokenizer.vocab_size).bool()
         
         # compute precision & recall
-        precision = (dataset_token_counts & token_counts).sum() / token_counts.sum()
-        recall = (dataset_token_counts & token_counts).sum() / dataset_token_counts.sum()
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
-        dataset_metrics = {
-            "dataset_token_precision": precision.detach().cpu().item(),
-            "dataset_token_recall": recall.detach().cpu().item(),
-            "dataset_token_f1": f1.detach().cpu().item(),
-        }
+        # precision = (dataset_token_counts & token_counts).sum() / token_counts.sum()
+        # recall = (dataset_token_counts & token_counts).sum() / dataset_token_counts.sum()
+        # f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
+        # dataset_metrics = {
+        #     "dataset_token_precision": precision.detach().cpu().item(),
+        #     "dataset_token_recall": recall.detach().cpu().item(),
+        #     "dataset_token_f1": f1.detach().cpu().item(),
+        # }
 
         # run full evaluation
         _, __, evaluation_metrics = train_expert_model(
@@ -178,19 +132,15 @@ class DatasetDistiller:
         )
 
         # log
-        metrics = { **dataset_metrics, **evaluation_metrics }
+        metrics = { **evaluation_metrics }
         wandb.log(metrics, step=step)
         return metrics
     
-    def _distributed_broadcast_everything(self, expert_buffer: list[dict[str, torch.Tensor]], dataset_token_counts: torch.Tensor) -> None:
+    def _distributed_broadcast_everything(self, expert_buffer: list[dict[str, torch.Tensor]]) -> None:
         if get_world_size() <= 1:
             return
         # broadcast expert_buffer from rank 0 to all other ranks
-        # for i in range(len(expert_buffer)):
-        #     expert_buffer[i] = torch.broadcast_coalesced(expert_buffer[i], devices=[0])[0]
         torch.distributed.broadcast_object_list(expert_buffer, src=0)
-        # broadcast dataset_token_counts from rank 0 to all other ranks
-        torch.distributed.broadcast(dataset_token_counts, src=0)
     
     def _run_defense(self, expert_buffer: list[dict[str, torch.Tensor]]) -> tuple[list[dict[str, torch.Tensor]], dict[str, float]]:
         if self.args.defense == None:
@@ -203,7 +153,7 @@ class DatasetDistiller:
         discrete_optimizer = self._init_discrete_optimizer()
 
         # load/generate expert trajectories
-        expert_buffer, dataset_token_counts, expert_evaluation_metrics = train_expert_model(
+        expert_buffer, expert_evaluation_metrics = train_expert_model(
             base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
@@ -215,11 +165,10 @@ class DatasetDistiller:
             label_column_name=self.classification_dataset.label_column_name,
             map_labels_to_letters=True,
         )
-        new_expert_buffer, new_expert_evaluation_metrics = self._run_defense(expert_buffer)
-        self.dataset_token_counts = dataset_token_counts.cpu()
+        # new_expert_buffer, new_expert_evaluation_metrics = self._run_defense(expert_buffer)
         
         # handle distributed
-        self._distributed_broadcast_everything(expert_buffer, dataset_token_counts)
+        self._distributed_broadcast_everything(expert_buffer)
 
         print(f"[run_distillation - start] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         # run optimization
