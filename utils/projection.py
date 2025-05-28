@@ -204,7 +204,6 @@ def _get_grads_final_layer_uncached(
             _, outputs = expert.compute_outputs(
                 examples=examples,
                 sequence_length=sequence_length,
-                is_tokenized=False,
                 output_hidden_states=True,
             )
             last_hidden_state = outputs.hidden_states[-1]
