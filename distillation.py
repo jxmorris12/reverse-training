@@ -3,6 +3,7 @@ import os
 import pickle
 import time
 
+import datasets
 import torch
 import transformers
 import wandb
@@ -99,15 +100,9 @@ class DatasetDistiller:
 
     def _evaluate_and_log(self, Z_text: torch.Tensor, Z_tokens: torch.Tensor, Y: torch.Tensor, step: int) -> dict[str, float]:
         self._log_table(Z_tokens, Y, step=step)
-        Z_tokens = Z_tokens.cpu()
-        Y = Y.cpu()
+        Y = Y.cpu().tolist()
         
-        tokens = Z_tokens
-        labels = Y
-
-        # TODO: Recheck the below logic!
-        
-        # compute precision & recall
+        # compute token-level precision & recall
         # precision = (dataset_token_counts & token_counts).sum() / token_counts.sum()
         # recall = (dataset_token_counts & token_counts).sum() / dataset_token_counts.sum()
         # f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
@@ -117,19 +112,29 @@ class DatasetDistiller:
         #     "dataset_token_f1": f1.detach().cpu().item(),
         # }
 
+        train_ds = datasets.Dataset.from_dict(
+            {
+                "text": Z_text,
+                "label": Y,
+            }
+        )
+        test_ds = self.classification_dataset.dataset["test"]
+        ds = datasets.DatasetDict({
+            "train": train_ds,
+            "test": test_ds,
+        })
+
         # run full evaluation
         expert, __, evaluation_metrics = train_expert_model(
             base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_eval_epochs,
-            num_steps_per_expert=max(1, len(tokens) // self.args.expert_batch_size),
+            num_steps_per_expert=max(1, len(Z_tokens) // self.args.expert_batch_size),
             expert_batch_size=self.args.expert_batch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,
-            ds=self.classification_dataset.dataset,
+            ds=ds,
             text_column_name=self.classification_dataset.text_column_name,
             label_column_name=self.classification_dataset.label_column_name,
-            ds_tokens=tokens,
-            ds_labels=labels,
         )
 
         # log

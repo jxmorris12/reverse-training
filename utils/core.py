@@ -37,7 +37,7 @@ class ExpertModel:
         self.tokenizer.truncation_side = "left" # important for correct truncation
         self.tokenizer.padding_side = "left" 
         self.all_labels = all_labels
-        self.all_labels_ids = [self.tokenizer.encode(f" {x}")[-1] for x in (self.all_labels or [])]
+        self.all_labels_ids = list({self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels or []})
         print(f"[ExpertModel] | {base_model_name_or_path} | all_labels: {self.all_labels} | all_labels_ids: {self.all_labels_ids}")
     
     @property
@@ -95,29 +95,20 @@ class ExpertModel:
 
     def compute_outputs(
             self, 
-            examples: Union[list[str], torch.Tensor], 
+            examples: list[str] ,
             sequence_length: int, 
-            is_tokenized: bool,
             output_hidden_states: bool = False,
         ) -> tuple[transformers.BatchEncoding, torch.Tensor]:
 
-        if is_tokenized:
-            input_ids = examples.to(device)
-            attention_mask = (input_ids != self.tokenizer.pad_token_id)
-            tokenized_text = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            }
-        else:
-            tokenized_text = self.tokenizer(
-                examples,
-                return_tensors="pt", 
-                padding="max_length", 
-                truncation=True, 
-                max_length=sequence_length, 
-            ).to(device)
-            input_ids = tokenized_text.input_ids
-            attention_mask = tokenized_text.attention_mask
+        tokenized_text = self.tokenizer(
+            examples,
+            return_tensors="pt", 
+            padding="max_length", 
+            truncation=True, 
+            max_length=sequence_length, 
+        ).to(device)
+        input_ids = tokenized_text.input_ids
+        attention_mask = tokenized_text.attention_mask
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.student_net(
@@ -133,10 +124,9 @@ class ExpertModel:
             examples: list[str], 
             sequence_length: int,
             label_column_name: Optional[str] = None,
-            is_tokenized: bool = False,
         ) -> tuple[float, float]:
 
-        tokenized_text, outputs = self.compute_outputs(examples, sequence_length, is_tokenized)
+        tokenized_text, outputs = self.compute_outputs(examples, sequence_length)
 
         labels = tokenized_text.input_ids[:, 1:].detach().clone() 
         logits = outputs.logits[:, :-1, :]
@@ -310,7 +300,6 @@ def _autolabel_dataset_uncached(
             masked_logits, _, _ = expert.get_loss_and_accuracy(
                 examples=examples,
                 sequence_length=sequence_length,
-                is_tokenized=False,
             )
             all_labels.append(masked_logits.argmax(-1).cpu())
     
@@ -475,8 +464,6 @@ def _train_expert_model_uncached(
         ds: datasets.DatasetDict, 
         text_column_name: str, 
         label_column_name: Optional[str] = None,
-        ds_tokens: Optional[torch.Tensor] = None,
-        ds_labels: Optional[torch.Tensor] = None,
         early_stopping_patience: int = 10,
         num_eval_datapoints: int = 2048,
     ) -> tuple[ExpertModel, list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
@@ -485,13 +472,7 @@ def _train_expert_model_uncached(
     eval_ds = ds["test"].shuffle(seed=42)
     eval_ds = eval_ds.select(range(min(num_eval_datapoints, len(eval_ds))))
 
-    if ds_labels is not None:
-        all_labels = set(ds_labels)
-    elif label_column_name is not None:
-        all_labels = set(train_ds[label_column_name])
-    else:
-        all_labels = None
-    
+    all_labels = set(train_ds[label_column_name])    
     expert = ExpertModel(base_model_name_or_path, all_labels=all_labels)
     optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
     # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
@@ -510,41 +491,23 @@ def _train_expert_model_uncached(
     epochs_without_improvement = 0
 
     # Print first datapoint
-    if ds_tokens is not None:
-        print(f"[train_expert_model] First datapoint: {ds_tokens[0]}")
-        print(f"[train_expert_model] First datapoint label: {ds_labels[0]}")
-        print(f"[train_expert_model] Label distribution: {ds_labels.unique(return_counts=True)}")
-    else:
-        print(f"[train_expert_model] First datapoint: {train_ds[0][text_column_name]}")
-        if label_column_name is not None: print(f"[train_expert_model] First datapoint label: {train_ds[0][label_column_name]}")
+    print(f"[train_expert_model] First datapoint: {train_ds[0][text_column_name]}")
+    if label_column_name is not None: print(f"[train_expert_model] First datapoint label: {train_ds[0][label_column_name]}")
     
     for epoch in range(num_experts):
         for _i in range(num_steps_per_expert):
-            # Allow examples to be tokens. We need this for token-level distillation eval.
-            if ds_tokens is not None:
-                # Handle pre-tokenized data case
-                if len(ds_tokens) < expert_batch_size:
-                    batch_idxs = torch.randint(0, len(ds_tokens), (expert_batch_size,)).tolist()
-                else:
-                    batch_idxs = random.sample(range(len(ds_tokens)), k=expert_batch_size)
-                examples = ds_tokens[batch_idxs].to(device)
-                is_tokenized = True
-            else:
-                # Handle raw text data case
-                batch_idxs = random.sample(range(len(train_ds)), k=expert_batch_size)
-                examples = train_ds.select(batch_idxs)
-                examples = expert.prepare_examples(
-                    examples=examples,
-                    label_column_name=label_column_name,
-                    text_column_name=text_column_name,
-                )
-                is_tokenized = False
+            batch_idxs = random.sample(range(len(train_ds)), k=expert_batch_size)
+            examples = train_ds.select(batch_idxs)
+            examples = expert.prepare_examples(
+                examples=examples,
+                label_column_name=label_column_name,
+                text_column_name=text_column_name,
+            )
                 
             _, loss, accuracy = expert.get_loss_and_accuracy(
                 examples=examples,
                 label_column_name=label_column_name,
                 sequence_length=sequence_length,
-                is_tokenized=is_tokenized,
             )
             pbar.set_description(f"Epoch {epoch} | Step {step+1} | Loss = {loss:.3f} | Accuracy = {accuracy:.3f}")
             pbar.update(1)
