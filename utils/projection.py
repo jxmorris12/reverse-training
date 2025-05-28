@@ -1,12 +1,16 @@
 import hashlib
+import os
+from enum import Enum
+
+import datasets
+import numpy as np
 import torch
 import tqdm
-import os
-import numpy as np
-from enum import Enum
+
 
 from utils.core import device, hash_model_params, _get_cache_key
 from utils.batch import find_executable_batch_size
+from utils.core import ExpertModel
 
 def vectorize(grads: dict, device=None) -> torch.Tensor:
     """Convert a dictionary of gradients to a flat tensor."""
@@ -143,10 +147,9 @@ class CudaProjector:
 
 @find_executable_batch_size
 def _get_grads_final_layer_uncached(
-        student_net, 
+        expert: ExpertModel, 
         dataset, 
         labels,
-        tokenizer, 
         projector, 
         sequence_length: int, 
         do_projection: bool = True,
@@ -156,48 +159,52 @@ def _get_grads_final_layer_uncached(
     Computes gradients for each example in the dataset with respect to the model parameters.
     
     Args:
-        student_net: The model to compute gradients for
+        expert: The expert model to compute gradients for
         dataset: The dataset containing examples
-        tokenizer: Tokenizer for processing text examples
+        labels: Optional labels for classification tasks
         projector: Projector for projecting gradients to a lower-dimensional space
         sequence_length: Maximum sequence length for tokenization
-        batch_size: Number of examples to process at once
         do_projection: Whether to project the gradients
+        batch_size: Number of examples to process at once
         
     Returns:
         A tensor of shape (len(dataset), projection_dim) containing the gradients
     """
+    expert.student_net.eval()
+    expert.student_net.to(device)
+    
     do_classification = (labels is not None)
     all_grads = []
     pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) // batch_size < 10))
-
-    # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
-    params = {k: v.detach() for k, v in student_net.lm_head.named_parameters()}
-    buffers = {k: v.detach() for k, v in student_net.lm_head.named_buffers()}
+    
+    # Get parameters for the final layer only
+    params = {k: v.detach() for k, v in expert.student_net.lm_head.named_parameters()}
+    buffers = {k: v.detach() for k, v in expert.student_net.lm_head.named_buffers()}
     
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
-        
-        inputs = tokenizer(
-            batch["text"],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=sequence_length,
+        batch_labels = labels[batch_start:batch_end].to(device)
+
+        batch = datasets.Dataset.from_dict(
+            {
+                "text": batch["text"],
+                "label": batch_labels,
+            }
         )
-        inputs = { k: v.to(device) for k, v in inputs.items() }
-
-        if do_classification:
-            inputs["labels"] = labels[batch_start:batch_end]
-        else:
-            inputs["labels"] = inputs["input_ids"].detach().clone()
-
-        # get last hidden state for inputs
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = student_net(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
+            
+        examples = expert.prepare_examples(
+            examples=batch,
+            label_column_name="label",
+            text_column_name="text"
+        )
+        
+        # Get last hidden state
+        with torch.no_grad():
+            _, outputs = expert.compute_outputs(
+                examples=examples,
+                sequence_length=sequence_length,
+                is_tokenized=False,
                 output_hidden_states=True,
             )
             last_hidden_state = outputs.hidden_states[-1]
@@ -205,42 +212,20 @@ def _get_grads_final_layer_uncached(
         @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         def compute_loss(params, buffers, last_hidden_states, labels):
             logits = torch.func.functional_call(
-                module=student_net.lm_head,
+                module=expert.student_net.lm_head,
                 parameter_and_buffer_dicts=(params, buffers),
                 args=(last_hidden_states,),
             )
-            if do_classification:
-                logits = logits[-1, :]
-            else:
-                logits = logits[:-1, :]
-                logits.reshape(-1, logits.size(-1)), 
-                labels = labels[1:]
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).to(device), 
-                labels.reshape(-1).to(device),
-                ignore_index=-100,
-                reduction="mean"
-            )
+            _, loss, _ = expert.compute_loss_and_accuracy(logits[None], labels[None])
             return loss
         
-        with torch.no_grad():
-            logits = student_net.lm_head(last_hidden_state)
-            logits = logits[:, -1, :]
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).to(device), 
-                inputs["labels"].reshape(-1).to(device),
-                ignore_index=-100,
-                reduction="mean"
-            )
-            print(f"[get_grads_final_layer] Loss = {loss}")
-
         # Create vectorized gradient function
         ft_compute_grad = torch.func.grad(compute_loss)
         ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
 
         # Compute per-sample gradients
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, inputs["labels"])
-        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in student_net.lm_head.named_parameters()], dim=1)
+        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, batch_labels)
+        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.lm_head.named_parameters()], dim=1)
 
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
@@ -248,18 +233,20 @@ def _get_grads_final_layer_uncached(
         else:
             all_grads.extend(grads_batch.cpu())
     
+    expert.student_net.cpu()
+    expert.student_net.train()
+    
     return torch.stack(all_grads).to(torch.float16)
 
 
 def get_grads_final_layer(
-        student_net, 
+        expert: ExpertModel, 
         dataset, 
         labels,
-        tokenizer, 
         projector, 
         sequence_length: int, 
         do_projection: bool = True,
-        use_cache: bool = True,
+        use_cache: bool = False,
         model_cache_key: str = "",
     ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
@@ -274,21 +261,21 @@ def get_grads_final_layer(
     Returns:
         Tensor of shape (len(dataset),) containing the predicted token ids
     """
+    use_cache = False
     if not use_cache:
         return _get_grads_final_layer_uncached(
-            student_net=student_net, 
+            expert=expert, 
             dataset=dataset, 
             labels=labels, 
-            tokenizer=tokenizer, 
             projector=projector, 
             sequence_length=sequence_length, 
             do_projection=do_projection,
         )
     hash_kwargs = {
         # TODO: hash labels...
-        "student_net_hash": hash_model_params(student_net),
+        "student_net_hash": hash_model_params(expert.student_net),
         "dataset_hash": dataset._fingerprint,
-        "tokenizer_hash": tokenizer.name_or_path,
+        "tokenizer_hash": expert.tokenizer.name_or_path,
         "projector_hash": projector.deterministic_hash(),
         "sequence_length": sequence_length,
         "do_projection": do_projection,
@@ -305,10 +292,9 @@ def get_grads_final_layer(
     except:
         print(f"Getting grads for final layer with cache key: {full_cache_key} => {cache_key}")
         grads = _get_grads_final_layer_uncached(
-            student_net=student_net, 
+            expert=expert, 
             dataset=dataset,
             labels=labels, 
-            tokenizer=tokenizer, 
             projector=projector, 
             sequence_length=sequence_length, 
             do_projection=do_projection,
@@ -321,10 +307,9 @@ def get_grads_final_layer(
 
 @find_executable_batch_size
 def _get_grads_full_model_uncached(
-        student_net, 
+        expert: ExpertModel, 
         dataset, 
         labels,
-        tokenizer, 
         projector, 
         sequence_length: int, 
         do_projection: bool = True,
@@ -354,19 +339,25 @@ def _get_grads_full_model_uncached(
     print(f"[get_grads_full_model] First datapoint label: {labels[0]}")
 
     # helpful page: pytorch.org/tutorials/intermediate/per_sample_grads.html
-    params = {k: v.detach() for k, v in student_net.named_parameters()}
-    buffers = {k: v.detach() for k, v in student_net.named_buffers()}
+    params = {k: v.detach() for k, v in expert.student_net.named_parameters()}
+    buffers = {k: v.detach() for k, v in expert.student_net.named_buffers()}
     
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
+        batch_labels = labels[batch_start:batch_end]
+
+        batch = datasets.Dataset.from_dict(
+            {
+                "text": batch["text"],
+                "label": batch_labels,
+            }
+        )
         
-        inputs = tokenizer(
-            batch["text"],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=sequence_length-1,
+        inputs = expert.prepare_examples(
+            examples=batch,
+            label_column_name="label",
+            text_column_name="text"
         )
         inputs = { k: v.to(device) for k, v in inputs.items() }
 
@@ -426,10 +417,9 @@ def _get_grads_full_model_uncached(
 
 
 def get_grads_full_model(
-        student_net, 
+        expert: ExpertModel, 
         dataset, 
         labels,
-        tokenizer, 
         projector, 
         sequence_length: int, 
         do_projection: bool = True,

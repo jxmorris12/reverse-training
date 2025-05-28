@@ -20,6 +20,123 @@ from utils.batch import find_executable_batch_size
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+class ExpertModel:
+    """This is a wrapper class for consistent train/eval loss and accuracy calculation.
+    
+    It also handles tokenization and label remapping.
+    """
+    student_net: transformers.PreTrainedModel
+    tokenizer: transformers.PreTrainedTokenizer
+    all_labels: Optional[set[str]]
+    
+    def __init__(self, base_model_name_or_path: str, all_labels: Optional[set[str]] = None):
+        self.student_net = get_model(base_model_name_or_path).to(device)
+        self.student_net.eval()
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(base_model_name_or_path)
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.truncation_side = "left" # important for correct truncation
+        self.tokenizer.padding_side = "left" 
+        self.all_labels = all_labels
+        self.all_labels_ids = [self.tokenizer.encode(f" {x}")[-1] for x in (self.all_labels or [])]
+        print(f"[ExpertModel] | {base_model_name_or_path} | all_labels: {self.all_labels} | all_labels_ids: {self.all_labels_ids}")
+    
+    @property
+    def is_doing_classification(self) -> bool:
+        return (self.all_labels is not None) and (len(self.all_labels) > 0)
+    
+    def prepare_examples(
+            self, examples: list[str], label_column_name: Optional[str], text_column_name: str) -> list[str]:
+        if label_column_name is not None:
+            # Classification mode
+            examples = [
+                f"{text} {label}" 
+                for text, label in zip(examples[text_column_name], examples[label_column_name])
+            ]
+        else:
+            # Language modeling mode
+            examples = examples[text_column_name]
+        return examples
+
+    def compute_loss_and_accuracy(
+            self, 
+            logits: torch.Tensor, 
+            labels: torch.Tensor,
+        ) -> tuple[torch.Tensor, float, float]:
+        if self.is_doing_classification:
+            # For classification, only predict the last token
+            if labels.ndim == 1:
+                # unroll singleton for vmap
+                labels = labels[None]
+
+            labels = labels[:, -1]
+            logits = logits[:, -1, :]
+
+            # Mask logits by vocab
+            token_is_masked = (
+                ~(
+                    torch.arange(logits.shape[1])[None, :] 
+                    == 
+                    torch.tensor(self.all_labels_ids)[:, None]
+                ).any(dim=0)
+            )
+            logits[:, token_is_masked] = -float("inf")
+
+            # Get predictions
+            accuracy = (logits.argmax(-1) == labels).float().mean()
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), 
+                labels.reshape(-1),
+                reduction="mean"
+            )
+        else:
+            raise ValueError("Language modeling is not supported right now")
+    
+        return logits, loss, accuracy
+
+    def compute_outputs(
+            self, 
+            examples: list[str], 
+            sequence_length: int, 
+            is_tokenized: bool,
+            output_hidden_states: bool = False,
+        ) -> tuple[transformers.BatchEncoding, torch.Tensor]:
+
+        if is_tokenized:
+            tokenized_text = examples
+        else:
+            tokenized_text = self.tokenizer(
+                examples,
+                return_tensors="pt", 
+                padding="max_length", 
+                truncation=True, 
+                max_length=sequence_length, 
+            ).to(device)
+        
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = self.student_net(
+                input_ids=tokenized_text.input_ids,
+                attention_mask=tokenized_text.attention_mask,
+                output_hidden_states=output_hidden_states,
+            )
+        
+        return tokenized_text, outputs
+    
+    def get_loss_and_accuracy(
+            self, 
+            examples: list[str], 
+            sequence_length: int,
+            label_column_name: Optional[str] = None,
+            is_tokenized: bool = False,
+        ) -> tuple[float, float]:
+
+        tokenized_text, outputs = self.compute_outputs(examples, sequence_length, is_tokenized)
+
+        labels = tokenized_text.input_ids[:, 1:].detach().clone() 
+        logits = outputs.logits[:, :-1, :]
+
+        return self.compute_loss_and_accuracy(logits, labels)
+    
+
 def hash_model_params(model):
     """Generate a hash of model parameters."""
     # TODO: This is a hack to get around the fact that the model state dict is not serializable.
@@ -145,10 +262,8 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
 @find_executable_batch_size
 def _autolabel_dataset_uncached(
         dataset: datasets.Dataset,
-        model: transformers.PreTrainedModel,
-        tokenizer: transformers.PreTrainedTokenizer,
+        expert: ExpertModel,
         sequence_length: int,
-        label_map: dict[str, str],
         batch_size: int = 32,
     ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
@@ -163,93 +278,71 @@ def _autolabel_dataset_uncached(
     Returns:
         Tensor of shape (len(dataset),) containing the predicted token ids
     """
-    model.eval()
-    model.to(device)
+    expert.student_net.eval()
+    expert.student_net.to(device)
+
     all_labels = []
-
-    # Valid tokens are all tokens that are in the label map, prepended with a space
-    # e.g. "1" -> " 1" -> [352]
-    valid_token_keys = [f" {s}" for s in list(label_map.keys())]
-
-    # Some tokenizers tokenize " 5" as [" ", " 5"] so we just take the last token.
-    valid_tokens = torch.tensor([tokenizer.encode(s)[-1] for s in valid_token_keys]).flatten()
-    print(f"[autolabel_dataset] valid_tokens: {valid_token_keys} -> {valid_tokens}")
-
-    invalid_tokens_mask = torch.ones(tokenizer.vocab_size, dtype=torch.bool)
-    invalid_tokens_mask[valid_tokens] = False
 
     for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset", colour="RED"):
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
-        
-        # Tokenize batch
-        inputs = tokenizer(
-            batch["text"],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=sequence_length,
+        examples = datasets.Dataset.from_dict(
+            {
+                "text": batch["text"],
+                "label": [0] * len(batch),
+            }
         )
-        inputs = { k: v.to(device) for k, v in inputs.items() }
+        examples = expert.prepare_examples(
+            examples=examples,
+            label_column_name="label",
+            text_column_name="text",
+        )
         
         # Get model predictions
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(**inputs)
-            logits = outputs.logits[:, sequence_length-1, :] # Get logits for sequence_length-th token
-
-            # Set logits of invalid tokens to -float("inf")
-            logits[:, invalid_tokens_mask] = -float("inf")
-            
-            predictions = torch.argmax(logits, dim=-1)
-            all_labels.append(predictions.cpu())
+        with torch.no_grad():
+            masked_logits, _, _ = expert.get_loss_and_accuracy(
+                examples=examples,
+                sequence_length=sequence_length,
+                is_tokenized=False,
+            )
+            all_labels.append(masked_logits.argmax(-1).cpu())
     
-    model.cpu()
-    model.train()
-    return torch.cat(all_labels)
+    expert.student_net.cpu()
+    expert.student_net.train()
+    all_labels = torch.cat(all_labels)
+    label_counts = all_labels.unique(return_counts=True)
+    print(f"[autolabel_dataset] expert model autolabeled counts: {label_counts}")
+    return all_labels
 
 
 def autolabel_dataset(
         dataset: datasets.Dataset,
-        model: transformers.PreTrainedModel,
-        tokenizer: transformers.PreTrainedTokenizer,
+        expert: ExpertModel,
         sequence_length: int,
-        label_map: dict[str, str],
     ) -> torch.Tensor:
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
 
-    label_map_str = "_".join(map(str, sorted(label_map.items())))
-    label_map_hash = hashlib.sha256(label_map_str.encode()).hexdigest()
-    hash_kwargs = {
-        "dataset_hash": dataset._fingerprint,
-        "model_hash": hash_model_params(model),
-        "tokenizer_hash": tokenizer.name_or_path,
-        "sequence_length": sequence_length,
-        "label_map_hash": label_map_hash,
-    }
-    cache_key = _get_cache_key(**hash_kwargs)
-    cache_key = hashlib.sha256(cache_key.encode()).hexdigest()
-    print(f"Autolabeling dataset with cache key: {cache_key}")
-    cache_path = os.path.join(cache_dir, f"autolabel_dataset_{cache_key}.npz")
+    # TODO: Restore caching somehow.
+    # hash_kwargs = {
+    #     "dataset_hash": dataset._fingerprint,
+    #     # "random_seed": random.randint(0, 1000000),
+    #     # "model_hash": hash_model_params(expert.student_net),
+    #     "tokenizer_hash": expert.tokenizer.name_or_path,
+    #     "sequence_length": sequence_length,
+    # }
+    # cache_key = _get_cache_key(**hash_kwargs)
+    # cache_key = hashlib.sha256(cache_key.encode()).hexdigest()
+    # print(f"Autolabeling dataset with cache key: {cache_key}")
+    # cache_path = os.path.join(cache_dir, f"autolabel_dataset_{cache_key}.npz")
 
-    if not os.path.exists(cache_path):
-        labels = _autolabel_dataset_uncached(
-            dataset=dataset, 
-            model=model, 
-            tokenizer=tokenizer, 
-            sequence_length=sequence_length,
-            label_map=label_map,
-        )
-        np.savez(cache_path, labels=labels.numpy())
-    
-    labels = np.load(cache_path)["labels"]
-
-    # Count unique labels
-    # unique_labels, counts = np.unique(labels, return_counts=True)
-    # if len(unique_labels) != len(label_map):
-        # raise ValueError(f"[autolabel_dataset] Number of unique labels ({len(unique_labels)}) does not match number of labels in label_map ({len(label_map)})")    
-    
-    return torch.from_numpy(labels)
+    # if not os.path.exists(cache_path):
+    labels = _autolabel_dataset_uncached(
+        dataset=dataset, 
+        expert=expert,
+        sequence_length=sequence_length,
+    )
+    return labels
 
 
 def _get_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -306,97 +399,6 @@ def _get_cache_key(**kwargs) -> str:
     return '_'.join(f"{k}:{value_to_str(v)}" for k, v in sorted_items)
 
 
-
-class ExpertModel:
-    """This is a wrapper class for consistent train/eval loss and accuracy calculation.
-    
-    It also handles tokenization and label remapping.
-    """
-    student_net: transformers.PreTrainedModel
-    tokenizer: transformers.PreTrainedTokenizer
-    all_labels: Optional[set[str]]
-    
-    def __init__(self, base_model_name_or_path: str, all_labels: Optional[set[str]] = None):
-        self.student_net = get_model(base_model_name_or_path).to(device)
-        self.student_net.eval()
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(base_model_name_or_path)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.truncation_side = "left" # important for correct truncation
-        self.tokenizer.padding_side = "left" 
-        self.all_labels = all_labels
-        self.all_labels_ids = [self.tokenizer.encode(f" {x}")[-1] for x in (self.all_labels or [])]
-        print(f"[ExpertModel] | {base_model_name_or_path} | all_labels: {self.all_labels} | all_labels_ids: {self.all_labels_ids}")
-    
-    def prepare_examples(
-            self, examples: list[str], label_column_name: Optional[str], text_column_name: str) -> list[str]:
-        if label_column_name is not None:
-            # Classification mode
-            examples = [
-                f"{text} {label}" 
-                for text, label in zip(examples[text_column_name], examples[label_column_name])
-            ]
-        else:
-            # Language modeling mode
-            examples = examples[text_column_name]
-        return examples
-    
-    def get_loss_and_accuracy(
-            self, 
-            examples: list[str], 
-            sequence_length: int,
-            label_column_name: Optional[str] = None,
-            is_tokenized: bool = False,
-        ) -> tuple[float, float]:
-
-        is_classification = (self.all_labels is not None) and (len(self.all_labels) > 0)
-        if is_tokenized:
-            tokens = examples
-        else:
-            tokens = self.tokenizer(
-                examples,
-                return_tensors="pt", 
-                padding="max_length", 
-                truncation=True, 
-                max_length=sequence_length, 
-            ).to(device)
-        
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = self.student_net(
-                input_ids=tokens.input_ids,
-                attention_mask=tokens.attention_mask,
-            )
-        
-        labels = tokens.input_ids[:, 1:].detach().clone() 
-        logits = outputs.logits[:, :-1, :]
-
-        if is_classification:
-            # For classification, only predict the last token
-            labels = labels[:, -1]
-            logits = logits[:, -1, :]
-
-            # Mask logits by vocab
-            token_is_masked = (
-                ~(
-                    torch.arange(logits.shape[1])[None, :] 
-                    == 
-                    torch.tensor(self.all_labels_ids)[:, None]
-                ).any(dim=0)
-            )
-            logits[:, token_is_masked] = -float("inf")
-
-            # Get predictions
-            accuracy = (logits.argmax(-1) == labels).float().mean()
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), 
-                labels.reshape(-1),
-                reduction="mean"
-            )
-        else:
-            raise ValueError("Language modeling is not supported right now")
-
-        return loss, accuracy
-
-
 @find_executable_batch_size
 @torch.no_grad()
 def _eval_expert_model(
@@ -406,7 +408,6 @@ def _eval_expert_model(
     label_column_name: Optional[str],
     sequence_length: int,
     batch_size: int = 32,
-    map_labels_to_letters: bool = False,
 ) -> tuple[float, Optional[float], Optional[float]]:
     """Evaluate expert model on evaluation dataset.
     
@@ -421,8 +422,6 @@ def _eval_expert_model(
     Returns:
         Tuple of (eval_loss, eval_accuracy)
     """
-    assert map_labels_to_letters # Temporary – for consistency
-
     expert.student_net.eval()
 
     eval_metrics = []
@@ -451,7 +450,6 @@ def _eval_expert_model(
     eval_loss = sum(eval_metrics) / len(eval_metrics)
     eval_accuracy = sum(eval_accuracies) / len(eval_accuracies) if eval_accuracies else None
 
-
     # clear cache
     gc.collect()
     torch.cuda.empty_cache()
@@ -474,14 +472,11 @@ def _train_expert_model_uncached(
         ds_labels: Optional[torch.Tensor] = None,
         early_stopping_patience: int = 10,
         num_eval_datapoints: int = 2048,
-        map_labels_to_letters: bool = False,
-    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[ExpertModel, list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
 
     train_ds = ds["train"].shuffle(seed=42)
     eval_ds = ds["test"].shuffle(seed=42)
     eval_ds = eval_ds.select(range(min(num_eval_datapoints, len(eval_ds))))
-
-
 
     if ds_labels is not None:
         all_labels = set(ds_labels)
@@ -559,7 +554,6 @@ def _train_expert_model_uncached(
             text_column_name=text_column_name,
             label_column_name=label_column_name,
             sequence_length=sequence_length,
-            map_labels_to_letters=map_labels_to_letters,
         )
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
@@ -588,7 +582,6 @@ def _train_expert_model_uncached(
         text_column_name=text_column_name,
         label_column_name=label_column_name,
         sequence_length=sequence_length,
-        map_labels_to_letters=map_labels_to_letters,
     )
     evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
     evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
@@ -605,8 +598,7 @@ def _train_expert_model_uncached(
         final_evaluation_metrics["best_eval_accuracy"] = best_eval_accuracy
 
     expert.student_net.cpu()
-    del expert.student_net
-    return expert_state_dicts, final_evaluation_metrics
+    return expert, expert_state_dicts, final_evaluation_metrics
 
 
 def train_expert_model(
@@ -621,12 +613,9 @@ def train_expert_model(
         label_column_name: str,
         ds_tokens: Optional[torch.Tensor] = None,
         ds_labels: Optional[torch.Tensor] = None,
-        map_labels_to_letters: bool = False,
         **kwargs
-    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[ExpertModel, list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     """Train expert models with caching based on input parameters."""
-    assert map_labels_to_letters # Temporary – for consistency
-    
     # Create cache directory if it doesn't exist
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -642,7 +631,6 @@ def train_expert_model(
         "ds_name": ds.config_name if hasattr(ds, "config_name") else "custom",
         "text_column_name": text_column_name,
         "label_column_name": label_column_name,
-        "map_labels_to_letters": map_labels_to_letters,
         "ds_fingerprint": "_".join(str(ds[k]._fingerprint) for k in sorted(ds.keys())),
         **kwargs  # Include any additional kwargs in cache key generation
     }
@@ -664,11 +652,11 @@ def train_expert_model(
 
         try:
             with open(cache_path, "rb") as f:
-                expert_state_dicts, all_token_counts, final_evaluation_metrics = pickle.load(f)
+                expert, expert_state_dicts, final_evaluation_metrics = pickle.load(f)
             print0(f"Loaded cached expert model results from {cache_path} - "
                 f"best eval loss: {final_evaluation_metrics['best_eval_loss']:.3f} / " 
                 f"best eval accuracy: {final_evaluation_metrics['best_eval_accuracy']:.3f}")
-            return expert_state_dicts, all_token_counts, final_evaluation_metrics
+            return expert, expert_state_dicts, final_evaluation_metrics
         except Exception as e:
             print0(f"Error loading cached expert model results from {cache_path}: {e}")
             pass
@@ -692,7 +680,6 @@ def train_expert_model(
         label_column_name=label_column_name,
         ds_tokens=ds_tokens,
         ds_labels=ds_labels,
-        map_labels_to_letters=map_labels_to_letters,
         **kwargs
     )
     

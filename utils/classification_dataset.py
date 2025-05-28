@@ -149,7 +149,6 @@ class ClassificationDataset:
                 ds, 
                 text_column_name=dataset_list[0].text_column_name, 
                 label_column_name=dataset_list[0].label_column_name, 
-                label_map=dataset_list[0].label_map
             )
 
         if dataset_name == "ag_news":

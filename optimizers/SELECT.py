@@ -12,6 +12,7 @@ from utils import (
     get_model,
     ClassificationDataset,
 )
+from utils.core import ExpertModel
 from utils.projection import (
     CudaProjector,
     ProjectionType,
@@ -27,10 +28,12 @@ class SELECTOptimizer(DiscreteOptimizer):
     X: torch.Tensor
     Y: torch.Tensor
     syn_lr: torch.Tensor
+    expert_model: ExpertModel
 
     def __init__(
             self, 
             args, 
+            expert_model: ExpertModel,
             X: torch.Tensor, 
             Y: torch.Tensor, 
             tokenizer, 
@@ -41,7 +44,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         super().__init__(args)
         self.tokenizer = tokenizer
         self.base_model = get_model(args.base_model_name_or_path)
-
+        self.expert_model = expert_model
         self.Y = Y
 
         # Setup projector
@@ -70,10 +73,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         self.seed_dataset_train_split = self.seed_dataset.dataset["train"]
         print(f"SELECTOptimizer: dataset size: {len(self.seed_dataset_train_split)}")
         self.dataset_autolabels = None
-        self.tokenized_labels = torch.tensor([
-            self.tokenizer.encode(f" {x}")[-1]
-            for x in self.true_classification_dataset.label_map
-        ])
 
     def _run_create_pseudoexperts(
         self,
@@ -213,11 +212,10 @@ class SELECTOptimizer(DiscreteOptimizer):
 
             if self.args.select_use_expert_grads:
                 batch_grads = get_grads(
-                    model, 
-                    self.seed_dataset_train_split, 
-                    self.dataset_autolabels,
-                    self.tokenizer, 
-                    self.projector,
+                    expert=self.expert_model,
+                    dataset=self.seed_dataset_train_split, 
+                    labels=self.dataset_autolabels,
+                    projector=self.projector,
                     sequence_length=self.args.sequence_length, 
                     use_cache=False,
                     do_projection=True,
@@ -225,11 +223,10 @@ class SELECTOptimizer(DiscreteOptimizer):
                 )
             else:
                 batch_grads = get_grads(
-                    model, 
-                    self.seed_dataset_train_split, 
-                    self.dataset_autolabels,
-                    self.tokenizer, 
-                    self.projector,
+                    expert=self.expert_model, 
+                    dataset=self.seed_dataset_train_split, 
+                    labels=self.dataset_autolabels,
+                    projector=self.projector,
                     sequence_length=self.args.sequence_length, 
                     use_cache=False,
                     do_projection=True,
@@ -523,16 +520,12 @@ class SELECTOptimizer(DiscreteOptimizer):
             expert_model.load_state_dict(self._restore_model_state_dict(expert_state_dict))
             if self.args.select_label_strategy == "auto":
                 self.dataset_autolabels = autolabel_dataset(
+                    expert=self.expert_model,
                     dataset=self.seed_dataset_train_split,
-                    model=expert_model, 
-                    tokenizer=self.tokenizer, 
                     sequence_length=self.args.sequence_length,
-                    label_map=self.true_classification_dataset.label_map,
                 )
             elif self.args.select_label_strategy == "random":
-                tokenized_labels = torch.tensor(
-                    [self.tokenizer.encode(f" {x}")[0] for x in self.true_classification_dataset.label_map]
-                )
+                tokenized_labels = torch.tensor(self.expert_model.all_labels_ids)
                 dataset_autolabels_idxs = torch.randint(
                     0, 
                     len(tokenized_labels), 

@@ -20,8 +20,9 @@ from utils import (
     trange_if_main_worker,
     ClassificationDataset,
 )
-from utils.dataset_evaluation_metrics import evaluate_dataset_similarity
 
+from utils.core import ExpertModel
+from utils.dataset_evaluation_metrics import evaluate_dataset_similarity
 
 class DatasetDistiller:
     def __init__(self, args):
@@ -38,7 +39,7 @@ class DatasetDistiller:
     def _load_dataset(self) -> ClassificationDataset:
         return ClassificationDataset.from_dataset_name(self.args.dataset, seed=self.args.seed)
     
-    def _init_discrete_optimizer(self):
+    def _init_discrete_optimizer(self, expert_model: ExpertModel):
         X, Y = [None, None]
         if self.args.discrete_optimizer == "ADMM":
             optimizer = ADMMOptimizer(
@@ -70,6 +71,7 @@ class DatasetDistiller:
         elif self.args.discrete_optimizer == "SELECT":
             optimizer = SELECTOptimizer(
                 args=self.args,
+                expert_model=expert_model,
                 X=X, 
                 Y=Y,
                 tokenizer=self.tokenizer,
@@ -116,7 +118,7 @@ class DatasetDistiller:
         # }
 
         # run full evaluation
-        _, __, evaluation_metrics = train_expert_model(
+        expert, __, evaluation_metrics = train_expert_model(
             base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_eval_epochs,
             num_steps_per_expert=max(1, len(tokens) // self.args.expert_batch_size),
@@ -128,7 +130,6 @@ class DatasetDistiller:
             label_column_name=self.classification_dataset.label_column_name,
             ds_tokens=tokens,
             ds_labels=labels,
-            map_labels_to_letters=True,
         )
 
         # log
@@ -149,11 +150,8 @@ class DatasetDistiller:
             raise NotImplementedError(f"Defense {self.args.defense} not implemented")
 
     def _run_distillation(self) -> tuple:
-        # initialize parameters & optimizers
-        discrete_optimizer = self._init_discrete_optimizer()
-
         # load/generate expert trajectories
-        expert_buffer, expert_evaluation_metrics = train_expert_model(
+        expert_model, expert_buffer, expert_evaluation_metrics = train_expert_model(
             base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_experts,
             num_steps_per_expert=self.args.num_steps_per_expert,
@@ -163,10 +161,13 @@ class DatasetDistiller:
             ds=self.classification_dataset.dataset,
             text_column_name=self.classification_dataset.text_column_name,
             label_column_name=self.classification_dataset.label_column_name,
-            map_labels_to_letters=True,
         )
+
+        # initialize parameters & optimizers
+        discrete_optimizer = self._init_discrete_optimizer(expert_model=expert_model)
+
         # new_expert_buffer, new_expert_evaluation_metrics = self._run_defense(expert_buffer)
-        
+
         # handle distributed
         self._distributed_broadcast_everything(expert_buffer)
 
