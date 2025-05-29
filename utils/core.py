@@ -125,6 +125,15 @@ class ExpertModel:
         
         return tokenized_text, outputs
     
+    def get_logits_and_labels(
+            self, 
+            tokenized_text: transformers.BatchEncoding,
+            outputs: dict[str, torch.Tensor], # transformers.CausalLMOutputWithPast,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+        labels = tokenized_text.input_ids[:, 1:].detach().clone() 
+        logits = outputs.logits[:, :-1, :]
+        return logits, labels
+    
     def get_loss_and_accuracy(
             self, 
             examples: list[str], 
@@ -132,9 +141,7 @@ class ExpertModel:
         ) -> tuple[float, float]:
 
         tokenized_text, outputs = self.compute_outputs(examples)
-
-        labels = tokenized_text.input_ids[:, 1:].detach().clone() 
-        logits = outputs.logits[:, :-1, :]
+        logits, labels = self.get_logits_and_labels(tokenized_text, outputs)
 
         return self.compute_loss_and_accuracy(logits, labels)
     

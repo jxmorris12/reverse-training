@@ -200,12 +200,13 @@ def _get_grads_final_layer_uncached(
         
         # Get last hidden state
         with torch.no_grad():
-            _, outputs = expert.compute_outputs(
+            tokenized_text, outputs = expert.compute_outputs(
                 examples=examples,
                 output_hidden_states=True,
             )
+            _, label_ids = expert.get_logits_and_labels(tokenized_text, outputs)
             last_hidden_state = outputs.hidden_states[-1]
-        
+
         @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         def compute_loss(params, buffers, last_hidden_states, labels):
             logits = torch.func.functional_call(
@@ -221,7 +222,7 @@ def _get_grads_final_layer_uncached(
         ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
 
         # Compute per-sample gradients
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, batch_labels)
+        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, label_ids)
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.lm_head.named_parameters()], dim=1)
 
         if do_projection:
@@ -323,7 +324,6 @@ def _get_grads_full_model_uncached(
     Returns:
         A tensor of shape (len(dataset), projection_dim) containing the gradients
     """
-    do_classification = (labels is not None)
     all_grads = []
     pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) // batch_size < 10))
 
@@ -346,34 +346,18 @@ def _get_grads_full_model_uncached(
                 "label": batch_labels,
             }
         )
-        
+    
         inputs = expert.prepare_examples(
             examples=batch,
             label_column_name="label",
             text_column_name="text"
         )
         inputs = { k: v.to(device) for k, v in inputs.items() }
-
-        if do_classification:
-            # concatenate labels to end of input ids
-            inputs["input_ids"] = torch.cat([
-                inputs["input_ids"], 
-                labels[batch_start:batch_end][:, None].to(device),
-            ], dim=1)
-            inputs["attention_mask"] = torch.cat([
-                inputs["attention_mask"],
-                torch.ones(len(inputs["input_ids"]), 1, device=device),
-            ], dim=1)
-            # set labels
-            inputs["labels"] = inputs["input_ids"][:, 1:].detach().clone()
-            inputs["labels"][:, :-1] = -100
-        else:
-            inputs["labels"] = inputs["input_ids"].detach().clone()
         
         @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         def compute_loss(params, buffers, input_ids, attention_mask, labels):
             net_output = torch.func.functional_call(
-                module=student_net,
+                module=expert.student_net,
                 parameter_and_buffer_dicts=(params, buffers),
                 kwargs={"input_ids": input_ids[None], "attention_mask": attention_mask[None]},
             )[0]
@@ -396,8 +380,7 @@ def _get_grads_full_model_uncached(
 
         # Compute per-sample gradients
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
-        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in student_net.named_parameters()], dim=1)
-
+        grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.named_parameters()], dim=1)
         grads_batch = grads_batch.double() / grads_batch.norm(dim=1, keepdim=True)
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
