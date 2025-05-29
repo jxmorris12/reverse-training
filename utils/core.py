@@ -38,8 +38,9 @@ class ExpertModel:
         self.tokenizer.truncation_side = "left" # important for correct truncation
         self.tokenizer.padding_side = "left" 
         self.all_labels = list(sorted(all_labels))
-        self.all_labels_ids = list({self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels})
+        self.all_labels_ids = [self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels]
         self.max_sequence_length = max_sequence_length
+        self.verbose = False
         print(f"[ExpertModel] | {base_model_name_or_path} | all_labels: {self.all_labels} | all_labels_ids: {self.all_labels_ids}")
     
     @property
@@ -113,7 +114,7 @@ class ExpertModel:
 
         # print a single input
         text = self.tokenizer.decode(input_ids[0])
-        print(f"[compute_outputs] | input_ids.shape: {input_ids.shape} | text: {text}")
+        if self.verbose: print(f"[compute_outputs] | input_ids.shape: {input_ids.shape} | text: {text}")
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.student_net(
@@ -324,9 +325,7 @@ def _autolabel_dataset_uncached(
     true_label_counts = true_labels.unique(return_counts=True)
 
     agreement = (all_labels == true_labels).float().mean()
-
     print(f"[autolabel_dataset] expert model | agreement: {agreement:.2f} | autolabeled counts: {label_counts} | true label counts: {true_label_counts}")
-    breakpoint()
 
     return all_labels
 
