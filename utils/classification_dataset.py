@@ -85,8 +85,9 @@ class ClassificationDataset:
         else:
             self.label_map = label_map
         
-        self.dataset = self.dataset.cast_column(self.label_column_name, datasets.Value("int32"))
-        self.dataset = self.dataset.map(self.relabel_example)
+        if self.label_column_name is not None:
+            self.dataset = self.dataset.cast_column(self.label_column_name, datasets.Value("int32"))
+            self.dataset = self.dataset.map(self.relabel_example)
     
     def relabel_example(self, ex: dict[str, str]) -> dict[str, str]:
         """
