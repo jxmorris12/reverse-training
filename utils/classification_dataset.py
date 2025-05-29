@@ -46,6 +46,8 @@ NEWSGROUP_LABEL_MAP = {
     "T": "talk.religion.misc",
 }
 
+NUMBER_TO_LABEL = [ "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T" ]
+
 
 class ClassificationDataset:
     """
@@ -82,6 +84,16 @@ class ClassificationDataset:
             }
         else:
             self.label_map = label_map
+        
+        self.dataset = self.dataset.cast_column(self.label_column_name, datasets.Value("int32"))
+        self.dataset = self.dataset.map(self.relabel_example)
+    
+    def relabel_example(self, ex: dict[str, str]) -> dict[str, str]:
+        """
+        Relabel the example using the label map.
+        """
+        ex[self.label_column_name] = NUMBER_TO_LABEL[ex[self.label_column_name]]
+        return ex
     
     def __getitem__(self, idx):
         """

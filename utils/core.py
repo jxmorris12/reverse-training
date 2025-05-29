@@ -91,6 +91,9 @@ class ExpertModel:
                 labels.reshape(-1),
                 reduction="mean"
             )
+            # check for inf
+            # if torch.isinf(loss):
+            #     print(f"[WARNING] | loss is inf")
         else:
             raise ValueError("Language modeling is not supported right now")
     
@@ -293,9 +296,10 @@ def _autolabel_dataset_uncached(
     true_labels = []
 
     label_map = dict(zip(
-        expert.all_labels_ids,
         expert.all_labels,
+        expert.all_labels_ids,
     ))
+    label_map_reverse = {v: k for k, v in label_map.items()}
 
     for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset", colour="RED"):
         batch_end = min(batch_start + batch_size, len(dataset))
@@ -303,7 +307,7 @@ def _autolabel_dataset_uncached(
         examples = datasets.Dataset.from_dict(
             {
                 "text": batch["text"],
-                "label": [0] * len(batch),
+                "label": ["A"] * len(batch),
             }
         )
         examples = expert.prepare_examples(
@@ -317,11 +321,10 @@ def _autolabel_dataset_uncached(
             masked_logits, _, _ = expert.get_loss_and_accuracy(
                 examples=examples,
             )
-            pred_tokens = masked_logits.argmax(-1).cpu()
-            pred_labels = [label_map[y.item()] for y in pred_tokens]
+            pred_token_ids = masked_logits.argmax(-1).cpu()
 
-        all_labels.append(torch.tensor(pred_labels))
-        if "label" in batch: true_labels.append(torch.tensor(batch["label"]))
+        all_labels.append(torch.tensor(pred_token_ids))
+        if "label" in batch: true_labels.append(torch.tensor(label_map[L] for L in batch["label"]))
     
     expert.student_net.cpu()
     expert.student_net.train()
@@ -338,7 +341,7 @@ def _autolabel_dataset_uncached(
     else:
         print(f"[autolabel_dataset] expert model | autolabeled counts: {label_counts}")
 
-    return all_labels
+    return [label_map_reverse[L] for L in all_labels.tolist()]
 
 
 def autolabel_dataset(

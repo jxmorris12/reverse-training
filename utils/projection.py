@@ -183,7 +183,7 @@ def _get_grads_final_layer_uncached(
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
-        batch_labels = labels[batch_start:batch_end].to(device)
+        batch_labels = [labels[i] for i in range(batch_start, batch_end)]
 
         batch = datasets.Dataset.from_dict(
             {
@@ -222,6 +222,7 @@ def _get_grads_final_layer_uncached(
         ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
 
         # Compute per-sample gradients
+        print(f"[get_grads_final_layer] label_ids: {label_ids}")
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, label_ids)
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.lm_head.named_parameters()], dim=1)
 
@@ -338,7 +339,7 @@ def _get_grads_full_model_uncached(
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
-        batch_labels = labels[batch_start:batch_end]
+        batch_labels = [labels[i] for i in range(batch_start, batch_end)]
 
         batch = datasets.Dataset.from_dict(
             {

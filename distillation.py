@@ -86,13 +86,9 @@ class DatasetDistiller:
         optimizer.dataset_label_map = self.classification_dataset.label_map
         return optimizer
     
-    def _log_table(self, tokens: torch.Tensor, labels: torch.Tensor, step: int) -> None:
+    def _log_table(self, tokens: torch.Tensor, labels: list[str], step: int) -> None:
         tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
-        if labels is not None:
-            labels = self.tokenizer.batch_decode(labels.cpu(), add_special_tokens=False)
-            labels = list(map(lambda x: self.classification_dataset.label_map.get(x.strip(), "[?]"), labels))
-        else:
-            labels = [""] * len(tokens)
+        labels = list(map(lambda x: self.classification_dataset.label_map.get(x.strip(), "[?]"), labels))
         table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)
@@ -102,11 +98,10 @@ class DatasetDistiller:
             expert_model: ExpertModel, 
             Z_text: torch.Tensor, 
             Z_tokens: torch.Tensor, 
-            Y: torch.Tensor, 
+            Y: list[str], 
             step: int
         ) -> dict[str, float]:
         self._log_table(Z_tokens, Y, step=step)
-        Y = Y.cpu().tolist()
         
         # compute token-level precision & recall
         # precision = (dataset_token_counts & token_counts).sum() / token_counts.sum()
@@ -241,7 +236,7 @@ class DatasetDistiller:
         gc.collect()
         torch.cuda.empty_cache()
 
-        return (Z_text, Z_tokens.cpu(), Y.cpu(), output)
+        return (Z_text, Z_tokens.cpu(), Y, output)
 
     def run_distillation(self):
         import time

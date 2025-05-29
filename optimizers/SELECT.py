@@ -60,7 +60,6 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
         
         self.best_idx_counter = collections.Counter()
-        self.batch = []
         self.optimizer = torch.optim.Adam(self.base_model.parameters(), lr=self.args.select_lr_student)
         self.steps_since_last_improvement = 0
         self.best_mse = float("inf")
@@ -414,7 +413,7 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch_pbar.update(1)
             batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)} | Current sim: {best_sim:.3f} | Overall best sim: {overall_best_sim:.3f}")
 
-        label_distribution = self.dataset_autolabels[batch].unique(return_counts=True)
+        label_distribution = collections.Counter([self.dataset_autolabels[j] for j in batch])
         print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f} | Label distribution: {label_distribution}")
         return batch
     
@@ -441,7 +440,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         else:
             return torch.cat([v.flatten() for k, v in model_state_dict.items() if "lm_head" in k]).cpu().double()
 
-    def step_with_grad(self, step: int, buffer: list) -> dict[str, torch.Tensor]:
+    def _get_batch_idxs(self, step: int, buffer: list) -> list[int]:
         """Perform one step of SELECT optimization"""
         # Get current model parameters
         full_base_params = self._flatten_model_params(self.base_model.state_dict())
@@ -453,61 +452,13 @@ class SELECTOptimizer(DiscreteOptimizer):
         last_layer_expert_model_params = self._get_last_layer_params(expert_state_dict)
         
         # Update batch if needed
-        should_update_batch = (self.args.select_steps_per_grad > 0) and (step % self.args.select_steps_per_grad == 0)
-        if (not len(self.batch)) or should_update_batch:
-            self.base_model.to(device)
-            self.batch = self._rank_dataset_by_influence(
-                expert_state_dict=expert_state_dict,
-                full_base_params=full_base_params, 
-                full_expert_model_params=full_expert_model_params,
-                last_layer_base_params=last_layer_base_params, 
-                last_layer_expert_model_params=last_layer_expert_model_params
-            )
-        
-        # Select random minibatch from batch
-        minibatch = random.sample(self.batch, min(self.args.minibatch_size, len(self.batch)))
-        assert len(minibatch) > 0, f"Minibatch is empty"
-
-        # Take step on batch
-        inputs = self.tokenizer(
-            self.seed_dataset_train_split.select(minibatch)["text"],
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.args.sequence_length,
+        return self._rank_dataset_by_influence(
+            expert_state_dict=expert_state_dict,
+            full_base_params=full_base_params, 
+            full_expert_model_params=full_expert_model_params,
+            last_layer_base_params=last_layer_base_params, 
+            last_layer_expert_model_params=last_layer_expert_model_params
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        if self.args.select_do_classification:
-            no_labels = (
-                torch.zeros(len(minibatch), self.args.sequence_length - 1, device=device, dtype=torch.long) 
-                - 
-                100
-            )
-            last_token_labels = self.dataset_autolabels[minibatch][:, None].to(device)
-            inputs["labels"] = torch.cat([no_labels, last_token_labels], dim=1)
-        else:
-            inputs["labels"] = inputs["input_ids"].detach().clone()
-        outputs = self.base_model(**inputs)
-        loss = outputs.loss
-        loss.backward()
-
-        base_model_grad_norm = torch.cat([p.grad.flatten().detach().norm(dim=0, p=2, keepdim=True) for p in self.base_model.parameters()], dim=0).norm(dim=0, p=2, keepdim=True)
-        base_model_grad_norm = base_model_grad_norm.detach().cpu().item()
-
-        # Create optimizer and take step
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        self.base_model.zero_grad()
-        
-        # Report metrics
-        metrics = {
-            "ce_loss": loss.detach().item(),
-            "base_model_grad_norm": base_model_grad_norm,
-        }
-        torch.cuda.empty_cache()
-        
-        self.best_idx_counter.update(minibatch)
-        return metrics
 
     def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.args.select_do_classification and self.dataset_autolabels is None:
@@ -529,17 +480,17 @@ class SELECTOptimizer(DiscreteOptimizer):
             else:
                 raise ValueError(f"Invalid label strategy: {self.args.select_label_strategy}")
         
-        metrics = self.step_with_grad(step, buffer)
-        X = self.seed_dataset_train_split.select(self.batch)["text"]
+        batch = self._get_batch_idxs(step, buffer)
+        X = self.seed_dataset_train_split.select(batch)["text"]
         X_tokens = torch.stack([
-            self._tokenize_dataset_cached(i)
-            for i in self.batch
+            self._tokenize_dataset_cached(i) for i in batch
         ])
-        Y = self.dataset_autolabels[self.batch]
+        
+        Y = [self.dataset_autolabels[i] for i in batch]
+        Y_set = set(Y)
+        assert Y_set <= set(self.expert_model.all_labels), f"Y: {Y_set} is not a subset of expert_model.all_labels: {set(self.expert_model.all_labels)}"
 
-        Y_set = set(Y.cpu().tolist())
-        assert Y_set <= set(self.expert_model.all_labels), f"Y: {Y_set} is not a subset of expert_model.all_labels: {self.expert_model.all_labels}"
-        return X, X_tokens.cpu(), Y.cpu(), metrics
+        return X, X_tokens.cpu(), Y, {}
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:
         """Tokenize dataset entry with caching.
