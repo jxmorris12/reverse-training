@@ -214,7 +214,7 @@ def _get_grads_final_layer_uncached(
                 parameter_and_buffer_dicts=(params, buffers),
                 args=(last_hidden_states,),
             )
-            _, loss, _ = expert.compute_loss_and_accuracy(logits[None], labels[None])
+            _, loss, _ = expert.compute_loss_and_accuracy(logits[None], labels[None], vmap=True)
             return loss
         
         # Create vectorized gradient function

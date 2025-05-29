@@ -64,6 +64,7 @@ class ExpertModel:
             self, 
             logits: torch.Tensor, 
             labels: torch.Tensor,
+            vmap: bool = False,
         ) -> tuple[torch.Tensor, float, float]:
         if self.is_doing_classification:
             # For classification, only predict the last token
@@ -91,11 +92,14 @@ class ExpertModel:
                 labels.reshape(-1),
                 reduction="mean"
             )
-            # check for inf
-            # if torch.isinf(loss):
-            #     print(f"[WARNING] | loss is inf")
         else:
             raise ValueError("Language modeling is not supported right now")
+    
+
+        # if not vmap:
+        #     if torch.isinf(loss):
+        #         print(f"[WARNING] | loss is inf")
+        #         breakpoint()
     
         return logits, loss, accuracy
 
@@ -501,7 +505,7 @@ def _train_expert_model_uncached(
     eval_ds = eval_ds.select(range(min(num_eval_datapoints, len(eval_ds))))
 
     assert label_column_name in train_ds.column_names, f"label_column_name: {label_column_name} not in train_ds.column_names: {train_ds.column_names}"
-    all_labels = list(sorted(set(train_ds[label_column_name])))
+    all_labels = list(sorted(set(train_ds[label_column_name]) | set(eval_ds[label_column_name])))
     expert = ExpertModel(base_model_name_or_path, max_sequence_length=sequence_length, all_labels=all_labels)
     optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
     # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
@@ -553,7 +557,7 @@ def _train_expert_model_uncached(
         )
 
         if (eval_accuracy == 0.0) or (eval_loss == float("inf")):
-            print("Warning: 0.0 acc!")
+            print("Warning: 0.0 acc or inf loss!")
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
         evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
