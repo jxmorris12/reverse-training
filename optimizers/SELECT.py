@@ -100,7 +100,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         pseudoexperts = []
 
         label_mask = (
-            self.tokenized_labels[:, None].to(device) == torch.arange(self.tokenizer.vocab_size, device=device)[None, :]
+            expert_model.all_labels_ids[:, None].to(device) == torch.arange(self.tokenizer.vocab_size, device=device)[None, :]
         ).any(dim=0)
         num_steps_per_pseudoexpert = 10
         # optim = torch.optim.SGD(model.parameters(), lr=1e-4)
@@ -304,14 +304,14 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get the best remaining gradient
         if balanced:
             # Optionally we balance by label to avoid over-representing any one label
-            tokenized_labels = self.tokenized_labels.flatten().tolist()
-            best_idxs = []
+            tokenized_labels = set(self.dataset_autolabels.flatten().tolist())
             label_counts = { label: 0 for label in tokenized_labels }
             selected_data_by_label = { label: [] for label in tokenized_labels }
             label_is_removed = { label: False for label in tokenized_labels }
             pbar = tqdm.trange(self.args.select_full_dataset_size, desc="Filling and balancing batch")
             max_per_label = math.ceil(self.args.select_full_dataset_size / len(tokenized_labels))
             last_best_sim_length = 0
+            best_idxs = []
             while len(best_idxs) < self.args.select_full_dataset_size:
                 num_to_fill = self.args.select_full_dataset_size - len(best_idxs)
                 tqdm.tqdm.write(f"Searching for {num_to_fill} examples (len(best_idxs): {len(best_idxs)} / label_counts: {label_counts} / label_is_removed: {label_is_removed})")
