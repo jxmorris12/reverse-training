@@ -1,11 +1,15 @@
-from .optimizer import DiscreteOptimizer
-import datasets
 import collections
 import copy
 import random
 import math
+
+import datasets
+import numpy as np
 import torch
 import tqdm
+
+
+from .optimizer import DiscreteOptimizer
 from utils import (
     autolabel_dataset,
     device, 
@@ -303,12 +307,14 @@ class SELECTOptimizer(DiscreteOptimizer):
         # Get the best remaining gradient
         if balanced:
             # Optionally we balance by label to avoid over-representing any one label
-            tokenized_labels = set(self.dataset_autolabels.flatten().tolist())
-            label_counts = { label: 0 for label in tokenized_labels }
-            selected_data_by_label = { label: [] for label in tokenized_labels }
-            label_is_removed = { label: False for label in tokenized_labels }
+            # (This is the difference between 'topk' and 'topk_balanced' in the paper)
+            label_strings = set(self.dataset_autolabels)
+            dataset_autolabels = np.array(self.dataset_autolabels)
+            label_counts = { label: 0 for label in label_strings }
+            selected_data_by_label = { label: [] for label in label_strings }
+            label_is_removed = { label: False for label in label_strings }
             pbar = tqdm.trange(self.args.select_full_dataset_size, desc="Filling and balancing batch")
-            max_per_label = math.ceil(self.args.select_full_dataset_size / len(tokenized_labels))
+            max_per_label = math.ceil(self.args.select_full_dataset_size / len(label_strings))
             last_best_sim_length = 0
             best_idxs = []
             while len(best_idxs) < self.args.select_full_dataset_size:
@@ -316,17 +322,17 @@ class SELECTOptimizer(DiscreteOptimizer):
                 tqdm.tqdm.write(f"Searching for {num_to_fill} examples (len(best_idxs): {len(best_idxs)} / label_counts: {label_counts} / label_is_removed: {label_is_removed})")
                 _, best_idxs_full = grads_db.search(base_params_diff_norm, num_to_fill)
                 for best_idx in best_idxs_full.cpu().tolist():
-                    label = self.dataset_autolabels[best_idx].item()
+                    label = dataset_autolabels[best_idx]
                     if label_counts[label] < max_per_label:
                         best_idxs.append(best_idx)
                         label_counts[label] += 1
                         selected_data_by_label[label].append(best_idx)
 
                 # remove vectors from search from all datapoints w/ labels that are over max_per_label
-                for label in tokenized_labels:
+                for label in label_strings:
                     if (label_counts[label] >= max_per_label) and (not label_is_removed[label]):
                         label_is_removed[label] = True
-                        all_datapoints_within_label = (self.dataset_autolabels == label).nonzero().flatten() 
+                        all_datapoints_within_label = (dataset_autolabels == label).nonzero()[0]
                         grads_db.remove_vectors(all_datapoints_within_label)
                         tqdm.tqdm.write(f"Filled quota for label {label}; Removed {len(all_datapoints_within_label)} datapoints")
                 

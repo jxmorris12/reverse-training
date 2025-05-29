@@ -1,4 +1,6 @@
 import abc
+
+import numpy as np
 import torch
 
 
@@ -76,8 +78,13 @@ class BatchedExactVectorDatabase(VectorDatabase):
         return top_k_sims, top_k_indices
     
     def remove_vectors(self, idxs: torch.Tensor):
+        if isinstance(idxs, list):
+            idxs = torch.tensor(idxs)
+        elif isinstance(idxs, np.ndarray):
+            idxs = torch.tensor(idxs)
         # Zero out vectors at the given indices
         self.ignore_mask[idxs] = True
+        self.ignore_mask = self.ignore_mask.to(device)
     
     def reset_removed_vectors(self):
         self.ignore_mask = torch.zeros(self.vectors.shape[0], dtype=bool)

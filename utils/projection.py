@@ -222,7 +222,6 @@ def _get_grads_final_layer_uncached(
         ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
 
         # Compute per-sample gradients
-        print(f"[get_grads_final_layer] label_ids: {label_ids}")
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, label_ids)
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.lm_head.named_parameters()], dim=1)
 
@@ -376,9 +375,6 @@ def _get_grads_full_model_uncached(
         ft_compute_grad = torch.func.grad(compute_loss)
         ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0, 0))
 
-        # Non-vectorized gradient function
-        # ft_compute_sample_grad = torch.func.grad(compute_loss)
-
         # Compute per-sample gradients
         ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.named_parameters()], dim=1)
@@ -388,8 +384,6 @@ def _get_grads_full_model_uncached(
             all_grads.extend(projected_grads.cpu())
         else:
             all_grads.extend(grads_batch.cpu())
-        
-    print(f"[get_grads_full_model] grads_batch.shape: {grads_batch.shape}")
     return torch.stack(all_grads)
 
 

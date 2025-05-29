@@ -180,12 +180,18 @@ class DatasetDistiller:
 
         print(f"[run_distillation - start] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         # run optimization
-        pbar = trange_if_main_worker(0, self.args.max_iterations+1, desc="iterations")
+        if self.args.max_iterations > 10:
+            pbar = trange_if_main_worker(0, self.args.max_iterations, desc="iterations")
+        else:
+            pbar = range(self.args.max_iterations)
         all_evaluation_metrics = []
         total_time_in_evaluation = 0
         for step in pbar:
             Z_text, Z_tokens, Y, metrics = discrete_optimizer.step(step, expert_buffer)
-            pbar.set_postfix(**metrics)
+            try:
+                pbar.set_postfix(**metrics)
+            except:
+                pass
             wandb.log(metrics, step=step)
 
             # clear cache
@@ -212,7 +218,7 @@ class DatasetDistiller:
                 break
 
         print(f"[run_distillation - end] Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print("Stopping distillation...")
+        print("Stopping...")
         eval_start_time = time.time()
         final_evaluation_metrics = self._evaluate_and_log(
             expert_model=expert_model, 
