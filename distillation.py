@@ -17,12 +17,11 @@ from utils import (
     get_world_size,
     # get_token_embeddings_random_soft,
     # get_token_embeddings_from_classification_dataset, 
-    train_expert_model,
     trange_if_main_worker,
     ClassificationDataset,
 )
+from utils.core import _train_expert_model_uncached, train_expert_model, ExpertModel
 
-from utils.core import ExpertModel
 from utils.dataset_evaluation_metrics import evaluate_dataset_similarity
 
 class DatasetDistiller:
@@ -118,17 +117,10 @@ class DatasetDistiller:
         #     "dataset_token_recall": recall.detach().cpu().item(),
         #     "dataset_token_f1": f1.detach().cpu().item(),
         # }
-
-        # Map labels back to original dataset
-        label_map = dict(zip(
-            expert_model.all_labels_ids,
-            expert_model.all_labels,
-        ))
-        Y = [label_map[y] for y in Y]
         train_ds = datasets.Dataset.from_dict(
             {
-                "text": Z_text,
-                "label": Y,
+                self.classification_dataset.text_column_name: Z_text,
+                self.classification_dataset.label_column_name: Y,
             }
         )
         test_ds = self.classification_dataset.dataset["test"]
@@ -140,10 +132,10 @@ class DatasetDistiller:
         assert set(Y) <= set(test_ds[self.classification_dataset.label_column_name])
 
         # run full evaluation
-        expert, __, evaluation_metrics = train_expert_model(
+        expert, __, evaluation_metrics = _train_expert_model_uncached(
             base_model_name_or_path=self.args.base_model_name_or_path,
             num_experts=self.args.num_eval_epochs,
-            num_steps_per_expert=max(1, len(Z_tokens) // self.args.expert_batch_size),
+            num_steps_per_expert=max(1, len(train_ds) // self.args.expert_batch_size),
             expert_batch_size=self.args.expert_batch_size,
             expert_lr=self.args.expert_lr,
             sequence_length=self.args.sequence_length,

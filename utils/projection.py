@@ -151,7 +151,6 @@ def _get_grads_final_layer_uncached(
         dataset, 
         labels,
         projector, 
-        sequence_length: int, 
         do_projection: bool = True,
         batch_size: int = 32,
     ) -> torch.Tensor:
@@ -203,7 +202,6 @@ def _get_grads_final_layer_uncached(
         with torch.no_grad():
             _, outputs = expert.compute_outputs(
                 examples=examples,
-                sequence_length=sequence_length,
                 output_hidden_states=True,
             )
             last_hidden_state = outputs.hidden_states[-1]
@@ -243,7 +241,6 @@ def get_grads_final_layer(
         dataset, 
         labels,
         projector, 
-        sequence_length: int, 
         do_projection: bool = True,
         use_cache: bool = False,
         model_cache_key: str = "",
@@ -267,7 +264,6 @@ def get_grads_final_layer(
             dataset=dataset, 
             labels=labels, 
             projector=projector, 
-            sequence_length=sequence_length, 
             do_projection=do_projection,
         )
     hash_kwargs = {
@@ -276,7 +272,6 @@ def get_grads_final_layer(
         "dataset_hash": dataset._fingerprint,
         "tokenizer_hash": expert.tokenizer.name_or_path,
         "projector_hash": projector.deterministic_hash(),
-        "sequence_length": sequence_length,
         "do_projection": do_projection,
         "model_cache_key": model_cache_key,
     }
@@ -295,7 +290,6 @@ def get_grads_final_layer(
             dataset=dataset,
             labels=labels, 
             projector=projector, 
-            sequence_length=sequence_length, 
             do_projection=do_projection,
         )
         np.savez(cache_path, grads=grads.numpy())
@@ -420,7 +414,6 @@ def get_grads_full_model(
         dataset, 
         labels,
         projector, 
-        sequence_length: int, 
         do_projection: bool = True,
         use_cache: bool = True,
         model_cache_key: str = "",
@@ -439,20 +432,17 @@ def get_grads_full_model(
     """
     if not use_cache:
         return _get_grads_full_model_uncached(
-            student_net=student_net, 
+            expert=expert, 
             dataset=dataset, 
             labels=labels, 
-            tokenizer=tokenizer, 
             projector=projector, 
-            sequence_length=sequence_length, 
             do_projection=do_projection,
         )
     hash_kwargs = {
-        "student_net_hash": hash_model_params(student_net),
+        "student_net_hash": hash_model_params(expert.student_net),
         "dataset_hash": dataset._fingerprint,
-        "tokenizer_hash": tokenizer.name_or_path,
+        "tokenizer_hash": expert.tokenizer.name_or_path,
         "projector_hash": projector.deterministic_hash(),
-        "sequence_length": sequence_length,
         "do_projection": do_projection,
         "model_cache_key": model_cache_key,
     }
@@ -467,12 +457,10 @@ def get_grads_full_model(
     except:
         print(f"Getting grads for full model with cache key: {full_cache_key} => {cache_key}")
         grads = _get_grads_full_model_uncached(
-            student_net=student_net, 
+            expert=expert, 
             dataset=dataset,
             labels=labels, 
-            tokenizer=tokenizer, 
             projector=projector, 
-            sequence_length=sequence_length, 
             do_projection=do_projection,
         )
         np.savez(cache_path, grads=grads.numpy())

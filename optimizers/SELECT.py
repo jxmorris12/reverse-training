@@ -178,7 +178,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         
         # Create pseudoexperts by trajectory matching with random data
         expert_model = copy.deepcopy(self.base_model)
-        expert_model.load_state_dict(expert_state_dict)
+        expert_model.load_state_dict(self._restore_model_state_dict(expert_state_dict))
 
         expert_model_num_points = self.args.expert_batch_size * self.args.expert_epochs
         random_idxs = random.sample(range(len(self.seed_dataset_train_split)), k=expert_model_num_points)
@@ -216,7 +216,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                     dataset=self.seed_dataset_train_split, 
                     labels=self.dataset_autolabels,
                     projector=self.projector,
-                    sequence_length=self.args.sequence_length, 
                     use_cache=False,
                     do_projection=True,
                     model_cache_key=model_cache_key + "_expert_grads",
@@ -227,7 +226,6 @@ class SELECTOptimizer(DiscreteOptimizer):
                     dataset=self.seed_dataset_train_split, 
                     labels=self.dataset_autolabels,
                     projector=self.projector,
-                    sequence_length=self.args.sequence_length, 
                     use_cache=False,
                     do_projection=True,
                     model_cache_key=model_cache_key,
@@ -506,7 +504,6 @@ class SELECTOptimizer(DiscreteOptimizer):
             "ce_loss": loss.detach().item(),
             "base_model_grad_norm": base_model_grad_norm,
         }
-        
         torch.cuda.empty_cache()
         
         self.best_idx_counter.update(minibatch)
@@ -515,14 +512,10 @@ class SELECTOptimizer(DiscreteOptimizer):
     def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if self.args.select_do_classification and self.dataset_autolabels is None:
             # Get labels from expert model
-            expert_state_dict = buffer[-1]
-            expert_model = copy.deepcopy(self.base_model)
-            expert_model.load_state_dict(self._restore_model_state_dict(expert_state_dict))
             if self.args.select_label_strategy == "auto":
                 self.dataset_autolabels = autolabel_dataset(
                     expert=self.expert_model,
                     dataset=self.seed_dataset_train_split,
-                    sequence_length=self.args.sequence_length,
                 )
             elif self.args.select_label_strategy == "random":
                 tokenized_labels = torch.tensor(self.expert_model.all_labels_ids)
@@ -543,6 +536,9 @@ class SELECTOptimizer(DiscreteOptimizer):
             for i in self.batch
         ])
         Y = self.dataset_autolabels[self.batch]
+
+        Y_set = set(Y.cpu().tolist())
+        assert Y_set <= set(self.expert_model.all_labels), f"Y: {Y_set} is not a subset of expert_model.all_labels: {self.expert_model.all_labels}"
         return X, X_tokens.cpu(), Y.cpu(), metrics
 
     def _tokenize_dataset_cached(self, i: int) -> torch.Tensor:

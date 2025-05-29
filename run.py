@@ -29,7 +29,7 @@ def main(args):
 
     wandb.init(
         sync_tensorboard=False,
-        project="weight-reversal-1",
+        project="weight-reversal-2",
         config=args,
         # mode="disabled" if get_rank() > 0 else os.getenv("WANDB_MODE", "online"),
     )

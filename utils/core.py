@@ -28,16 +28,18 @@ class ExpertModel:
     student_net: transformers.PreTrainedModel
     tokenizer: transformers.PreTrainedTokenizer
     all_labels: Optional[set[str]]
+    max_sequence_length: int
     
-    def __init__(self, base_model_name_or_path: str, all_labels: Optional[set[str]] = None):
+    def __init__(self, base_model_name_or_path: str, max_sequence_length: int, all_labels: Optional[set[str]] = None):
         self.student_net = get_model(base_model_name_or_path).to(device)
         self.student_net.eval()
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(base_model_name_or_path)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.truncation_side = "left" # important for correct truncation
         self.tokenizer.padding_side = "left" 
-        self.all_labels = all_labels
-        self.all_labels_ids = list({self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels or []})
+        self.all_labels = list(sorted(all_labels))
+        self.all_labels_ids = list({self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels})
+        self.max_sequence_length = max_sequence_length
         print(f"[ExpertModel] | {base_model_name_or_path} | all_labels: {self.all_labels} | all_labels_ids: {self.all_labels_ids}")
     
     @property
@@ -95,8 +97,7 @@ class ExpertModel:
 
     def compute_outputs(
             self, 
-            examples: list[str] ,
-            sequence_length: int, 
+            examples: list[str],
             output_hidden_states: bool = False,
         ) -> tuple[transformers.BatchEncoding, torch.Tensor]:
 
@@ -105,10 +106,14 @@ class ExpertModel:
             return_tensors="pt", 
             padding="max_length", 
             truncation=True, 
-            max_length=sequence_length, 
+            max_length=self.max_sequence_length, 
         ).to(device)
         input_ids = tokenized_text.input_ids
         attention_mask = tokenized_text.attention_mask
+
+        # print a single input
+        text = self.tokenizer.decode(input_ids[0])
+        print(f"[compute_outputs] | input_ids.shape: {input_ids.shape} | text: {text}")
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.student_net(
@@ -122,11 +127,10 @@ class ExpertModel:
     def get_loss_and_accuracy(
             self, 
             examples: list[str], 
-            sequence_length: int,
             label_column_name: Optional[str] = None,
         ) -> tuple[float, float]:
 
-        tokenized_text, outputs = self.compute_outputs(examples, sequence_length)
+        tokenized_text, outputs = self.compute_outputs(examples)
 
         labels = tokenized_text.input_ids[:, 1:].detach().clone() 
         logits = outputs.logits[:, :-1, :]
@@ -258,9 +262,8 @@ def get_model(model_path: str) -> dict[str, torch.Tensor]:
 
 @find_executable_batch_size
 def _autolabel_dataset_uncached(
-        dataset: datasets.Dataset,
         expert: ExpertModel,
-        sequence_length: int,
+        dataset: datasets.Dataset,
         batch_size: int = 32,
     ) -> torch.Tensor:
     """Get model predictions for the sequence_length-th token for each example in the dataset.
@@ -279,6 +282,12 @@ def _autolabel_dataset_uncached(
     expert.student_net.to(device)
 
     all_labels = []
+    true_labels = []
+
+    label_map = dict(zip(
+        expert.all_labels_ids,
+        expert.all_labels,
+    ))
 
     for batch_start in tqdm.trange(0, len(dataset), batch_size, desc="Autolabeling dataset", colour="RED"):
         batch_end = min(batch_start + batch_size, len(dataset))
@@ -299,22 +308,32 @@ def _autolabel_dataset_uncached(
         with torch.no_grad():
             masked_logits, _, _ = expert.get_loss_and_accuracy(
                 examples=examples,
-                sequence_length=sequence_length,
             )
-            all_labels.append(masked_logits.argmax(-1).cpu())
+            pred_tokens = masked_logits.argmax(-1).cpu()
+            pred_labels = [label_map[y.item()] for y in pred_tokens]
+
+        all_labels.append(torch.tensor(pred_labels))
+        true_labels.append(torch.tensor(batch["label"]))
     
     expert.student_net.cpu()
     expert.student_net.train()
+
+    true_labels = torch.cat(true_labels)
     all_labels = torch.cat(all_labels)
     label_counts = all_labels.unique(return_counts=True)
-    print(f"[autolabel_dataset] expert model autolabeled counts: {label_counts}")
+    true_label_counts = true_labels.unique(return_counts=True)
+
+    agreement = (all_labels == true_labels).float().mean()
+
+    print(f"[autolabel_dataset] expert model | agreement: {agreement:.2f} | autolabeled counts: {label_counts} | true label counts: {true_label_counts}")
+    breakpoint()
+
     return all_labels
 
 
 def autolabel_dataset(
         dataset: datasets.Dataset,
         expert: ExpertModel,
-        sequence_length: int,
     ) -> torch.Tensor:
     cache_dir = os.path.join(os.path.dirname(__file__), os.pardir, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -336,7 +355,6 @@ def autolabel_dataset(
     labels = _autolabel_dataset_uncached(
         dataset=dataset, 
         expert=expert,
-        sequence_length=sequence_length,
     )
     return labels
 
@@ -402,7 +420,6 @@ def _eval_expert_model(
     eval_ds: datasets.Dataset,
     text_column_name: str,
     label_column_name: Optional[str],
-    sequence_length: int,
     batch_size: int = 32,
 ) -> tuple[float, Optional[float], Optional[float]]:
     """Evaluate expert model on evaluation dataset.
@@ -412,7 +429,6 @@ def _eval_expert_model(
         eval_ds: Evaluation dataset
         text_column_name: Name of text column in dataset
         label_column_name: Name of label column in dataset (if doing classification)
-        sequence_length: Maximum sequence length for tokenization
         batch_size: Number of datapoints to evaluate on per batch
         
     Returns:
@@ -438,7 +454,6 @@ def _eval_expert_model(
         _, loss, accuracy = expert.get_loss_and_accuracy(
             examples=examples,
             label_column_name=label_column_name,
-            sequence_length=sequence_length
         )
         eval_metrics.append(loss.item())
         eval_accuracies.append(accuracy.item())
@@ -472,8 +487,8 @@ def _train_expert_model_uncached(
     eval_ds = ds["test"].shuffle(seed=42)
     eval_ds = eval_ds.select(range(min(num_eval_datapoints, len(eval_ds))))
 
-    all_labels = set(train_ds[label_column_name])    
-    expert = ExpertModel(base_model_name_or_path, all_labels=all_labels)
+    all_labels = list(sorted(set(train_ds[label_column_name])))
+    expert = ExpertModel(base_model_name_or_path, max_sequence_length=sequence_length, all_labels=all_labels)
     optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
     # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
 
@@ -496,18 +511,16 @@ def _train_expert_model_uncached(
     
     for epoch in range(num_experts):
         for _i in range(num_steps_per_expert):
-            batch_idxs = random.sample(range(len(train_ds)), k=expert_batch_size)
+            batch_idxs = random.sample(range(len(train_ds)), k=min(expert_batch_size, len(train_ds)))
             examples = train_ds.select(batch_idxs)
             examples = expert.prepare_examples(
                 examples=examples,
                 label_column_name=label_column_name,
                 text_column_name=text_column_name,
             )
-                
             _, loss, accuracy = expert.get_loss_and_accuracy(
                 examples=examples,
                 label_column_name=label_column_name,
-                sequence_length=sequence_length,
             )
             pbar.set_description(f"Epoch {epoch} | Step {step+1} | Loss = {loss:.3f} | Accuracy = {accuracy:.3f}")
             pbar.update(1)
@@ -523,14 +536,10 @@ def _train_expert_model_uncached(
             eval_ds=eval_ds,
             text_column_name=text_column_name,
             label_column_name=label_column_name,
-            sequence_length=sequence_length,
         )
 
-
         if (eval_accuracy == 0.0) or (eval_loss == float("inf")):
-            breakpoint()
-        else:
-            print("its ok?")
+            print("Warning: 0.0 acc!")
         
         evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
         evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
@@ -545,7 +554,6 @@ def _train_expert_model_uncached(
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                
                 if epochs_without_improvement >= early_stopping_patience:
                     pbar.close()
                     print(f"Early stopping triggered after {epoch+1} epochs (patience = {early_stopping_patience}, best eval accuracy = {best_eval_accuracy:.3f})")
@@ -557,7 +565,6 @@ def _train_expert_model_uncached(
         eval_ds=eval_ds,
         text_column_name=text_column_name,
         label_column_name=label_column_name,
-        sequence_length=sequence_length,
     )
     evaluation_metrics[f"eval_step{step}_loss"].append(eval_loss)
     evaluation_metrics[f"eval_step{step}_accuracy"].append(eval_accuracy)
