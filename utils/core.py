@@ -314,18 +314,22 @@ def _autolabel_dataset_uncached(
             pred_labels = [label_map[y.item()] for y in pred_tokens]
 
         all_labels.append(torch.tensor(pred_labels))
-        true_labels.append(torch.tensor(batch["label"]))
+        if "label" in batch: true_labels.append(torch.tensor(batch["label"]))
     
     expert.student_net.cpu()
     expert.student_net.train()
 
-    true_labels = torch.cat(true_labels)
     all_labels = torch.cat(all_labels)
     label_counts = all_labels.unique(return_counts=True)
-    true_label_counts = true_labels.unique(return_counts=True)
 
-    agreement = (all_labels == true_labels).float().mean()
-    print(f"[autolabel_dataset] expert model | agreement: {agreement:.2f} | autolabeled counts: {label_counts} | true label counts: {true_label_counts}")
+    if len(true_labels) > 0:
+        true_labels = torch.cat(true_labels)
+        true_label_counts = true_labels.unique(return_counts=True)
+
+        agreement = (all_labels == true_labels).float().mean()
+        print(f"[autolabel_dataset] expert model | agreement: {agreement:.2f} | autolabeled counts: {label_counts} | true label counts: {true_label_counts}")
+    else:
+        print(f"[autolabel_dataset] expert model | autolabeled counts: {label_counts}")
 
     return all_labels
 
@@ -486,6 +490,7 @@ def _train_expert_model_uncached(
     eval_ds = ds["test"].shuffle(seed=42)
     eval_ds = eval_ds.select(range(min(num_eval_datapoints, len(eval_ds))))
 
+    assert label_column_name in train_ds.column_names, f"label_column_name: {label_column_name} not in train_ds.column_names: {train_ds.column_names}"
     all_labels = list(sorted(set(train_ds[label_column_name])))
     expert = ExpertModel(base_model_name_or_path, max_sequence_length=sequence_length, all_labels=all_labels)
     optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
