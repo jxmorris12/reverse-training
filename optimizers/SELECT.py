@@ -425,8 +425,12 @@ class SELECTOptimizer(DiscreteOptimizer):
             batch_pbar.update(1)
             batch_pbar.set_description(f"Best sim: {best_sim:.3f} | Best idx: {best_idx} | Batch size: {len(batch)} | Current sim: {best_sim:.3f} | Overall best sim: {overall_best_sim:.3f}")
 
-        label_distribution = collections.Counter([self.dataset_autolabels[j] for j in batch])
-        print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f} | Label distribution: {label_distribution}")
+        
+        if self.expert_model.is_doing_classification:
+            label_distribution = collections.Counter([self.dataset_autolabels[j] for j in batch])
+            print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f} | Label distribution: {label_distribution}")
+        else:
+            print(f"[SELECTOptimizer._fill_batch_greedy] Overall best sim: {overall_best_sim:.3f}")
         return batch
     
     def _restore_model_state_dict(self, expert_state_dict: dict) -> dict:
