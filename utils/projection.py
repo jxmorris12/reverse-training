@@ -174,6 +174,7 @@ def _get_grads_final_layer_uncached(
     
     do_classification = (labels is not None)
     all_grads = []
+    all_losses = []
     pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) // batch_size < 10))
     
     # Get parameters for the final layer only
@@ -183,20 +184,31 @@ def _get_grads_final_layer_uncached(
     for batch_start in pbar:
         batch_end = min(batch_start + batch_size, len(dataset))
         batch = dataset.select(range(batch_start, batch_end))
-        batch_labels = [labels[i] for i in range(batch_start, batch_end)]
-
-        batch = datasets.Dataset.from_dict(
-            {
-                "text": batch["text"],
-                "label": batch_labels,
-            }
-        )
-            
-        examples = expert.prepare_examples(
-            examples=batch,
-            label_column_name="label",
-            text_column_name="text"
-        )
+        
+        if do_classification:
+            batch_labels = [labels[i] for i in range(batch_start, batch_end)]
+            batch = datasets.Dataset.from_dict(
+                {
+                    "text": batch["text"],
+                    "label": batch_labels,
+                }
+            )
+            examples = expert.prepare_examples(
+                examples=batch,
+                label_column_name="label",
+                text_column_name="text"
+            )
+        else:
+            batch = datasets.Dataset.from_dict(
+                {
+                    "text": batch["text"],
+                }
+            )
+            examples = expert.prepare_examples(
+                examples=batch,
+                label_column_name=None,
+                text_column_name="text"
+            )
         
         # Get last hidden state
         with torch.no_grad():
@@ -217,24 +229,27 @@ def _get_grads_final_layer_uncached(
             _, loss, _ = expert.compute_loss_and_accuracy(logits[None], labels[None], vmap=True)
             return loss
         
-        # Create vectorized gradient function
-        ft_compute_grad = torch.func.grad(compute_loss)
-        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0))
+        ft_compute_grad_and_loss = torch.func.grad_and_value(compute_loss)
+        ft_compute_sample_grad_and_loss = torch.func.vmap(ft_compute_grad_and_loss, in_dims=(None, None, 0, 0))
 
-        # Compute per-sample gradients
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, last_hidden_state, label_ids)
+        # Compute per-sample gradients and losses
+        ft_per_sample_grads, losses_batch = ft_compute_sample_grad_and_loss(params, buffers, last_hidden_state, label_ids)
+
+        # Process gradients as before
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.lm_head.named_parameters()], dim=1)
 
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
             all_grads.extend(projected_grads.cpu())
+            all_losses.extend(losses_batch.cpu())
         else:
             all_grads.extend(grads_batch.cpu())
+            all_losses.extend(losses_batch.cpu())
     
     expert.student_net.cpu()
     expert.student_net.train()
     
-    return torch.stack(all_grads).to(torch.float16)
+    return torch.stack(all_grads).to(torch.float16), torch.stack(all_losses).to(torch.float16)
 
 
 def get_grads_final_layer(
@@ -286,17 +301,18 @@ def get_grads_final_layer(
         grads = np.load(cache_path)["grads"]
     except:
         print(f"Getting grads for final layer with cache key: {full_cache_key} => {cache_key}")
-        grads = _get_grads_final_layer_uncached(
+        grads, losses = _get_grads_final_layer_uncached(
             expert=expert, 
             dataset=dataset,
             labels=labels, 
             projector=projector, 
             do_projection=do_projection,
         )
-        np.savez(cache_path, grads=grads.numpy())
+        np.savez(cache_path, grads=grads.numpy(), losses=losses.numpy())
 
     grads = np.load(cache_path)["grads"]
-    return torch.from_numpy(grads)
+    losses = np.load(cache_path)["losses"]
+    return torch.from_numpy(grads), torch.from_numpy(losses)
 
 
 @find_executable_batch_size
@@ -325,6 +341,7 @@ def _get_grads_full_model_uncached(
         A tensor of shape (len(dataset), projection_dim) containing the gradients
     """
     all_grads = []
+    all_losses = []
     pbar = tqdm.trange(0, len(dataset), batch_size, disable=(len(dataset) // batch_size < 10))
 
     # print first datapoint
@@ -370,21 +387,24 @@ def _get_grads_full_model_uncached(
                 reduction="mean"
             )
             return loss
+    
+        ft_compute_grad_and_loss = torch.func.grad_and_value(compute_loss)
+        ft_compute_sample_grad_and_loss = torch.func.vmap(ft_compute_grad_and_loss, in_dims=(None, None, 0, 0, 0))
 
-        # Create vectorized gradient function
-        ft_compute_grad = torch.func.grad(compute_loss)
-        ft_compute_sample_grad = torch.func.vmap(ft_compute_grad, in_dims=(None, None, 0, 0, 0))
+        # Compute per-sample gradients and losses
+        ft_per_sample_grads, losses_batch = ft_compute_sample_grad_and_loss(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
 
-        # Compute per-sample gradients
-        ft_per_sample_grads = ft_compute_sample_grad(params, buffers, inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
+        # Process gradients as before
         grads_batch = torch.cat([ft_per_sample_grads[n].reshape(batch_end - batch_start, -1) for n, _ in expert.student_net.named_parameters()], dim=1)
         grads_batch = grads_batch.double() / grads_batch.norm(dim=1, keepdim=True)
+        all_losses.extend(losses_batch.double())
+
         if do_projection:
             projected_grads = projector.project(grads_batch, model_id=0)
             all_grads.extend(projected_grads.cpu())
         else:
             all_grads.extend(grads_batch.cpu())
-    return torch.stack(all_grads)
+    return torch.stack(all_grads), torch.stack(all_losses)
 
 
 def get_grads_full_model(

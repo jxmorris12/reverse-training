@@ -37,8 +37,12 @@ class ExpertModel:
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.truncation_side = "left" # important for correct truncation
         self.tokenizer.padding_side = "left" 
-        self.all_labels = list(sorted(all_labels))
-        self.all_labels_ids = [self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels]
+        if all_labels is not None:
+            self.all_labels = list(sorted(all_labels))
+            self.all_labels_ids = [self.tokenizer.encode(f" {x}")[-1] for x in self.all_labels]
+        else:
+            self.all_labels = None
+            self.all_labels_ids = None
         self.max_sequence_length = max_sequence_length
         self.verbose = False
         print(f"[ExpertModel] | {base_model_name_or_path} | all_labels: {self.all_labels} | all_labels_ids: {self.all_labels_ids}")
@@ -93,7 +97,19 @@ class ExpertModel:
                 reduction="mean"
             )
         else:
-            raise ValueError("Language modeling is not supported right now")
+            if labels.ndim == 1:
+                # unroll singleton for vmap
+                labels = labels[None]
+
+            labels = labels[:, -1]
+            logits = logits[:, -1, :]
+            loss = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), 
+                labels.reshape(-1),
+                reduction="mean",
+                ignore_index=-100,
+            )
+            accuracy = (logits.argmax(-1).float() == labels.float()).float().mean()
     
 
         # if not vmap:
@@ -504,8 +520,11 @@ def _train_expert_model_uncached(
     eval_ds = ds["test"].shuffle(seed=42)
     eval_ds = eval_ds.select(range(min(num_eval_datapoints, len(eval_ds))))
 
-    assert label_column_name in train_ds.column_names, f"label_column_name: {label_column_name} not in train_ds.column_names: {train_ds.column_names}"
-    all_labels = list(sorted(set(train_ds[label_column_name]) | set(eval_ds[label_column_name])))
+    if label_column_name is not None:
+        assert label_column_name in train_ds.column_names, f"label_column_name: {label_column_name} not in train_ds.column_names: {train_ds.column_names}"
+        all_labels = list(sorted(set(train_ds[label_column_name]) | set(eval_ds[label_column_name])))
+    else:
+        all_labels = None
     expert = ExpertModel(base_model_name_or_path, max_sequence_length=sequence_length, all_labels=all_labels)
     optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
     # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)

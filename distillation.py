@@ -1,3 +1,5 @@
+from typing import Optional
+
 import gc
 import os
 import pickle
@@ -7,7 +9,6 @@ import datasets
 import torch
 import transformers
 import wandb
-
 
 from optimizers import ADMMOptimizer, GCGOptimizer, GCGAOptimizer, SELECTOptimizer
 from reparam_module import ReparamModule
@@ -86,9 +87,12 @@ class DatasetDistiller:
         optimizer.dataset_label_map = self.classification_dataset.label_map
         return optimizer
     
-    def _log_table(self, tokens: torch.Tensor, labels: list[str], step: int) -> None:
+    def _log_table(self, tokens: torch.Tensor, labels: Optional[list[str]], step: int) -> None:
         tokens = self.tokenizer.batch_decode(tokens.cpu(), add_special_tokens=False)
-        labels = list(map(lambda x: self.classification_dataset.label_map.get(x.strip(), "[?]"), labels))
+        if labels is not None:
+            labels = list(map(lambda x: self.classification_dataset.label_map.get(x.strip(), "[?]"), labels))
+        else:
+            labels = ["-"] * len(tokens)
         table_data = [(i, T, L) for i, (T, L) in enumerate(zip(tokens, labels))]
         tokens_table = wandb.Table(data=table_data, columns=["index", "text", "label"])
         wandb.log({ "Z": tokens_table }, step=step)
@@ -111,20 +115,27 @@ class DatasetDistiller:
         #     "dataset_token_precision": precision.detach().cpu().item(),
         #     "dataset_token_recall": recall.detach().cpu().item(),
         #     "dataset_token_f1": f1.detach().cpu().item(),
-        # }
-        train_ds = datasets.Dataset.from_dict(
-            {
-                self.classification_dataset.text_column_name: Z_text,
-                self.classification_dataset.label_column_name: Y,
-            }
-        )
+        
         test_ds = self.classification_dataset.dataset["test"]
+        if expert_model.is_doing_classification:
+            train_ds = datasets.Dataset.from_dict(
+                {
+                    self.classification_dataset.text_column_name: Z_text,
+                    self.classification_dataset.label_column_name: Y,
+                }
+            )
+            assert set(Y) <= set(test_ds[self.classification_dataset.label_column_name])
+        else:
+            train_ds = datasets.Dataset.from_dict(
+                {
+                    self.classification_dataset.text_column_name: Z_text,
+                }
+            )
         ds = datasets.DatasetDict({
             "train": train_ds,
             "test": test_ds,
         })
 
-        assert set(Y) <= set(test_ds[self.classification_dataset.label_column_name])
 
         # run full evaluation
         expert, __, evaluation_metrics = _train_expert_model_uncached(

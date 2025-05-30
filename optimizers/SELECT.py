@@ -174,7 +174,6 @@ class SELECTOptimizer(DiscreteOptimizer):
 
         # Get all gradients
         base_model = copy.deepcopy(self.base_model)
-        grads = []
 
         if self.args.select_do_warmup:
             self._run_warmup(base_model, last_layer_expert_model_params)
@@ -196,6 +195,8 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
         get_grads = get_grads_full_model if self.args.select_grads_full_model else get_grads_final_layer
+        grads = []
+        losses = []
         for model, i in pseudoexperts:
             # TODO: Add other expert hparams to model_cache_key – lr, steps, batch size.
             model_cache_key = (
@@ -207,14 +208,13 @@ class SELECTOptimizer(DiscreteOptimizer):
                 + f"_{self.args.select_lr_student}"
                 + f"_{self.args.select_steps_per_grad}"
                 + f"_{self.args.select_do_warmup}"
-                + f"_{self.args.select_do_classification}"
             )
             if self.args.select_do_warmup:
                 model_cache_key += f"_warmup"
             print(f"[SELECTOptimizer._rank_dataset_by_influence] Getting grads for model {i} | model_cache_key: {model_cache_key}")
 
             if self.args.select_use_expert_grads:
-                batch_grads = get_grads(
+                batch_grads, batch_losses = get_grads(
                     expert=self.expert_model,
                     dataset=self.seed_dataset_train_split, 
                     labels=self.dataset_autolabels,
@@ -224,7 +224,7 @@ class SELECTOptimizer(DiscreteOptimizer):
                     model_cache_key=model_cache_key + "_expert_grads",
                 )
             else:
-                batch_grads = get_grads(
+                batch_grads, batch_losses = get_grads(
                     expert=self.expert_model, 
                     dataset=self.seed_dataset_train_split, 
                     labels=self.dataset_autolabels,
@@ -234,8 +234,10 @@ class SELECTOptimizer(DiscreteOptimizer):
                     model_cache_key=model_cache_key,
                 )
             grads.append(batch_grads)
+            losses.append(batch_losses)
         
         grads = torch.stack(grads, dim=0)
+        losses = torch.cat(losses, dim=0)
         grads_db = BatchedExactVectorDatabase(grads)
         
         # Fill batch using greedy algorithm
@@ -277,6 +279,10 @@ class SELECTOptimizer(DiscreteOptimizer):
                 expert_params=expert_params,
                 reverse=True,
             )
+        elif self.args.select_batch_fill_strategy == "p_min":
+            batch = losses.argsort(dim=0)[:self.args.select_full_dataset_size].tolist()
+        elif self.args.select_batch_fill_strategy == "p_max":
+            batch = losses.argsort(dim=0)[-self.args.select_full_dataset_size:].tolist()
         elif self.args.select_batch_fill_strategy == "random":
             batch = random.choices(range(len(self.seed_dataset_train_split)), k=self.args.select_full_dataset_size)
         else:
@@ -467,7 +473,7 @@ class SELECTOptimizer(DiscreteOptimizer):
         )
 
     def step(self, step: int, buffer: list[torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if self.args.select_do_classification and self.dataset_autolabels is None:
+        if self.expert_model.is_doing_classification and self.dataset_autolabels is None:
             # Get labels from expert model
             if self.args.select_label_strategy == "auto":
                 self.dataset_autolabels = autolabel_dataset(
@@ -492,9 +498,12 @@ class SELECTOptimizer(DiscreteOptimizer):
             self._tokenize_dataset_cached(i) for i in batch
         ])
         
-        Y = [self.dataset_autolabels[i] for i in batch]
-        Y_set = set(Y)
-        assert Y_set <= set(self.expert_model.all_labels), f"Y: {Y_set} is not a subset of expert_model.all_labels: {set(self.expert_model.all_labels)}"
+        if self.expert_model.is_doing_classification:
+            Y = [self.dataset_autolabels[i] for i in batch]
+            Y_set = set(Y)
+            assert Y_set <= set(self.expert_model.all_labels), f"Y: {Y_set} is not a subset of expert_model.all_labels: {set(self.expert_model.all_labels)}"
+        else:
+            Y = None
 
         return X, X_tokens.cpu(), Y, {}
 
