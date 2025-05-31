@@ -488,6 +488,7 @@ def evaluate_dataset_similarity(raw_reference_dataset: list[str], raw_recovered_
     """
     # Pre-process all texts once for Levenshtein distance
 
+    print("[evaluate_dataset_similarity] Pre-processing texts...")
     tokenized_ref_texts = [
         tokenizer.tokenize(text, max_length=max_tokens, padding=True, truncation=True) 
         for text in raw_reference_dataset
@@ -504,46 +505,51 @@ def evaluate_dataset_similarity(raw_reference_dataset: list[str], raw_recovered_
     preprocessed_rec_token_sets = [set(tokens) for tokens in tokenized_rec_texts]
     
     # Compute embeddings once for both datasets
+    print("[evaluate_dataset_similarity] Computing embeddings...")
     emb_A = get_sentence_embeddings(reference_dataset, tokenizer, model, device)
     emb_B = get_sentence_embeddings(recovered_dataset, tokenizer, model, device)
     
     # Compute embedding-based metrics using the pre-computed embeddings
-    full_ot_distance = dataset_level_full_ot_with_embeddings(emb_A, emb_B)
+    # full_ot_distance = dataset_level_full_ot_with_embeddings(emb_A, emb_B)
+    print("[evaluate_dataset_similarity] Computing Sinkhorn distance...")
     sinkhorn_distance = dataset_level_sinkhorn_ot_with_embeddings(emb_A, emb_B, reg=0.1)
+    print("[evaluate_dataset_similarity] Computing optimal matching relaxed WMD...")
     optimal_matching_relaxed_wmd_stats = optimal_matching_relaxed_wmd_with_embeddings_optimized(emb_A, emb_B)
     
     ### Lexical-Based Metrics (these don't use embeddings) ###
 
-    jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
-    jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
+    # print("[evaluate_dataset_similarity] Computing Jaccard overlap examples...")
+    # jaccard_overlap_examples_score = jaccard_overlap_examples(reference_dataset, recovered_dataset)
 
-    #BUG Found: the function is implemented at the opposite. 
-    # levenshtein_stats = dataset_levenshtein_closest_pair_statistics(reference_dataset, recovered_dataset)
-    levenshtein_stats = dataset_levenshtein_closest_pair_statistics(recovered_dataset, reference_dataset)
+    # print("[evaluate_dataset_similarity] Computing Jaccard overlap vocabulary...")
+    # jaccard_overlap_vocabulary_truncated_score = jaccard_overlap_vocabulary_truncated(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
 
+    # levenshtein_stats = dataset_levenshtein_closest_pair_statistics(recovered_dataset, reference_dataset)
+
+    print("[evaluate_dataset_similarity] Computing containment similarity examples...")
     containment_similarity_examples_score = containment_similarity_examples(reference_dataset, recovered_dataset)
     containment_similarity_vocabulary_score = containment_similarity_vocabulary(preprocessed_ref_token_sets, preprocessed_rec_token_sets)
 
     # Use the preprocessed texts for the discrete OT distances
-    discrete_ot_distance_levenshtein_score = discrete_ot_distance_levenshtein(
-        reference_dataset, recovered_dataset,
-    )
+    # discrete_ot_distance_levenshtein_score = discrete_ot_distance_levenshtein(
+    #     reference_dataset, recovered_dataset,
+    # )
     
-    discrete_ot_distance_jaccard_score = discrete_ot_distance_jaccard(
-        preprocessed_ref_token_sets, preprocessed_rec_token_sets, 
-    )
+    # discrete_ot_distance_jaccard_score = discrete_ot_distance_jaccard(
+    #     preprocessed_ref_token_sets, preprocessed_rec_token_sets, 
+    # )
     
     results = {
-        "full_ot_distance": full_ot_distance,
+        # "full_ot_distance": full_ot_distance,
         "sinkhorn_distance": sinkhorn_distance,
         "optimal_matching_relaxed_wmd": optimal_matching_relaxed_wmd_stats,
-        "jaccard_overlap_examples": jaccard_overlap_examples_score,
-        "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_truncated_score,
+        # "jaccard_overlap_examples": jaccard_overlap_examples_score,
+        # "jaccard_overlap_vocabulary": jaccard_overlap_vocabulary_truncated_score,
         "containment_similarity_examples": containment_similarity_examples_score,
         "containment_similarity_vocabulary": containment_similarity_vocabulary_score,
-        "levenshtein_stats": levenshtein_stats,
-        "discrete_ot_distance_levenshtein": discrete_ot_distance_levenshtein_score,
-        "discrete_ot_distance_jaccard": discrete_ot_distance_jaccard_score,
+        # "levenshtein_stats": levenshtein_stats,
+        # "discrete_ot_distance_levenshtein": discrete_ot_distance_levenshtein_score,
+        # "discrete_ot_distance_jaccard": discrete_ot_distance_jaccard_score,
     }
     
     return results

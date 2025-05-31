@@ -100,5 +100,9 @@ if __name__ == '__main__':
 
     if args.base_model_name_or_path == "tinyllama":
         args.base_model_name_or_path = "TinyLlama/TinyLlama_v1.1"
+    elif args.base_model_name_or_path == "llama3-1b":
+        args.base_model_name_or_path = "meta-llama/Llama-3.2-1B"
+    elif args.base_model_name_or_path == "llama3-3b":
+        args.base_model_name_or_path = "meta-llama/Llama-3.2-3B"
 
     main(args)
