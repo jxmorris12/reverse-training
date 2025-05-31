@@ -148,6 +148,8 @@ class DatasetDistiller:
             ds=ds,
             text_column_name=self.classification_dataset.text_column_name,
             label_column_name=self.classification_dataset.label_column_name,
+            optimizer=self.args.optimizer_test,
+            freeze_last_layer=bool(self.args.freeze_last_layer_test),
         )
 
         # log
@@ -179,6 +181,7 @@ class DatasetDistiller:
             ds=self.classification_dataset.dataset,
             text_column_name=self.classification_dataset.text_column_name,
             label_column_name=self.classification_dataset.label_column_name,
+            optimizer=self.args.optimizer,
         )
 
         # initialize parameters & optimizers

@@ -96,6 +96,10 @@ if __name__ == '__main__':
     parser.add_argument("--exp_name", type=str, required=True, help="experiment name [user-provided str]")
     parser.add_argument("--base_model_name_or_path", "--model", type=str, default="gpt2", help="base model name or path")
 
+    parser.add_argument("--optimizer", type=str, default="adam", help="optimizer to use", choices=["adam", "adamw", "sgd"])
+    parser.add_argument("--optimizer_test", type=str, default="adam", help="optimizer to use for test", choices=["adam", "adamw", "sgd"])
+    parser.add_argument("--freeze_last_layer_test", type=int, default=0, help="whether to freeze the last layer in the test", choices=[0, 1])
+
     args = parser.parse_args()
 
     if args.base_model_name_or_path == "tinyllama":

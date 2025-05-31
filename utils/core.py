@@ -514,6 +514,8 @@ def _train_expert_model_uncached(
         label_column_name: Optional[str] = None,
         early_stopping_patience: int = 10,
         num_eval_datapoints: int = 2048,
+        optimizer: str = "adam",
+        freeze_last_layer: bool = False,
     ) -> tuple[ExpertModel, list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
 
     train_ds = ds["train"].shuffle(seed=42)
@@ -526,8 +528,24 @@ def _train_expert_model_uncached(
     else:
         all_labels = None
     expert = ExpertModel(base_model_name_or_path, max_sequence_length=sequence_length, all_labels=all_labels)
-    optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
-    # optim = torch.optim.SGD(student_net.parameters(), lr=expert_lr)
+    if freeze_last_layer:
+        total_params = 0
+        total_head_params = 0
+        for param in expert.student_net.parameters():
+            param.requires_grad = False
+            total_params += param.numel()
+        for param in expert.student_net.lm_head.parameters():
+            param.requires_grad = True
+            total_head_params += param.numel()
+        print(f"[train_expert_model] Total params: {total_params} | Head (unfrozen) params: {total_head_params}")
+    if optimizer == "adam":
+        optim = torch.optim.Adam(expert.student_net.parameters(), lr=expert_lr)
+    elif optimizer == "adamw":
+        optim = torch.optim.AdamW(expert.student_net.parameters(), lr=expert_lr, weight_decay=0.01)
+    elif optimizer == "sgd":
+        optim = torch.optim.SGD(expert.student_net.parameters(), lr=expert_lr)
+    else:
+        raise ValueError(f"Invalid optimizer: {optimizer}")
 
     expert_state_dicts = [_get_state_dict(expert.student_net)]
     step = 0
@@ -596,6 +614,10 @@ def _train_expert_model_uncached(
                     print(f"Early stopping triggered after {epoch+1} epochs (patience = {early_stopping_patience}, best eval accuracy = {best_eval_accuracy:.3f})")
                     break
 
+        # Force garbage collection after each epoch
+        gc.collect()
+        torch.cuda.empty_cache()
+        
     # Run one more evaluation
     eval_loss, eval_accuracy = _eval_expert_model(
         expert=expert,
@@ -631,6 +653,8 @@ def train_expert_model(
         ds: datasets.DatasetDict, 
         text_column_name: str, 
         label_column_name: str,
+        optimizer: str = "adam",
+        freeze_last_layer: bool = False,
         **kwargs
     ) -> tuple[ExpertModel, list[dict[str, torch.Tensor]], torch.Tensor, dict[str, torch.Tensor]]:
     """Train expert models with caching based on input parameters."""
@@ -650,6 +674,8 @@ def train_expert_model(
         "text_column_name": text_column_name,
         "label_column_name": label_column_name,
         "ds_fingerprint": "_".join(str(ds[k]._fingerprint) for k in sorted(ds.keys())),
+        "optimizer": optimizer,
+        "freeze_last_layer": freeze_last_layer,
         **kwargs  # Include any additional kwargs in cache key generation
     }
     cache_key = _get_cache_key(**cache_kwargs)
@@ -691,6 +717,8 @@ def train_expert_model(
         ds=ds,
         text_column_name=text_column_name,
         label_column_name=label_column_name,
+        optimizer=optimizer,
+        freeze_last_layer=freeze_last_layer,
         **kwargs
     )
     
