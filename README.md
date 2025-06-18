@@ -2,7 +2,7 @@
 
 This repository contains all the code for our paper "Approximating Language Model Training from Weights".  It also contains implementations of discrete optimizers such as ADMM and GCG and helper functions for finetuning language models with various datasets and objectives, computing per-example gradients, and projecting gradients using JL based on code from [trak](https://github.com/MadryLab/trak).
 
-![image](https://github.com/user-attachments/assets/4322cadd-9561-4203-adbd-a96e3d2af26a)
+<img src="https://github.com/user-attachments/assets/4322cadd-9561-4203-adbd-a96e3d2af26a" width="500" />
 
 
 
